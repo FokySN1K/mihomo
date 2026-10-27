@@ -1777,6 +1777,29 @@ proxy-groups:
     url: "https://cp.cloudflare.com/generate_204"
     interval: 300
 
+  # url-test-pool 只按 interval 测试延迟最低的 pool-size 个节点，并按 full-interval 全量测试后重建节点池
+  # 池内节点不全且连续 degraded-checks 次快速检查仍未恢复时，会提前触发全量检查
+  # 节点拨号失败时会被标记并在下一次连接时跳过，全部节点不可用时立即触发全量测试
+  # 恢复连接后的首次成功拨号会在有冷却时间的前提下触发一次后台全量检查，用于重建空池
+  # 注意：为 use 的 provider 关闭 health-check.enable，否则 provider 自带的检查仍会全量测试
+  - name: "auto-pool"
+    type: url-test-pool
+    proxies:
+      - ss1
+      - ss2
+      - vmess1
+    url: "https://cp.cloudflare.com/generate_204"
+    interval: 300 # 快速检查：只测试池内节点
+    full-interval: 1800 # 全量检查：测试所有节点并重建池
+    # pool-size: 5 # 节点池大小
+    # degraded-checks: 2 # 连续多少次快速检查发现池内节点不全后触发全量检查，0 表示关闭
+    # tolerance: 150
+    # lazy: true
+    # timeout: 5000 # 单次节点测试超时时间(毫秒)
+    # max-failed-times: 5 # 连续失败多少次后触发全量测试
+    # expected-status: 204 # 当健康检查返回状态码与期望值不符时，认为节点不可用
+    # disable-udp: true
+
   # fallback 将按照 url 测试结果按照节点顺序选择
   - name: "fallback-auto"
     type: fallback

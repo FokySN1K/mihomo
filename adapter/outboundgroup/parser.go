@@ -147,7 +147,10 @@ func ParseProxyGroup(config map[string]any, proxyMap map[string]C.Proxy, provide
 				groupOption.URL = C.DefaultTestURL
 			}
 		} else {
-			addTestUrlToProviders(PDs, groupOption.URL, expectedStatus, groupOption.Filter, uint(groupOption.Interval))
+			// url-test-pool runs its own checks and shouldn't touch provider health checks
+			if groupOption.Type != "url-test-pool" {
+				addTestUrlToProviders(PDs, groupOption.URL, expectedStatus, groupOption.Filter, uint(groupOption.Interval))
+			}
 		}
 		providers = append(providers, PDs...)
 	}
@@ -173,7 +176,13 @@ func ParseProxyGroup(config map[string]any, proxyMap map[string]C.Proxy, provide
 			}
 		}
 
-		hc := provider.NewHealthCheck(ps, groupOption.URL, uint(groupOption.TestTimeout), uint(groupOption.Interval), groupOption.Lazy, expectedStatus)
+		hcInterval := uint(groupOption.Interval)
+		if groupOption.Type == "url-test-pool" {
+			// url-test-pool controls its own checking schedule, the provider ticker must stay disabled
+			hcInterval = 0
+		}
+
+		hc := provider.NewHealthCheck(ps, groupOption.URL, uint(groupOption.TestTimeout), hcInterval, groupOption.Lazy, expectedStatus)
 
 		pd, err := provider.NewCompatibleProvider(groupName, ps, hc)
 		if err != nil {
@@ -213,6 +222,13 @@ func ParseProxyGroup(config map[string]any, proxyMap map[string]C.Proxy, provide
 			return nil, err
 		}
 		return NewLoadBalance(groupOption, opt, emptyFallback, providers)
+	case "url-test-pool":
+		opt := URLTestPoolOption{}
+		err = decoder.Decode(config, &opt)
+		if err != nil {
+			return nil, err
+		}
+		return NewURLTestPool(groupOption, opt, emptyFallback, providers)
 	case "relay":
 		return nil, fmt.Errorf("%w: The group [%s] with relay type was removed, please using dialer-proxy instead", errType, groupName)
 	default:

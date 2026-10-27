@@ -30,6 +30,7 @@ const (
 	Fallback
 	URLTest
 	LoadBalance
+	URLTestPool
 
 	Shadowsocks
 	ShadowsocksR
@@ -252,6 +253,8 @@ func (at AdapterType) String() string {
 		return "URLTest"
 	case LoadBalance:
 		return "LoadBalance"
+	case URLTestPool:
+		return "URLTestPool"
 	default:
 		return "Unknown"
 	}
