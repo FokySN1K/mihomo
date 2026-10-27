@@ -1,0 +1,122 @@
+name: Release Core
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version label for the artifacts (optional)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-core-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.goos }}-${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64, goamd64: v3 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: windows, goarch: amd64, goamd64: v3, ext: ".exe" }
+          - { goos: windows, goarch: arm64, ext: ".exe" }
+          - { goos: darwin, goarch: amd64, goamd64: v3 }
+          - { goos: darwin, goarch: arm64 }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+          check-latest: true
+
+      - name: Resolve version
+        id: vars
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME}"
+          else
+            version="${{ inputs.version }}"
+          fi
+          if [[ -z "$version" ]]; then
+            version="dev-${GITHUB_SHA::7}"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "buildtime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOAMD64: ${{ matrix.goamd64 }}
+        run: |
+          set -euo pipefail
+          out="mihomo-${GOOS}-${GOARCH}"
+          mkdir -p dist
+          go build -tags with_gvisor -trimpath \
+            -ldflags "-X github.com/metacubex/mihomo/constant.Version=${{ steps.vars.outputs.version }} -X github.com/metacubex/mihomo/constant.BuildTime=${{ steps.vars.outputs.buildtime }} -w -s -buildid=" \
+            -o "dist/${out}${{ matrix.ext }}"
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.vars.outputs.version }}"
+          cd dist
+          if [[ "${{ matrix.goos }}" == "windows" ]]; then
+            zip -9 "mihomo-${{ matrix.goos }}-${{ matrix.goarch }}-${version}.zip" "mihomo-${{ matrix.goos }}-${{ matrix.goarch }}.exe"
+            rm "mihomo-${{ matrix.goos }}-${{ matrix.goarch }}.exe"
+          else
+            gzip -9 -c "mihomo-${{ matrix.goos }}-${{ matrix.goarch }}" > "mihomo-${{ matrix.goos }}-${{ matrix.goarch }}-${version}.gz"
+            rm "mihomo-${{ matrix.goos }}-${{ matrix.goarch }}"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mihomo-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
