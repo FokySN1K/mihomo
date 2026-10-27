@@ -30,13 +30,26 @@ const (
 	urlTestPoolRecoveryTestInterval  = 5 * time.Second
 	urlTestPoolRecoveryTestTimeout   = 2 * time.Second
 	urlTestPoolRetryReserve          = 500 * time.Millisecond
+	// defaultURLTestPoolDialTimeout and defaultURLTestPoolDialRetryLimit are
+	// the pool's own dial budget: a connection through the pool is retried by
+	// the tunnel with these values unless the group overrides them.
+	defaultURLTestPoolDialTimeout    = C.DefaultTCPTimeout
+	defaultURLTestPoolDialRetryLimit = 10
 )
 
 type URLTestPoolOption struct {
-	PoolSize       int    `group:"pool-size,omitempty"`
-	FullInterval   int    `group:"full-interval,omitempty"`
+	PoolSize     int `group:"pool-size,omitempty"`
+	FullInterval int `group:"full-interval,omitempty"`
+	// DegradedChecks is how many consecutive quick checks must see the pool
+	// underfilled (fewer alive members than it currently holds) before an early
+	// full check rebuilds it. It is not a target number of alive proxies, and
+	// 0 disables the early refill.
 	DegradedChecks *int   `group:"degraded-checks,omitempty"`
 	Tolerance      uint16 `group:"tolerance,omitempty"`
+	// DialTimeout is the budget of one connection through the pool, in milliseconds.
+	DialTimeout *int `group:"dial-timeout,omitempty"`
+	// DialRetryLimit is how many times the tunnel may retry such a connection.
+	DialRetryLimit *int `group:"dial-retry-limit,omitempty"`
 }
 
 // URLTestPool keeps a fixed pool of the fastest proxies.
@@ -57,6 +70,8 @@ type URLTestPool struct {
 	poolSize       int
 	degradedChecks int
 	tolerance      uint16
+	dialTimeout    time.Duration
+	dialRetryLimit int
 	lazy           bool
 
 	mu            sync.RWMutex
@@ -147,6 +162,16 @@ func (u *URLTestPool) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 // Now implements ProxyGroup
 func (u *URLTestPool) Now() string {
 	return u.fast(false).Name()
+}
+
+// DialTimeout implements C.DialBudget
+func (u *URLTestPool) DialTimeout() time.Duration {
+	return u.dialTimeout
+}
+
+// DialRetryLimit implements C.DialBudget
+func (u *URLTestPool) DialRetryLimit() int {
+	return u.dialRetryLimit
 }
 
 // Providers implements ProxyGroup
@@ -755,6 +780,22 @@ func NewURLTestPool(option GroupCommonOption, poolOption URLTestPoolOption, empt
 		}
 	}
 
+	dialTimeout := defaultURLTestPoolDialTimeout
+	if poolOption.DialTimeout != nil {
+		dialTimeout = time.Duration(*poolOption.DialTimeout) * time.Millisecond
+		if dialTimeout <= 0 {
+			dialTimeout = defaultURLTestPoolDialTimeout
+		}
+	}
+
+	dialRetryLimit := defaultURLTestPoolDialRetryLimit
+	if poolOption.DialRetryLimit != nil {
+		dialRetryLimit = *poolOption.DialRetryLimit
+		if dialRetryLimit < 1 {
+			dialRetryLimit = 1
+		}
+	}
+
 	testUrl := option.URL
 	if testUrl == "" {
 		testUrl = C.DefaultTestURL
@@ -783,6 +824,8 @@ func NewURLTestPool(option GroupCommonOption, poolOption URLTestPoolOption, empt
 		poolSize:       poolSize,
 		degradedChecks: degradedChecks,
 		tolerance:      poolOption.Tolerance,
+		dialTimeout:    dialTimeout,
+		dialRetryLimit: dialRetryLimit,
 		lazy:           option.Lazy,
 		suspicious:     make(map[string]struct{}),
 	}, nil

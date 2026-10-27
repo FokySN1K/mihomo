@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"time"
 
 	C "github.com/metacubex/mihomo/constant"
 	P "github.com/metacubex/mihomo/constant/provider"
@@ -78,6 +79,23 @@ func (s *Selector) MarshalJSON() ([]byte, error) {
 
 func (s *Selector) Now() string {
 	return s.selectedProxy(false).Name()
+}
+
+// DialTimeout implements C.DialBudget: the selected member may carry its own
+// dial budget, so a rule pointed at this selector inherits it.
+func (s *Selector) DialTimeout() time.Duration {
+	if b, ok := s.selectedProxy(false).Adapter().(C.DialBudget); ok {
+		return b.DialTimeout()
+	}
+	return 0
+}
+
+// DialRetryLimit implements C.DialBudget
+func (s *Selector) DialRetryLimit() int {
+	if b, ok := s.selectedProxy(false).Adapter().(C.DialBudget); ok {
+		return b.DialRetryLimit()
+	}
+	return 0
 }
 
 func (s *Selector) Set(name string) error {

@@ -25,10 +25,10 @@ func TestURLTestPoolDefaults(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, C.URLTestPool, pool.Type())
-	require.Equal(t, 5, pool.poolSize)
+	require.Equal(t, 10, pool.poolSize)
 	require.Equal(t, 300*time.Second, pool.interval)
 	require.Equal(t, 1800*time.Second, pool.fullInterval)
-	require.Equal(t, 2, pool.degradedChecks)
+	require.Equal(t, 3, pool.degradedChecks)
 	require.True(t, pool.lazy)
 	require.Equal(t, C.DefaultTestURL, pool.testUrl)
 }
@@ -114,7 +114,7 @@ func TestURLTestPoolNoRecoveryCheckWithoutEmptyPool(t *testing.T) {
 	require.NoError(t, err)
 
 	pool.pool = []string{"a"}
-	pool.noteDialSucceeded()
+	pool.noteDialSucceeded(newPoolEmptyFallback())
 	require.False(t, pool.testing.Load())
 }
 
@@ -139,4 +139,16 @@ func TestURLTestPoolTracksOnlyDialFailures(t *testing.T) {
 
 	require.True(t, shouldTrackDialFailure(C.Shadowsocks, errDial))
 	require.True(t, shouldTrackDialFailure(C.URLTestPool, errDial))
+}
+
+func TestURLTestPoolDialBudget(t *testing.T) {
+	timeout := 1234
+	retries := 3
+	pool, err := NewURLTestPool(GroupCommonOption{Name: "pool"},
+		URLTestPoolOption{DialTimeout: &timeout, DialRetryLimit: &retries},
+		newPoolEmptyFallback(), nil)
+	require.NoError(t, err)
+
+	require.Equal(t, 1234*time.Millisecond, pool.DialTimeout())
+	require.Equal(t, 3, pool.DialRetryLimit())
 }
