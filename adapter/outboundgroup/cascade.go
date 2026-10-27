@@ -24,6 +24,12 @@ const (
 	// but never spends more than this many probes per cycle. That keeps the
 	// check cost bounded on a large member list with many dead entries.
 	cascadeProbeBudgetFactor = 2
+	// defaultCascadeDialTimeout and defaultCascadeDialRetryLimit are the
+	// cascade's own dial budget: one connection may try several candidates,
+	// and the tunnel retries the whole call with these values unless the
+	// group overrides them.
+	defaultCascadeDialTimeout    = C.DefaultTCPTimeout
+	defaultCascadeDialRetryLimit = 10
 )
 
 type CascadeOption struct {
@@ -33,6 +39,10 @@ type CascadeOption struct {
 	MaxAttempts *int `group:"max-attempts,omitempty"`
 	// FailedCooldown is how long a failed candidate is demoted, in seconds.
 	FailedCooldown *int `group:"failed-cooldown,omitempty"`
+	// DialTimeout is the budget of one connection through the cascade, in milliseconds.
+	DialTimeout *int `group:"dial-timeout,omitempty"`
+	// DialRetryLimit is how many times the tunnel may retry such a connection.
+	DialRetryLimit *int `group:"dial-retry-limit,omitempty"`
 }
 
 type cascadeState struct {
@@ -57,6 +67,8 @@ type Cascade struct {
 	lookahead      int
 	maxAttempts    int
 	failedCooldown time.Duration
+	dialTimeout    time.Duration
+	dialRetryLimit int
 	lazy           bool
 
 	mu         sync.RWMutex
@@ -175,6 +187,16 @@ func (c *Cascade) Now() string {
 	return c.pick(false).Name()
 }
 
+// DialTimeout implements C.DialBudget
+func (c *Cascade) DialTimeout() time.Duration {
+	return c.dialTimeout
+}
+
+// DialRetryLimit implements C.DialBudget
+func (c *Cascade) DialRetryLimit() int {
+	return c.dialRetryLimit
+}
+
 // Providers implements ProxyGroup
 func (c *Cascade) Providers() []P.ProxyProvider {
 	return c.providers
@@ -224,11 +246,11 @@ func (c *Cascade) MarshalJSON() ([]byte, error) {
 	selected := c.selected
 	c.mu.RUnlock()
 
-	// Hosts pick a group's UI by its type name, and Cascade is not one they
-	// know; report the closest built-in type so the ordered candidates and the
-	// selected one stay visible, while the real type remains on the adapter.
+	// The type is the adapter's own name: hosts that know cascade show it as
+	// such, and the built-in fields below still let the rest render the ordered
+	// candidates and the selected one.
 	return json.Marshal(map[string]any{
-		"type":           C.Fallback.String(),
+		"type":           C.Cascade.String(),
 		"now":            c.Now(),
 		"all":            all,
 		"active":         active,
@@ -591,6 +613,22 @@ func NewCascade(option GroupCommonOption, cascadeOption CascadeOption, emptyFall
 		}
 	}
 
+	dialTimeout := defaultCascadeDialTimeout
+	if cascadeOption.DialTimeout != nil {
+		dialTimeout = time.Duration(*cascadeOption.DialTimeout) * time.Millisecond
+		if dialTimeout <= 0 {
+			dialTimeout = defaultCascadeDialTimeout
+		}
+	}
+
+	dialRetryLimit := defaultCascadeDialRetryLimit
+	if cascadeOption.DialRetryLimit != nil {
+		dialRetryLimit = *cascadeOption.DialRetryLimit
+		if dialRetryLimit < 1 {
+			dialRetryLimit = 1
+		}
+	}
+
 	testUrl := option.URL
 	if testUrl == "" {
 		testUrl = C.DefaultTestURL
@@ -618,6 +656,8 @@ func NewCascade(option GroupCommonOption, cascadeOption CascadeOption, emptyFall
 		lookahead:      lookahead,
 		maxAttempts:    maxAttempts,
 		failedCooldown: failedCooldown,
+		dialTimeout:    dialTimeout,
+		dialRetryLimit: dialRetryLimit,
 		lazy:           option.Lazy,
 		states:         make(map[string]*cascadeState),
 	}, nil

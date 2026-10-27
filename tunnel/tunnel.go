@@ -62,6 +62,15 @@ var (
 	// default timeout for UDP session
 	udpTimeout = 60 * time.Second
 
+	// dialTimeout is the default budget of one whole dial: every retry, the
+	// pauses between them and any candidate attempts inside it have to fit.
+	// A proxy implementing C.DialBudget can override it for its own dials.
+	dialTimeout = C.DefaultTCPTimeout
+
+	// dialRetryLimit is the default number of attempts one dial is retried
+	// with inside dialTimeout, unless the matched proxy overrides it.
+	dialRetryLimit = 10
+
 	findProcessMode = atomic.NewInt32Enum(process.FindProcessStrict)
 
 	snifferDispatcher *sniffer.Dispatcher
@@ -464,9 +473,10 @@ func handleUDPConn(packet C.PacketAdapter) {
 			}
 
 			dialMetadata := metadata.Pure()
-			ctx, cancel := context.WithTimeout(context.Background(), C.DefaultUDPTimeout)
+			timeout, retries := dialBudget(proxy)
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
-			rawPc, err := retry(ctx, func(ctx context.Context) (C.PacketConn, error) {
+			rawPc, err := retry(ctx, retries, func(ctx context.Context) (C.PacketConn, error) {
 				return proxy.ListenPacketContext(ctx, dialMetadata)
 			}, func(err error) {
 				logMetadataErr(metadata, rule, proxy, err)
@@ -571,9 +581,10 @@ func handleTCPConn(connCtx C.ConnContext) {
 	var peekBytes []byte
 	var peekLen int
 
-	ctx, cancel := context.WithTimeout(context.Background(), C.DefaultTCPTimeout)
+	timeout, retries := dialBudget(proxy)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	remoteConn, err := retry(ctx, func(ctx context.Context) (remoteConn C.Conn, err error) {
+	remoteConn, err := retry(ctx, retries, func(ctx context.Context) (remoteConn C.Conn, err error) {
 		remoteConn, err = proxy.DialContext(ctx, dialMetadata)
 		if err != nil {
 			return
@@ -736,9 +747,28 @@ func shouldStopRetry(err error) bool {
 	return false
 }
 
-func retry[T any](ctx context.Context, ft func(context.Context) (T, error), fe func(err error)) (t T, err error) {
+// dialBudget resolves the budget of one dial for the matched proxy. The new
+// group types (url-test-pool, cascade) carry their own values and a selector
+// reports the budget of its current member; everything else keeps the defaults.
+func dialBudget(proxy C.Proxy) (time.Duration, int) {
+	timeout, retries := dialTimeout, dialRetryLimit
+	if b, ok := proxy.Adapter().(C.DialBudget); ok {
+		if t := b.DialTimeout(); t > 0 {
+			timeout = t
+		}
+		if r := b.DialRetryLimit(); r > 0 {
+			retries = r
+		}
+	}
+	return timeout, retries
+}
+
+func retry[T any](ctx context.Context, retries int, ft func(context.Context) (T, error), fe func(err error)) (t T, err error) {
 	s := slowdown.New()
-	for i := 0; i < 10; i++ {
+	if retries < 1 {
+		retries = 1
+	}
+	for i := 0; i < retries; i++ {
 		t, err = ft(ctx)
 		if err != nil {
 			if fe != nil {

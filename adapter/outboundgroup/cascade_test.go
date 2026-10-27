@@ -421,7 +421,7 @@ func TestCascadeMarshalJSON(t *testing.T) {
 
 	var payload map[string]any
 	require.NoError(t, json.Unmarshal(data, &payload))
-	require.Equal(t, C.Fallback.String(), payload["type"])
+	require.Equal(t, C.Cascade.String(), payload["type"])
 	require.Equal(t, "b", payload["now"])
 	require.Equal(t, "b", payload["fixed"])
 	require.Equal(t, float64(2), payload["lookahead"])
