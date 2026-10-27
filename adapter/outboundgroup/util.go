@@ -26,6 +26,7 @@ var _ ProxyGroup = (*Fallback)(nil)
 var _ ProxyGroup = (*LoadBalance)(nil)
 var _ ProxyGroup = (*URLTest)(nil)
 var _ ProxyGroup = (*URLTestPool)(nil)
+var _ ProxyGroup = (*Cascade)(nil)
 var _ ProxyGroup = (*Selector)(nil)
 
 type SelectAble interface {
@@ -36,4 +37,5 @@ type SelectAble interface {
 var _ SelectAble = (*Fallback)(nil)
 var _ SelectAble = (*URLTest)(nil)
 var _ SelectAble = (*URLTestPool)(nil)
+var _ SelectAble = (*Cascade)(nil)
 var _ SelectAble = (*Selector)(nil)
