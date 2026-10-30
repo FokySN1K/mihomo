@@ -1797,6 +1797,32 @@ proxy-groups:
     # lazy: true
     # timeout: 5000 # 单次节点测试超时时间(毫秒)
     # max-failed-times: 5 # 连续失败多少次后触发全量测试
+    # dial-timeout: 5000 # 单条连接的拨号预算(毫秒)，包含隧道对该连接的所有重试
+    # dial-retry-limit: 10 # 隧道对该组连接的重试次数
+    # expected-status: 204 # 当健康检查返回状态码与期望值不符时，认为节点不可用
+    # disable-udp: true
+
+  # cascade 按 proxies 顺序做优先级故障转移，只探测当前节点及其后 lookahead 个候选
+  # 单条连接内最多尝试 max-attempts 个候选，失败的节点在 failed-cooldown 秒内被降级
+  # 节点稳定后不会被恢复的高优先级节点抢占，只有当前节点失败才会切换
+  # 全部节点都在冷却时，会优先重试上次成功的节点；其余失败节点排在最后，短时故障后仍会再次尝试
+  # proxies 允许嵌套代理组（url-test-pool 不允许），嵌套时按所选组的行为转发
+  # 注意：为 use 的 provider 关闭 health-check.enable，否则 provider 自带的检查仍会全量测试
+  - name: "cascade"
+    type: cascade
+    proxies:
+      - ss1
+      - ss2
+      - vmess1
+    url: "https://cp.cloudflare.com/generate_204"
+    interval: 300 # 检查周期：保持当前节点及其后 lookahead 个候选可用
+    # lookahead: 2 # 保持可用的候选数量（当前节点之后）
+    # max-attempts: 3 # 单条连接最多尝试的候选数量，默认 lookahead + 1
+    # failed-cooldown: 30 # 失败节点的降级时间(秒)
+    # dial-timeout: 5000 # 单条连接的拨号预算(毫秒)，max-attempts 个候选共用这一个预算
+    # dial-retry-limit: 10 # 隧道对该组连接的重试次数
+    # timeout: 5000 # 单次节点测试超时时间(毫秒)
+    # lazy: true
     # expected-status: 204 # 当健康检查返回状态码与期望值不符时，认为节点不可用
     # disable-udp: true
 
