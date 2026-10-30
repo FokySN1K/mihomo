@@ -2,6 +2,9 @@ name: Release Core
 
 on:
   push:
+    # a merge or push into the release branch builds the core for the fork
+    branches:
+      - Alpha
     tags:
       - "v*"
   workflow_dispatch:
@@ -19,19 +22,35 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # A push to the release branch builds only the linux/windows core, a tag
+  # release keeps the full target set. The matrix is assembled here because the
+  # matrix context is not available in a job-level `if`.
+  prepare:
+    name: Prepare matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - name: Select targets
+        id: select
+        shell: bash
+        run: |
+          set -euo pipefail
+          core='{"goos":"linux","goarch":"amd64","goamd64":"v3"},{"goos":"linux","goarch":"arm64"},{"goos":"windows","goarch":"amd64","goamd64":"v3","ext":".exe"},{"goos":"windows","goarch":"arm64","ext":".exe"}'
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            matrix="{\"include\":[${core},{\"goos\":\"darwin\",\"goarch\":\"amd64\",\"goamd64\":\"v3\"},{\"goos\":\"darwin\",\"goarch\":\"arm64\"}]}"
+          else
+            matrix="{\"include\":[${core}]}"
+          fi
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+
   build:
     name: ${{ matrix.goos }}-${{ matrix.goarch }}
+    needs: prepare
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - { goos: linux, goarch: amd64, goamd64: v3 }
-          - { goos: linux, goarch: arm64 }
-          - { goos: windows, goarch: amd64, goamd64: v3, ext: ".exe" }
-          - { goos: windows, goarch: arm64, ext: ".exe" }
-          - { goos: darwin, goarch: amd64, goamd64: v3 }
-          - { goos: darwin, goarch: arm64 }
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
 
     steps:
       - name: Checkout
@@ -49,10 +68,12 @@ jobs:
         run: |
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             version="${GITHUB_REF_NAME}"
-          else
+          elif [[ -n "${{ inputs.version }}" ]]; then
             version="${{ inputs.version }}"
-          fi
-          if [[ -z "$version" ]]; then
+          elif [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            # branch builds carry the branch name and the commit they were built from
+            version="${GITHUB_REF_NAME,,}-${GITHUB_SHA::7}"
+          else
             version="dev-${GITHUB_SHA::7}"
           fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
@@ -96,7 +117,9 @@ jobs:
 
   release:
     name: Publish release
-    if: github.ref_type == 'tag'
+    # a push to the release branch publishes a prerelease tagged <branch>-<sha>,
+    # a v* tag keeps its own tag name
+    if: github.event_name == 'push'
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -114,9 +137,22 @@ jobs:
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
 
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag="${GITHUB_REF_NAME,,}-${GITHUB_SHA::7}"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           files: dist/*
           generate_release_notes: true
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(steps.tag.outputs.tag, '-') }}
