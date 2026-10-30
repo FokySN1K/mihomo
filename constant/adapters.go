@@ -30,6 +30,8 @@ const (
 	Fallback
 	URLTest
 	LoadBalance
+	URLTestPool
+	Cascade
 
 	Shadowsocks
 	ShadowsocksR
@@ -173,6 +175,15 @@ type Proxy interface {
 	URLTest(ctx context.Context, url string, expectedStatus utils.IntRanges[uint16]) (uint16, error)
 }
 
+// DialBudget is an optional extension for proxies that want to override the
+// dial budget the tunnel applies to a single connection. A zero value means
+// "use the tunnel default", so a wrapping group can report nothing when its
+// current member doesn't care.
+type DialBudget interface {
+	DialTimeout() time.Duration
+	DialRetryLimit() int
+}
+
 // AdapterType is enum of adapter type
 type AdapterType int
 
@@ -252,6 +263,10 @@ func (at AdapterType) String() string {
 		return "URLTest"
 	case LoadBalance:
 		return "LoadBalance"
+	case URLTestPool:
+		return "URLTestPool"
+	case Cascade:
+		return "Cascade"
 	default:
 		return "Unknown"
 	}

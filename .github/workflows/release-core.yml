@@ -1,0 +1,158 @@
+name: Release Core
+
+on:
+  push:
+    # a merge or push into the release branch builds the core for the fork
+    branches:
+      - Alpha
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version label for the artifacts (optional)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-core-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # A push to the release branch builds only the linux/windows core, a tag
+  # release keeps the full target set. The matrix is assembled here because the
+  # matrix context is not available in a job-level `if`.
+  prepare:
+    name: Prepare matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - name: Select targets
+        id: select
+        shell: bash
+        run: |
+          set -euo pipefail
+          core='{"goos":"linux","goarch":"amd64","goamd64":"v3"},{"goos":"linux","goarch":"arm64"},{"goos":"windows","goarch":"amd64","goamd64":"v3","ext":".exe"},{"goos":"windows","goarch":"arm64","ext":".exe"}'
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            matrix="{\"include\":[${core},{\"goos\":\"darwin\",\"goarch\":\"amd64\",\"goamd64\":\"v3\"},{\"goos\":\"darwin\",\"goarch\":\"arm64\"}]}"
+          else
+            matrix="{\"include\":[${core}]}"
+          fi
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.goos }}-${{ matrix.goarch }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+          check-latest: true
+
+      - name: Resolve version
+        id: vars
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME}"
+          elif [[ -n "${{ inputs.version }}" ]]; then
+            version="${{ inputs.version }}"
+          elif [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            # branch builds carry the branch name and the commit they were built from
+            version="${GITHUB_REF_NAME,,}-${GITHUB_SHA::7}"
+          else
+            version="dev-${GITHUB_SHA::7}"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "buildtime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOAMD64: ${{ matrix.goamd64 }}
+        run: |
+          set -euo pipefail
+          out="mihomo-${GOOS}-${GOARCH}"
+          mkdir -p dist
+          go build -tags with_gvisor -trimpath \
+            -ldflags "-X github.com/metacubex/mihomo/constant.Version=${{ steps.vars.outputs.version }} -X github.com/metacubex/mihomo/constant.BuildTime=${{ steps.vars.outputs.buildtime }} -w -s -buildid=" \
+            -o "dist/${out}${{ matrix.ext }}"
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.vars.outputs.version }}"
+          cd dist
+          if [[ "${{ matrix.goos }}" == "windows" ]]; then
+            zip -9 "mihomo-${{ matrix.goos }}-${{ matrix.goarch }}-${version}.zip" "mihomo-${{ matrix.goos }}-${{ matrix.goarch }}.exe"
+            rm "mihomo-${{ matrix.goos }}-${{ matrix.goarch }}.exe"
+          else
+            gzip -9 -c "mihomo-${{ matrix.goos }}-${{ matrix.goarch }}" > "mihomo-${{ matrix.goos }}-${{ matrix.goarch }}-${version}.gz"
+            rm "mihomo-${{ matrix.goos }}-${{ matrix.goarch }}"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mihomo-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    # a push to the release branch publishes a prerelease tagged <branch>-<sha>,
+    # a v* tag keeps its own tag name
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag="${GITHUB_REF_NAME,,}-${GITHUB_SHA::7}"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          files: dist/*
+          generate_release_notes: true
+          prerelease: ${{ contains(steps.tag.outputs.tag, '-') }}
