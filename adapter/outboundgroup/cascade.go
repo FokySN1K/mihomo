@@ -32,6 +32,15 @@ const (
 	defaultCascadeDialRetryLimit = 10
 )
 
+// The dial order is rebuilt from these ranks: the pinned/active head first,
+// then warm candidates in the configured order, then the cooling ones.
+const (
+	cascadeRankHead uint8 = iota
+	cascadeRankAlive
+	cascadeRankWarm
+	cascadeRankCooling
+)
+
 type CascadeOption struct {
 	// Lookahead is how many live standby candidates after the active one are kept warm.
 	Lookahead *int `group:"lookahead,omitempty"`
@@ -287,6 +296,10 @@ func (c *Cascade) pick(touch bool) C.Proxy {
 // last known good one is promoted right after the pinned candidate, so recovery
 // starts from the path that worked before the outage. The rest of the failed
 // ones stay at the end so a short outage does not lock them out forever.
+//
+// The order is built on every dial and on every API poll of the group, so the
+// states are read in place under the lock and the result is assembled from
+// per-candidate ranks instead of copied lookup maps.
 func (c *Cascade) candidateOrder(proxies []C.Proxy) []C.Proxy {
 	if len(proxies) == 0 {
 		return nil
@@ -294,24 +307,24 @@ func (c *Cascade) candidateOrder(proxies []C.Proxy) []C.Proxy {
 
 	now := time.Now()
 	c.mu.RLock()
-	selected := c.selected
-	active := c.active
-	lastActive := c.lastActive
-	states := make(map[string]cascadeState, len(c.states))
-	for name, state := range c.states {
-		states[name] = *state
-	}
-	c.mu.RUnlock()
+	defer c.mu.RUnlock()
 
 	failed := func(name string) bool {
-		state, ok := states[name]
+		state, ok := c.states[name]
 		return ok && state.failedUntil.After(now)
 	}
-	alive := func(name string) bool {
-		state, ok := states[name]
-		return ok && state.alive
+
+	allFailed := true
+	for _, proxy := range proxies {
+		if !failed(proxy.Name()) {
+			allFailed = false
+			break
+		}
 	}
 
+	// Duplicate names can come from overlapping providers; every candidate must
+	// stay in the order once, otherwise a failed proxy could be tried twice in
+	// the same connection.
 	order := make([]C.Proxy, 0, len(proxies))
 	seen := make(map[string]struct{}, len(proxies))
 	add := func(proxy C.Proxy) {
@@ -323,53 +336,60 @@ func (c *Cascade) candidateOrder(proxies []C.Proxy) []C.Proxy {
 		order = append(order, proxy)
 	}
 
-	for _, proxy := range proxies {
-		if proxy.Name() == selected && !failed(proxy.Name()) {
-			add(proxy)
-			break
+	// The head is the pinned candidate and the active ones: a handful of names
+	// at most, so a short scan is cheaper than a separate pass over the list.
+	addHead := func(name string) {
+		if name == "" {
+			return
 		}
-	}
-
-	allFailed := true
-	for _, proxy := range proxies {
-		if !failed(proxy.Name()) {
-			allFailed = false
-			break
+		if _, ok := seen[name]; ok {
+			return
 		}
-	}
-	if allFailed && lastActive != "" {
 		for _, proxy := range proxies {
-			if proxy.Name() == lastActive {
+			if proxy.Name() == name {
 				add(proxy)
-				break
+				return
 			}
 		}
 	}
 
-	for _, proxy := range proxies {
-		if proxy.Name() == active && !failed(proxy.Name()) {
-			add(proxy)
-			break
+	if !failed(c.selected) {
+		addHead(c.selected)
+	}
+	if allFailed {
+		addHead(c.lastActive)
+	}
+	if !failed(c.active) {
+		addHead(c.active)
+	}
+	if !failed(c.lastActive) {
+		addHead(c.lastActive)
+	}
+
+	ranks := make([]uint8, len(proxies))
+	for i, proxy := range proxies {
+		name := proxy.Name()
+		if _, ok := seen[name]; ok {
+			ranks[i] = cascadeRankHead
+			continue
+		}
+		state, ok := c.states[name]
+		switch {
+		case ok && state.alive && !state.failedUntil.After(now):
+			ranks[i] = cascadeRankAlive
+		case !ok || !state.failedUntil.After(now):
+			ranks[i] = cascadeRankWarm
+		default:
+			ranks[i] = cascadeRankCooling
 		}
 	}
-	for _, proxy := range proxies {
-		if proxy.Name() == lastActive && !failed(proxy.Name()) {
-			add(proxy)
-			break
+
+	for rank := cascadeRankAlive; rank <= cascadeRankCooling; rank++ {
+		for i, proxy := range proxies {
+			if ranks[i] == rank {
+				add(proxy)
+			}
 		}
-	}
-	for _, proxy := range proxies {
-		if alive(proxy.Name()) && !failed(proxy.Name()) {
-			add(proxy)
-		}
-	}
-	for _, proxy := range proxies {
-		if !failed(proxy.Name()) {
-			add(proxy)
-		}
-	}
-	for _, proxy := range proxies {
-		add(proxy)
 	}
 
 	return order

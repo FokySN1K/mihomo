@@ -340,21 +340,7 @@ func (u *URLTestPool) pickFast(proxies []C.Proxy) (C.Proxy, bool) {
 }
 
 func (u *URLTestPool) poolProxiesLocked(proxies []C.Proxy) []C.Proxy {
-	if len(u.pool) == 0 {
-		return nil
-	}
-
-	lookup := make(map[string]C.Proxy, len(proxies))
-	for _, proxy := range proxies {
-		lookup[proxy.Name()] = proxy
-	}
-
-	pool := make([]C.Proxy, 0, len(u.pool))
-	for _, name := range u.pool {
-		if proxy, ok := lookup[name]; ok {
-			pool = append(pool, proxy)
-		}
-	}
+	pool, _ := proxiesByNames(proxies, u.pool)
 	return pool
 }
 
@@ -475,18 +461,8 @@ func (u *URLTestPool) quickCheck() {
 	}
 
 	proxies := u.GetProxies(true)
-	lookup := make(map[string]C.Proxy, len(proxies))
-	for _, proxy := range proxies {
-		lookup[proxy.Name()] = proxy
-	}
-
-	poolProxies := make([]C.Proxy, 0, len(names))
-	for _, name := range names {
-		if proxy, ok := lookup[name]; ok {
-			poolProxies = append(poolProxies, proxy)
-		}
-	}
-	if len(poolProxies) != len(names) {
+	poolProxies, complete := proxiesByNames(proxies, names)
+	if !complete {
 		// the proxy list has been changed, rebuild the pool
 		u.fullCheck()
 		return
@@ -589,16 +565,7 @@ func (u *URLTestPool) recoverAfterFailure(ctx context.Context) C.Proxy {
 	}
 
 	proxies := u.GetProxies(true)
-	lookup := make(map[string]C.Proxy, len(proxies))
-	for _, proxy := range proxies {
-		lookup[proxy.Name()] = proxy
-	}
-	candidates := make([]C.Proxy, 0, len(names))
-	for _, name := range names {
-		if proxy, ok := lookup[name]; ok {
-			candidates = append(candidates, proxy)
-		}
-	}
+	candidates, _ := proxiesByNames(proxies, names)
 	if len(candidates) == 0 {
 		u.requestFullCheckOnExhaustion()
 		return nil
@@ -621,10 +588,7 @@ func (u *URLTestPool) recoverAfterFailure(ctx context.Context) C.Proxy {
 		return nil
 	}
 
-	if proxy, ok := lookup[best]; ok {
-		return proxy
-	}
-	return nil
+	return proxyByName(proxies, best)
 }
 
 func (u *URLTestPool) fullCheck() {
@@ -727,6 +691,46 @@ func containsProxy(proxies []C.Proxy, target C.Proxy) bool {
 		}
 	}
 	return false
+}
+
+// proxiesByNames resolves the given member names against the current proxy
+// list, preserving the requested order and reporting whether every name was
+// found. It runs on the dial path, so it allocates a set of the requested
+// names instead of a lookup map over every member of the group.
+func proxiesByNames(proxies []C.Proxy, names []string) ([]C.Proxy, bool) {
+	if len(names) == 0 {
+		return nil, true
+	}
+
+	wanted := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		wanted[name] = struct{}{}
+	}
+
+	found := make(map[string]C.Proxy, len(names))
+	for _, proxy := range proxies {
+		if _, ok := wanted[proxy.Name()]; ok {
+			found[proxy.Name()] = proxy
+		}
+	}
+
+	resolved := make([]C.Proxy, 0, len(names))
+	for _, name := range names {
+		if proxy, ok := found[name]; ok {
+			resolved = append(resolved, proxy)
+		}
+	}
+	return resolved, len(resolved) == len(names)
+}
+
+// proxyByName returns the member with the given name, if it still exists.
+func proxyByName(proxies []C.Proxy, name string) C.Proxy {
+	for _, proxy := range proxies {
+		if proxy.Name() == name {
+			return proxy
+		}
+	}
+	return nil
 }
 
 func shouldTrackDialFailure(adapterType C.AdapterType, err error) bool {

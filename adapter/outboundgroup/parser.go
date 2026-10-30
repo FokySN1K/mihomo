@@ -148,9 +148,11 @@ func ParseProxyGroup(config map[string]any, proxyMap map[string]C.Proxy, provide
 			if groupOption.URL == "" {
 				groupOption.URL = C.DefaultTestURL
 			}
-		} else if groupOption.Type != "url-test-pool" && groupOption.Type != "cascade" {
-			// url-test-pool and cascade run their own checks
-			addTestUrlToProviders(PDs, groupOption.URL, expectedStatus, groupOption.Filter, uint(groupOption.Interval))
+		} else {
+			// url-test-pool and cascade run their own checks and shouldn't touch provider health checks
+			if groupOption.Type != "url-test-pool" && groupOption.Type != "cascade" {
+				addTestUrlToProviders(PDs, groupOption.URL, expectedStatus, groupOption.Filter, uint(groupOption.Interval))
+			}
 		}
 		providers = append(providers, PDs...)
 	}
@@ -178,7 +180,7 @@ func ParseProxyGroup(config map[string]any, proxyMap map[string]C.Proxy, provide
 
 		hcInterval := uint(groupOption.Interval)
 		if groupOption.Type == "url-test-pool" || groupOption.Type == "cascade" {
-			// url-test-pool and cascade control their own checking schedule
+			// url-test-pool and cascade control their own checking schedule, the provider ticker must stay disabled
 			hcInterval = 0
 		}
 

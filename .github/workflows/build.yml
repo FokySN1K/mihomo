@@ -25,6 +25,8 @@ env:
   REGISTRY: docker.io
 jobs:
   build:
+    # upstream-only: the fork ships its own core build from release-core.yml
+    if: ${{ github.repository == 'MetaCubeX/mihomo' }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
