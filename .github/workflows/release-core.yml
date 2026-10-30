@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version label for the artifacts (optional)"
+        description: "Release version (empty = next auto number from .github/release-version)"
         required: false
         default: ""
 
@@ -23,26 +23,69 @@ concurrency:
 
 jobs:
   # A push to the release branch builds only the linux/windows core, a tag
-  # release keeps the full target set. The matrix is assembled here because the
-  # matrix context is not available in a job-level `if`.
+  # release keeps the full target set. The matrix and the release number are
+  # resolved here because job-level `if` cannot see the matrix context.
   prepare:
-    name: Prepare matrix
+    name: Prepare release
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
+      targets: ${{ steps.select.outputs.targets }}
+      version: ${{ steps.version.outputs.version }}
+      buildtime: ${{ steps.version.outputs.buildtime }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags are needed to pick the next release number
+          fetch-tags: true
+
       - name: Select targets
         id: select
         shell: bash
         run: |
           set -euo pipefail
           core='{"goos":"linux","goarch":"amd64","goamd64":"v3"},{"goos":"linux","goarch":"arm64"},{"goos":"windows","goarch":"amd64","goamd64":"v3","ext":".exe"},{"goos":"windows","goarch":"arm64","ext":".exe"}'
+          core_names='linux/amd64 (v3), linux/arm64, windows/amd64 (v3), windows/arm64'
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             matrix="{\"include\":[${core},{\"goos\":\"darwin\",\"goarch\":\"amd64\",\"goamd64\":\"v3\"},{\"goos\":\"darwin\",\"goarch\":\"arm64\"}]}"
+            targets="${core_names}, darwin/amd64 (v3), darwin/arm64"
           else
             matrix="{\"include\":[${core}]}"
+            targets="${core_names}"
           fi
           echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          echo "targets=${targets}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME}"
+          elif [[ -n "${INPUT_VERSION}" ]]; then
+            version="${INPUT_VERSION}"
+          else
+            # releases are numbered v<base>.<n>; the next number is the highest
+            # tag with the same base plus one, so every merge gets its own
+            base="$(tr -d '[:space:]' < .github/release-version)"
+            [[ -n "${base}" ]] || { echo "empty .github/release-version" >&2; exit 1; }
+            max=0
+            while IFS= read -r tag; do
+              n="${tag#"v${base}."}"
+              if [[ "${n}" =~ ^[0-9]+$ ]] && (( n > max )); then
+                max="${n}"
+              fi
+            done < <(git tag --list "v${base}.*")
+            version="v${base}.$((max + 1))"
+          fi
+          [[ "${version}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo "bad version: ${version}" >&2; exit 1; }
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "buildtime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo "resolved version: ${version}"
 
   build:
     name: ${{ matrix.goos }}-${{ matrix.goarch }}
@@ -62,23 +105,6 @@ jobs:
           go-version: "1.27.x"
           check-latest: true
 
-      - name: Resolve version
-        id: vars
-        shell: bash
-        run: |
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            version="${GITHUB_REF_NAME}"
-          elif [[ -n "${{ inputs.version }}" ]]; then
-            version="${{ inputs.version }}"
-          elif [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
-            # branch builds carry the branch name and the commit they were built from
-            version="${GITHUB_REF_NAME,,}-${GITHUB_SHA::7}"
-          else
-            version="dev-${GITHUB_SHA::7}"
-          fi
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "buildtime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
-
       - name: Build
         shell: bash
         env:
@@ -86,25 +112,28 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           GOAMD64: ${{ matrix.goamd64 }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          BUILDTIME: ${{ needs.prepare.outputs.buildtime }}
         run: |
           set -euo pipefail
           out="mihomo-${GOOS}-${GOARCH}"
           mkdir -p dist
           go build -tags with_gvisor -trimpath \
-            -ldflags "-X github.com/metacubex/mihomo/constant.Version=${{ steps.vars.outputs.version }} -X github.com/metacubex/mihomo/constant.BuildTime=${{ steps.vars.outputs.buildtime }} -w -s -buildid=" \
+            -ldflags "-X github.com/metacubex/mihomo/constant.Version=${VERSION} -X github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME} -w -s -buildid=" \
             -o "dist/${out}${{ matrix.ext }}"
 
       - name: Package
         shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          version="${{ steps.vars.outputs.version }}"
           cd dist
           if [[ "${{ matrix.goos }}" == "windows" ]]; then
-            zip -9 "mihomo-${{ matrix.goos }}-${{ matrix.goarch }}-${version}.zip" "mihomo-${{ matrix.goos }}-${{ matrix.goarch }}.exe"
+            zip -9 "mihomo-${{ matrix.goos }}-${{ matrix.goarch }}-${VERSION}.zip" "mihomo-${{ matrix.goos }}-${{ matrix.goarch }}.exe"
             rm "mihomo-${{ matrix.goos }}-${{ matrix.goarch }}.exe"
           else
-            gzip -9 -c "mihomo-${{ matrix.goos }}-${{ matrix.goarch }}" > "mihomo-${{ matrix.goos }}-${{ matrix.goarch }}-${version}.gz"
+            gzip -9 -c "mihomo-${{ matrix.goos }}-${{ matrix.goarch }}" > "mihomo-${{ matrix.goos }}-${{ matrix.goarch }}-${VERSION}.gz"
             rm "mihomo-${{ matrix.goos }}-${{ matrix.goarch }}"
           fi
 
@@ -117,12 +146,17 @@ jobs:
 
   release:
     name: Publish release
-    # a push to the release branch publishes a prerelease tagged <branch>-<sha>,
-    # a v* tag keeps its own tag name
-    if: github.event_name == 'push'
-    needs: build
+    # every push to the release branch and every manual run publishes a numbered
+    # release; a pushed v* tag keeps its own name
+    needs: [prepare, build]
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -137,22 +171,71 @@ jobs:
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
 
-      - name: Resolve release tag
-        id: tag
+      - name: Compose release notes
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          BUILDTIME: ${{ needs.prepare.outputs.buildtime }}
+          TARGETS: ${{ needs.prepare.outputs.targets }}
         run: |
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            tag="${GITHUB_REF_NAME}"
-          else
-            tag="${GITHUB_REF_NAME,,}-${GITHUB_SHA::7}"
-          fi
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY}"
+          sha="${GITHUB_SHA}"
+          short="${sha:0:7}"
+
+          # the previous release of this repository; upstream tags are not
+          # releases here, so they never leak into the changelog range
+          prev=""
+          while IFS= read -r tag; do
+            if [[ -n "${tag}" && "${tag}" != "${VERSION}" ]]; then
+              prev="${tag}"
+              break
+            fi
+          done < <(gh api "repos/${repo}/releases?per_page=30" --jq '.[].tag_name' 2>/dev/null || true)
+
+          {
+            echo "## ${VERSION}"
+            echo
+            echo "Сборка ядра mihomo из ветки \`${GITHUB_REF_NAME}\`, коммит [\`${short}\`](https://github.com/${repo}/commit/${sha})."
+            echo
+            echo "### Что изменилось"
+            echo
+            if [[ -n "${prev}" ]]; then
+              notes="$(git log --no-merges --max-count=25 --pretty=format:'- %s (%h)' "${prev}..${sha}" || true)"
+              if [[ -n "${notes}" ]]; then
+                echo "${notes}"
+                echo
+                echo "[Полный список изменений](https://github.com/${repo}/compare/${prev}...${sha})"
+              else
+                echo "Код не менялся с ${prev} — повторная сборка того же коммита."
+              fi
+            else
+              notes="$(git log --no-merges --max-count=25 --pretty=format:'- %s (%h)' "${sha}" || true)"
+              echo "${notes:-Первая сборка в этой схеме нумерации.}"
+            fi
+            echo
+            echo "### Сборка"
+            echo
+            echo "- цели: ${TARGETS}"
+            echo "- go 1.27.x, \`-tags with_gvisor\`, CGO отключён"
+            echo "- собрано: ${BUILDTIME}"
+            echo "- контрольные суммы: \`SHA256SUMS\` в ассетах"
+            echo
+            echo "### Проверка"
+            echo
+            echo '```'
+            echo 'sha256sum -c SHA256SUMS'
+            echo '```'
+          } > RELEASE_NOTES.md
+          cat RELEASE_NOTES.md
 
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
+          tag_name: ${{ needs.prepare.outputs.version }}
+          name: ${{ needs.prepare.outputs.version }}
           target_commitish: ${{ github.sha }}
+          body_path: RELEASE_NOTES.md
           files: dist/*
-          generate_release_notes: true
-          prerelease: ${{ contains(steps.tag.outputs.tag, '-') }}
+          prerelease: ${{ contains(needs.prepare.outputs.version, '-') }}
