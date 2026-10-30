@@ -373,6 +373,47 @@ func TestCascadeDoesNotDemoteDirectFailures(t *testing.T) {
 	group.mu.RUnlock()
 }
 
+func TestCascadeCandidateOrderIgnoresRemovedHead(t *testing.T) {
+	group := newCascadeForTest(t, CascadeOption{}, newCascadeTestProxy("a"), newCascadeTestProxy("b"))
+
+	// the pinned and active names may point to members that were already
+	// removed from the providers; they must not disturb the order
+	group.mu.Lock()
+	group.selected = "removed"
+	group.active = "removed"
+	group.lastActive = "removed"
+	group.mu.Unlock()
+
+	order := group.candidateOrder(group.GetProxies(false))
+	require.Equal(t, []string{"a", "b"}, cascadeProxyNames(order))
+}
+
+func TestCascadeCandidateOrderDeduplicatesHead(t *testing.T) {
+	group := newCascadeForTest(t, CascadeOption{}, newCascadeTestProxy("a"), newCascadeTestProxy("b"))
+
+	group.mu.Lock()
+	group.selected = "b"
+	group.active = "b"
+	group.lastActive = "b"
+	group.mu.Unlock()
+
+	order := group.candidateOrder(group.GetProxies(false))
+	require.Equal(t, []string{"b", "a"}, cascadeProxyNames(order), "the same head member must be added once")
+}
+
+func TestCascadeCandidateOrderDeduplicatesMembers(t *testing.T) {
+	a := newCascadeTestProxy("a")
+	group := newCascadeForTest(t, CascadeOption{}, a, newCascadeTestProxy("b"))
+
+	// overlapping providers may expose proxies with the same name; the order
+	// must keep every candidate once so it is not dialed twice per connection
+	proxies := append([]C.Proxy(nil), group.GetProxies(false)...)
+	proxies = append(proxies, a)
+
+	order := group.candidateOrder(proxies)
+	require.Equal(t, []string{"a", "b"}, cascadeProxyNames(order))
+}
+
 func TestCascadeCheckWarmsLookahead(t *testing.T) {
 	group := newCascadeForTest(t, CascadeOption{Lookahead: intPtr(1)},
 		newCascadeFakeProxy("a", C.Shadowsocks, nil, errors.New("timeout"), 0),

@@ -222,3 +222,31 @@ func TestURLTestPoolTracksOnlyDialFailures(t *testing.T) {
 	require.True(t, shouldTrackDialFailure(C.Shadowsocks, errDial))
 	require.True(t, shouldTrackDialFailure(C.URLTestPool, errDial))
 }
+
+func TestURLTestPoolProxiesByNames(t *testing.T) {
+	a := newPoolDeadProxy("a")
+	b := newPoolDeadProxy("b")
+	c := newPoolDeadProxy("c")
+
+	resolved, complete := proxiesByNames([]C.Proxy{a, b, c}, []string{"c", "a"})
+	require.True(t, complete)
+	require.Equal(t, []string{"c", "a"}, cascadeProxyNames(resolved), "the requested order must be preserved")
+
+	// a removed member makes the resolution incomplete but keeps the rest
+	resolved, complete = proxiesByNames([]C.Proxy{a, c}, []string{"b", "c"})
+	require.False(t, complete)
+	require.Equal(t, []string{"c"}, cascadeProxyNames(resolved))
+
+	resolved, complete = proxiesByNames([]C.Proxy{a}, nil)
+	require.True(t, complete)
+	require.Empty(t, resolved)
+}
+
+func TestURLTestPoolProxiesLockedKeepsPoolOrder(t *testing.T) {
+	a := newPoolDeadProxy("a")
+	b := newPoolDeadProxy("b")
+	c := newPoolDeadProxy("c")
+
+	pool := &URLTestPool{pool: []string{"c", "a", "removed"}}
+	require.Equal(t, []string{"c", "a"}, cascadeProxyNames(pool.poolProxiesLocked([]C.Proxy{a, b, c})))
+}
