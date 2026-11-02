@@ -137,6 +137,24 @@ func TestURLTestPoolNoRecoveryCheckWithoutEmptyPool(t *testing.T) {
 	require.False(t, pool.testing.Load())
 }
 
+func TestURLTestPoolExhaustionCheckThrottled(t *testing.T) {
+	pool, err := NewURLTestPool(GroupCommonOption{Name: "pool"}, URLTestPoolOption{}, newPoolEmptyFallback(), nil)
+	require.NoError(t, err)
+
+	now := time.Now()
+	pool.pool = []string{"a"}
+	pool.lastFull.Store(now)
+	require.False(t, pool.shouldRequestFullCheckOnExhaustion(now),
+		"a full check that just found the pool alive must not be repeated")
+	require.True(t, pool.shouldRequestFullCheckOnExhaustion(now.Add(pool.interval+time.Second)))
+
+	pool.pool = nil
+	pool.lastEmptyFull = now
+	require.False(t, pool.shouldRequestFullCheckOnExhaustion(now),
+		"an empty pool keeps its own throttle")
+	require.True(t, pool.shouldRequestFullCheckOnExhaustion(now.Add(pool.interval+time.Second)))
+}
+
 func TestURLTestPoolSortedProxyNames(t *testing.T) {
 	results := map[string]uint16{
 		"slow":   300,
@@ -240,6 +258,138 @@ func TestURLTestPoolProxiesByNames(t *testing.T) {
 	resolved, complete = proxiesByNames([]C.Proxy{a}, nil)
 	require.True(t, complete)
 	require.Empty(t, resolved)
+}
+
+// newPoolForTest builds a pool whose scheduler is frozen, so unit tests never
+// race with an automatically started health check.
+func newPoolForTest(t *testing.T, opt URLTestPoolOption, proxies ...C.Proxy) *URLTestPool {
+	t.Helper()
+
+	pd, err := provider.NewCompatibleProvider("pool", proxies,
+		provider.NewHealthCheck(nil, "", 0, 0, false, nil))
+	require.NoError(t, err)
+
+	pool, err := NewURLTestPool(GroupCommonOption{Name: "pool", Interval: 300},
+		opt, newPoolEmptyFallback(), []P.ProxyProvider{pd})
+	require.NoError(t, err)
+	pool.testUrl = "http://127.0.0.1:1/"
+	pool.pool = cascadeProxyNames(proxies)
+	pool.lastPool = append([]string(nil), pool.pool...)
+	pool.hasFullCheck.Store(true)
+	pool.lastFull.Store(time.Now())
+	pool.lastQuick.Store(time.Now())
+	return pool
+}
+
+func newPoolFailingProxy(name string, log *dialLog) *cascadeFakeProxy {
+	return newCascadeFakeProxy(name, C.Shadowsocks, func(context.Context, *C.Metadata) (C.Conn, error) {
+		log.record(name)
+		return nil, errors.New("dial failed")
+	}, nil, 0)
+}
+
+func newPoolSucceedingProxy(name string, log *dialLog) *cascadeFakeProxy {
+	return newCascadeFakeProxy(name, C.Shadowsocks, func(context.Context, *C.Metadata) (C.Conn, error) {
+		log.record(name)
+		return &cascadeFakeConn{}, nil
+	}, nil, 0)
+}
+
+func TestURLTestPoolAttemptTimeoutTriesNextMember(t *testing.T) {
+	log := &dialLog{}
+	pool := newPoolForTest(t, URLTestPoolOption{AttemptTimeout: intPtr(1000)},
+		newPoolFailingProxy("a", log),
+		newPoolSucceedingProxy("b", log),
+	)
+
+	conn, err := pool.DialContext(context.Background(), &C.Metadata{})
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	require.Equal(t, []string{"a", "b"}, log.list())
+	require.Equal(t, "b", pool.Now(), "the member that proved connectivity must be preferred")
+}
+
+func TestURLTestPoolAttemptTimeoutCutsHangingMember(t *testing.T) {
+	a := newCascadeFakeProxy("a", C.Shadowsocks, func(ctx context.Context, _ *C.Metadata) (C.Conn, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}, nil, 0)
+	log := &dialLog{}
+	pool := newPoolForTest(t, URLTestPoolOption{AttemptTimeout: intPtr(60)},
+		a,
+		newPoolSucceedingProxy("b", log),
+	)
+
+	start := time.Now()
+	conn, err := pool.DialContext(context.Background(), &C.Metadata{})
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	require.Equal(t, []string{"b"}, log.list())
+	require.GreaterOrEqual(t, elapsed, 60*time.Millisecond)
+	require.Less(t, elapsed, 2*time.Second)
+}
+
+func TestURLTestPoolKeepsSingleDialWithoutAttemptTimeout(t *testing.T) {
+	log := &dialLog{}
+	pool := newPoolForTest(t, URLTestPoolOption{},
+		newPoolFailingProxy("a", log),
+		newPoolSucceedingProxy("b", log),
+	)
+
+	_, err := pool.DialContext(context.Background(), &C.Metadata{})
+	require.Error(t, err)
+	require.Equal(t, []string{"a"}, log.list(), "without attempt-timeout the pool keeps one dial per call")
+}
+
+func TestURLTestPoolAttemptTimeoutRunsFullCheckOnExhaustion(t *testing.T) {
+	log := &dialLog{}
+	brokenTest := errors.New("test failed")
+	failing := func(name string) *cascadeFakeProxy {
+		return newCascadeFakeProxy(name, C.Shadowsocks, func(context.Context, *C.Metadata) (C.Conn, error) {
+			log.record(name)
+			return nil, errors.New("dial failed")
+		}, brokenTest, 0)
+	}
+	pool := newPoolForTest(t, URLTestPoolOption{AttemptTimeout: intPtr(1000)}, failing("a"), failing("b"))
+
+	_, err := pool.DialContext(context.Background(), &C.Metadata{})
+	require.Error(t, err)
+	require.Equal(t, []string{"a", "b"}, log.list())
+
+	time.Sleep(100 * time.Millisecond)
+	pool.mu.RLock()
+	empty := pool.lastEmptyFull.IsZero()
+	pool.mu.RUnlock()
+	require.True(t, empty, "a recent full check must throttle exhaustion rechecks")
+
+	// Once the full check is stale, exhaustion may probe the whole pool again.
+	pool.lastFull.Store(time.Now().Add(-pool.interval - time.Second))
+	pool.markSuspicious("a")
+
+	require.Eventually(t, func() bool {
+		pool.mu.RLock()
+		defer pool.mu.RUnlock()
+		return !pool.lastEmptyFull.IsZero()
+	}, 2*time.Second, 10*time.Millisecond, "a stale pool must trigger a full check")
+}
+
+func TestURLTestPoolAttemptTimeoutOption(t *testing.T) {
+	pool, err := NewURLTestPool(GroupCommonOption{Name: "pool"},
+		URLTestPoolOption{AttemptTimeout: intPtr(750)}, newPoolEmptyFallback(), nil)
+	require.NoError(t, err)
+	require.Equal(t, 750*time.Millisecond, pool.attemptTimeout)
+
+	pool, err = NewURLTestPool(GroupCommonOption{Name: "pool"},
+		URLTestPoolOption{AttemptTimeout: intPtr(-1)}, newPoolEmptyFallback(), nil)
+	require.NoError(t, err)
+	require.Zero(t, pool.attemptTimeout, "a negative attempt-timeout disables the bound")
+
+	pool, err = NewURLTestPool(GroupCommonOption{Name: "pool"},
+		URLTestPoolOption{}, newPoolEmptyFallback(), nil)
+	require.NoError(t, err)
+	require.Zero(t, pool.attemptTimeout)
 }
 
 func TestURLTestPoolProxiesLockedKeepsPoolOrder(t *testing.T) {

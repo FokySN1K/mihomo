@@ -50,6 +50,10 @@ type URLTestPoolOption struct {
 	DialTimeout *int `group:"dial-timeout,omitempty"`
 	// DialRetryLimit is how many times the tunnel may retry such a connection.
 	DialRetryLimit *int `group:"dial-retry-limit,omitempty"`
+	// AttemptTimeout bounds one pool member dial, in milliseconds. When it is
+	// set, a failed member is followed by the next one while the caller's
+	// budget lasts; 0 keeps the single dial per call.
+	AttemptTimeout *int `group:"attempt-timeout,omitempty"`
 }
 
 // URLTestPool keeps a fixed pool of the fastest proxies.
@@ -58,7 +62,8 @@ type URLTestPoolOption struct {
 // the pool. When the pool stays underfilled (some members are dead) for
 // several quick checks in a row, a full check is started early to refill it.
 // Dial failures mark the used proxy as suspicious so the next connection is
-// routed to the next best pool member.
+// routed to the next best pool member; with `attempt-timeout` set, the next
+// member is tried inside the same call as well.
 type URLTestPool struct {
 	*GroupBase
 	disableUDP     bool
@@ -72,6 +77,7 @@ type URLTestPool struct {
 	tolerance      uint16
 	dialTimeout    time.Duration
 	dialRetryLimit int
+	attemptTimeout time.Duration
 	lazy           bool
 
 	mu            sync.RWMutex
@@ -94,10 +100,27 @@ type URLTestPool struct {
 
 // DialContext implements C.ProxyAdapter
 func (u *URLTestPool) DialContext(ctx context.Context, metadata *C.Metadata) (c C.Conn, err error) {
-	proxy, recovery := u.fastForDial(true)
-	c, err = proxy.DialContext(ctx, metadata)
-	if err != nil {
+	var proxy C.Proxy
+	tried := make(map[string]struct{})
+
+	for {
+		var recovery bool
+		proxy, recovery = u.fastForDial(true)
+		if _, ok := tried[proxy.Name()]; ok {
+			// every fresh member has already been tried
+			break
+		}
+		tried[proxy.Name()] = struct{}{}
+
+		dialCtx, cancel := u.attemptContext(ctx)
+		c, err = proxy.DialContext(dialCtx, metadata)
+		cancel()
+		if err == nil {
+			break
+		}
+
 		u.onProxyFailed(proxy, err)
+
 		if recovery {
 			if fallback := u.recoverAfterFailure(ctx); fallback != nil {
 				proxy = fallback
@@ -106,6 +129,13 @@ func (u *URLTestPool) DialContext(ctx context.Context, metadata *C.Metadata) (c 
 					u.onProxyFailed(proxy, err)
 				}
 			}
+			break
+		}
+
+		// Without attempt-timeout the pool keeps its single dial per call;
+		// with it, the next member is tried while the caller's budget lasts.
+		if u.attemptTimeout <= 0 || ctx.Err() != nil {
+			break
 		}
 	}
 
@@ -127,17 +157,44 @@ func (u *URLTestPool) DialContext(ctx context.Context, metadata *C.Metadata) (c 
 	return c, err
 }
 
+// attemptContext bounds one member dial by attempt-timeout without touching
+// the caller's budget: a closer parent deadline still wins.
+func (u *URLTestPool) attemptContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if u.attemptTimeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, u.attemptTimeout)
+}
+
 // ListenPacketContext implements C.ProxyAdapter
 func (u *URLTestPool) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
-	proxy, _ := u.fastForDial(true)
-	pc, err := proxy.ListenPacketContext(ctx, metadata)
-	if err == nil {
-		pc.AppendToChains(u)
-		u.noteDialSucceeded(proxy)
-	} else {
+	var lastErr error
+	tried := make(map[string]struct{})
+
+	for {
+		proxy, _ := u.fastForDial(true)
+		if _, ok := tried[proxy.Name()]; ok {
+			break
+		}
+		tried[proxy.Name()] = struct{}{}
+
+		dialCtx, cancel := u.attemptContext(ctx)
+		pc, err := proxy.ListenPacketContext(dialCtx, metadata)
+		cancel()
+		if err == nil {
+			pc.AppendToChains(u)
+			u.noteDialSucceeded(proxy)
+			return pc, nil
+		}
+
+		lastErr = err
 		u.onProxyFailed(proxy, err)
+		if u.attemptTimeout <= 0 || ctx.Err() != nil {
+			break
+		}
 	}
-	return pc, err
+
+	return nil, lastErr
 }
 
 // SupportUDP implements C.ProxyAdapter
@@ -424,16 +481,32 @@ func (u *URLTestPool) maybeScheduleCheck() {
 }
 
 // requestFullCheckOnExhaustion runs a full check when there is no usable proxy left.
-// It is throttled by `interval` after a full check that found nothing alive.
+// It is throttled by `interval`: after a full check that found nothing alive,
+// and after a recent full check that found the pool alive but every dial still
+// failed. The latter prevents a failed health check from probing the whole
+// provider on every connection.
 func (u *URLTestPool) requestFullCheckOnExhaustion() {
-	u.mu.RLock()
-	lastEmpty := u.lastEmptyFull
-	u.mu.RUnlock()
-
-	if !lastEmpty.IsZero() && time.Since(lastEmpty) < u.interval {
+	if !u.shouldRequestFullCheckOnExhaustion(time.Now()) {
 		return
 	}
 	u.scheduleCheck(true)
+}
+
+func (u *URLTestPool) shouldRequestFullCheckOnExhaustion(now time.Time) bool {
+	u.mu.RLock()
+	lastEmpty := u.lastEmptyFull
+	empty := len(u.pool) == 0
+	u.mu.RUnlock()
+
+	if !lastEmpty.IsZero() && now.Sub(lastEmpty) < u.interval {
+		return false
+	}
+	if !empty {
+		if last, ok := u.lastFull.LoadOk(); ok && now.Sub(last) < u.interval {
+			return false
+		}
+	}
+	return true
 }
 
 func (u *URLTestPool) scheduleCheck(full bool) {
@@ -800,6 +873,14 @@ func NewURLTestPool(option GroupCommonOption, poolOption URLTestPoolOption, empt
 		}
 	}
 
+	attemptTimeout := time.Duration(0)
+	if poolOption.AttemptTimeout != nil {
+		attemptTimeout = time.Duration(*poolOption.AttemptTimeout) * time.Millisecond
+		if attemptTimeout < 0 {
+			attemptTimeout = 0
+		}
+	}
+
 	testUrl := option.URL
 	if testUrl == "" {
 		testUrl = C.DefaultTestURL
@@ -830,6 +911,7 @@ func NewURLTestPool(option GroupCommonOption, poolOption URLTestPoolOption, empt
 		tolerance:      poolOption.Tolerance,
 		dialTimeout:    dialTimeout,
 		dialRetryLimit: dialRetryLimit,
+		attemptTimeout: attemptTimeout,
 		lazy:           option.Lazy,
 		suspicious:     make(map[string]struct{}),
 	}, nil

@@ -110,6 +110,29 @@ func intPtr(v int) *int {
 	return &v
 }
 
+func boolPtr(v bool) *bool {
+	return &v
+}
+
+type cascadeBudgetAdapter struct {
+	*cascadeFakeAdapter
+	timeout time.Duration
+}
+
+func (b *cascadeBudgetAdapter) DialTimeout() time.Duration { return b.timeout }
+
+func (b *cascadeBudgetAdapter) DialRetryLimit() int { return 1 }
+
+func newCascadeBudgetProxy(name string, timeout time.Duration) *cascadeFakeProxy {
+	base := outbound.NewBase(outbound.BaseOption{Name: name, Type: C.Shadowsocks, UDP: true})
+	return &cascadeFakeProxy{Proxy: adapter.NewProxy(&cascadeBudgetAdapter{
+		cascadeFakeAdapter: &cascadeFakeAdapter{Base: base, dialFn: func(context.Context, *C.Metadata) (C.Conn, error) {
+			return &cascadeFakeConn{}, nil
+		}},
+		timeout: timeout,
+	})}
+}
+
 // newCascadeForTest builds a group and freezes its scheduler, so unit tests
 // never race with an automatically started health check.
 func newCascadeForTest(t *testing.T, opt CascadeOption, proxies ...C.Proxy) *Cascade {
@@ -144,6 +167,8 @@ func TestCascadeDefaults(t *testing.T) {
 	require.Equal(t, 30*time.Second, group.failedCooldown)
 	require.Equal(t, 300*time.Second, group.interval)
 	require.Equal(t, C.DefaultTestURL, group.testUrl)
+	require.False(t, group.preferFirst)
+	require.Zero(t, group.attemptTimeout)
 
 	_, err = NewCascade(GroupCommonOption{Name: "cascade"}, CascadeOption{}, nil, nil)
 	require.ErrorContains(t, err, "empty fallback proxy not exist")
@@ -168,12 +193,16 @@ func TestCascadeExplicitOptions(t *testing.T) {
 			Lookahead:      intPtr(4),
 			MaxAttempts:    intPtr(7),
 			FailedCooldown: intPtr(15),
+			PreferFirst:    boolPtr(true),
+			AttemptTimeout: intPtr(1500),
 		}, newPoolEmptyFallback(), nil)
 	require.NoError(t, err)
 
 	require.Equal(t, 4, group.lookahead)
 	require.Equal(t, 7, group.maxAttempts)
 	require.Equal(t, 15*time.Second, group.failedCooldown)
+	require.True(t, group.preferFirst)
+	require.Equal(t, 1500*time.Millisecond, group.attemptTimeout)
 }
 
 func TestCascadeAcceptsNestedGroup(t *testing.T) {
@@ -306,6 +335,73 @@ func TestCascadeSettleActive(t *testing.T) {
 	require.Equal(t, "b", group.active)
 }
 
+func TestCascadePreferFirstReturnsToFirstAlive(t *testing.T) {
+	group := newCascadeForTest(t, CascadeOption{PreferFirst: boolPtr(true)},
+		newCascadeTestProxy("a"), newCascadeTestProxy("b"))
+	proxies := group.GetProxies(false)
+
+	group.mu.Lock()
+	group.states["a"] = &cascadeState{alive: true}
+	group.states["b"] = &cascadeState{alive: true}
+	group.active = "b"
+	group.mu.Unlock()
+
+	order := group.candidateOrder(proxies)
+	require.Equal(t, []string{"a", "b"}, cascadeProxyNames(order),
+		"prefer-first must not pin the fallback that took over")
+
+	group.settleActive(proxies)
+	group.mu.RLock()
+	require.Equal(t, "a", group.active)
+	group.mu.RUnlock()
+
+	// an explicit choice still wins
+	group.ForceSet("b")
+	group.settleActive(proxies)
+	group.mu.RLock()
+	require.Equal(t, "b", group.active)
+	group.mu.RUnlock()
+}
+
+func TestCascadeAttemptTimeoutCutsHangingDial(t *testing.T) {
+	log := &dialLog{}
+	hang := newCascadeFakeProxy("hang", C.Shadowsocks, func(ctx context.Context, _ *C.Metadata) (C.Conn, error) {
+		log.record("hang")
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}, nil, 0)
+	group := newCascadeForTest(t, CascadeOption{AttemptTimeout: intPtr(30), FailedCooldown: intPtr(0)},
+		hang, newCascadeSucceedingProxy("ok", log))
+
+	start := time.Now()
+	conn, err := group.DialContext(context.Background(), &C.Metadata{})
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	require.Less(t, time.Since(start), time.Second)
+	require.Equal(t, []string{"hang", "ok"}, log.list())
+
+	group.mu.RLock()
+	require.False(t, group.states["hang"].alive)
+	group.mu.RUnlock()
+}
+
+func TestCascadeAttemptContextSkipsNestedBudget(t *testing.T) {
+	group := newCascadeForTest(t, CascadeOption{AttemptTimeout: intPtr(30)}, newCascadeTestProxy("a"))
+	parent, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	ctx, cancelAttempt := group.attemptContext(parent, newCascadeTestProxy("plain"))
+	defer cancelAttempt()
+	deadline, ok := ctx.Deadline()
+	require.True(t, ok)
+	require.WithinDuration(t, time.Now().Add(30*time.Millisecond), deadline, 25*time.Millisecond)
+
+	budget := newCascadeBudgetProxy("nested", time.Second)
+	ctx, cancelAttempt = group.attemptContext(parent, budget)
+	defer cancelAttempt()
+	require.Equal(t, parent, ctx, "a candidate with its own dial budget must not be cut")
+}
+
 func TestCascadeDialFailsOverWithinOneConnection(t *testing.T) {
 	log := &dialLog{}
 	group := newCascadeForTest(t, CascadeOption{},
@@ -348,6 +444,26 @@ func TestCascadeDialRespectsMaxAttempts(t *testing.T) {
 	_, probedC := group.states["c"]
 	group.mu.RUnlock()
 	require.False(t, probedC)
+}
+
+func TestCascadeWrapsPoolAttemptTimeout(t *testing.T) {
+	log := &dialLog{}
+	pool := newPoolForTest(t, URLTestPoolOption{AttemptTimeout: intPtr(60)},
+		newCascadeFakeProxy("dead", C.Shadowsocks, func(context.Context, *C.Metadata) (C.Conn, error) {
+			return nil, errors.New("dial failed")
+		}, nil, 0),
+		newCascadeFakeProxy("alive", C.Shadowsocks, func(context.Context, *C.Metadata) (C.Conn, error) {
+			log.record("alive")
+			return &cascadeFakeConn{}, nil
+		}, nil, 0),
+	)
+
+	group := newCascadeForTest(t, CascadeOption{}, adapter.NewProxy(pool))
+	conn, err := group.DialContext(context.Background(), &C.Metadata{})
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	require.Equal(t, []string{"alive"}, log.list(), "the pool must replace its dead member inside the cascade attempt")
+	require.Equal(t, "pool", group.Now(), "the cascade must keep the pool as the active candidate")
 }
 
 func TestCascadeDoesNotDemoteDirectFailures(t *testing.T) {

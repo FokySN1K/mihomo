@@ -52,6 +52,13 @@ type CascadeOption struct {
 	DialTimeout *int `group:"dial-timeout,omitempty"`
 	// DialRetryLimit is how many times the tunnel may retry such a connection.
 	DialRetryLimit *int `group:"dial-retry-limit,omitempty"`
+	// PreferFirst returns to the first alive candidate after an outage instead
+	// of staying on the fallback that took over.
+	PreferFirst *bool `group:"prefer-first,omitempty"`
+	// AttemptTimeout bounds one candidate dial in milliseconds. Candidates
+	// that expose their own DialBudget are left alone, so a nested pool keeps
+	// its full retry budget.
+	AttemptTimeout *int `group:"attempt-timeout,omitempty"`
 }
 
 type cascadeState struct {
@@ -78,6 +85,8 @@ type Cascade struct {
 	failedCooldown time.Duration
 	dialTimeout    time.Duration
 	dialRetryLimit int
+	preferFirst    bool
+	attemptTimeout time.Duration
 	lazy           bool
 
 	mu         sync.RWMutex
@@ -108,7 +117,9 @@ func (c *Cascade) DialContext(ctx context.Context, metadata *C.Metadata) (conn C
 	for i := 0; i < attempts; i++ {
 		proxy := order[i]
 		lastProxy = proxy
-		conn, err = proxy.DialContext(ctx, metadata)
+		dialCtx, cancel := c.attemptContext(ctx, proxy)
+		conn, err = proxy.DialContext(dialCtx, metadata)
+		cancel()
 		if err == nil {
 			conn.AppendToChains(c)
 			c.onAttemptSucceeded(proxy.Name())
@@ -137,6 +148,21 @@ func (c *Cascade) DialContext(ctx context.Context, metadata *C.Metadata) (conn C
 	return nil, lastErr
 }
 
+// attemptContext bounds one candidate dial when attempt-timeout is set. A
+// candidate that reports its own dial budget (a nested pool, selector or
+// cascade) is not cut: its budget already covers the retries it wants to make.
+func (c *Cascade) attemptContext(ctx context.Context, proxy C.Proxy) (context.Context, context.CancelFunc) {
+	if c.attemptTimeout <= 0 || proxyHasDialBudget(proxy) {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, c.attemptTimeout)
+}
+
+func proxyHasDialBudget(proxy C.Proxy) bool {
+	budget, ok := proxy.Adapter().(C.DialBudget)
+	return ok && budget.DialTimeout() > 0
+}
+
 // ListenPacketContext implements C.ProxyAdapter
 func (c *Cascade) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (pc C.PacketConn, err error) {
 	c.maybeScheduleCheck()
@@ -155,7 +181,9 @@ func (c *Cascade) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
 	for i := 0; i < attempts; i++ {
 		proxy := order[i]
 		lastProxy = proxy
-		pc, err = proxy.ListenPacketContext(ctx, metadata)
+		dialCtx, cancel := c.attemptContext(ctx, proxy)
+		pc, err = proxy.ListenPacketContext(dialCtx, metadata)
+		cancel()
 		if err == nil {
 			pc.AppendToChains(c)
 			c.onAttemptSucceeded(proxy.Name())
@@ -264,6 +292,8 @@ func (c *Cascade) MarshalJSON() ([]byte, error) {
 		"all":            all,
 		"active":         active,
 		"lookahead":      c.lookahead,
+		"preferFirst":    c.preferFirst,
+		"attemptTimeout": c.attemptTimeout.Milliseconds(),
 		"testUrl":        c.testUrl,
 		"expectedStatus": c.expectedStatus,
 		"fixed":          selected,
@@ -336,8 +366,11 @@ func (c *Cascade) candidateOrder(proxies []C.Proxy) []C.Proxy {
 		order = append(order, proxy)
 	}
 
-	// The head is the pinned candidate and the active ones: a handful of names
-	// at most, so a short scan is cheaper than a separate pass over the list.
+	// The head is the pinned candidate and, unless prefer-first is enabled,
+	// the active ones: a handful of names at most, so a short scan is cheaper
+	// than a separate pass over the list. With prefer-first the active name is
+	// not pinned, so a recovered higher-priority candidate becomes first again
+	// in the normal rank walk below.
 	addHead := func(name string) {
 		if name == "" {
 			return
@@ -359,11 +392,13 @@ func (c *Cascade) candidateOrder(proxies []C.Proxy) []C.Proxy {
 	if allFailed {
 		addHead(c.lastActive)
 	}
-	if !failed(c.active) {
-		addHead(c.active)
-	}
-	if !failed(c.lastActive) {
-		addHead(c.lastActive)
+	if !c.preferFirst {
+		if !failed(c.active) {
+			addHead(c.active)
+		}
+		if !failed(c.lastActive) {
+			addHead(c.lastActive)
+		}
 	}
 
 	ranks := make([]uint8, len(proxies))
@@ -514,9 +549,11 @@ func (c *Cascade) ensureStateLocked(name string) *cascadeState {
 }
 
 // settleActive moves the active candidate to the first alive one when the
-// current active died. A recovered higher-priority candidate never preempts
-// the active one on its own: that switch happens only when the active fails,
-// which keeps the group from flapping between two healthy candidates.
+// current active died. Without prefer-first a recovered higher-priority
+// candidate never preempts the active one on its own: that switch happens only
+// when the active fails, which keeps the group from flapping between two
+// healthy candidates. With prefer-first the group always returns to the first
+// alive candidate in the configured order.
 func (c *Cascade) settleActive(proxies []C.Proxy) {
 	now := time.Now()
 
@@ -532,7 +569,7 @@ func (c *Cascade) settleActive(proxies []C.Proxy) {
 		c.active = c.selected
 		return
 	}
-	if c.active != "" && alive(c.active) {
+	if !c.preferFirst && c.active != "" && alive(c.active) {
 		return
 	}
 
@@ -649,6 +686,19 @@ func NewCascade(option GroupCommonOption, cascadeOption CascadeOption, emptyFall
 		}
 	}
 
+	preferFirst := false
+	if cascadeOption.PreferFirst != nil {
+		preferFirst = *cascadeOption.PreferFirst
+	}
+
+	var attemptTimeout time.Duration
+	if cascadeOption.AttemptTimeout != nil {
+		attemptTimeout = time.Duration(*cascadeOption.AttemptTimeout) * time.Millisecond
+		if attemptTimeout < 0 {
+			attemptTimeout = 0
+		}
+	}
+
 	testUrl := option.URL
 	if testUrl == "" {
 		testUrl = C.DefaultTestURL
@@ -678,6 +728,8 @@ func NewCascade(option GroupCommonOption, cascadeOption CascadeOption, emptyFall
 		failedCooldown: failedCooldown,
 		dialTimeout:    dialTimeout,
 		dialRetryLimit: dialRetryLimit,
+		preferFirst:    preferFirst,
+		attemptTimeout: attemptTimeout,
 		lazy:           option.Lazy,
 		states:         make(map[string]*cascadeState),
 	}, nil

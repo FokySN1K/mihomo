@@ -25,6 +25,8 @@ func TestParseCascadeGroup(t *testing.T) {
 				"lookahead":       1,
 				"max-attempts":    2,
 				"failed-cooldown": 15,
+				"prefer-first":    true,
+				"attempt-timeout": 1500,
 			},
 		},
 	}
@@ -35,6 +37,11 @@ func TestParseCascadeGroup(t *testing.T) {
 	group, ok := proxies["cascade"].Adapter().(outboundgroup.ProxyGroup)
 	require.True(t, ok)
 	require.Equal(t, C.Cascade, group.Type())
+
+	data, err := proxies["cascade"].MarshalJSON()
+	require.NoError(t, err)
+	require.Contains(t, string(data), `"preferFirst":true`)
+	require.Contains(t, string(data), `"attemptTimeout":1500`)
 }
 
 func TestParseCascadeAcceptsNestedGroup(t *testing.T) {
