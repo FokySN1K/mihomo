@@ -77,13 +77,12 @@ func BenchmarkURLTestPoolProxies(b *testing.B) {
 	}
 }
 
-// BenchmarkURLTestPoolWarmPath measures the warm-up check every dial runs when
-// the pool already has members, which is the steady state of a connection.
+// BenchmarkURLTestPoolWarmPath measures the first-result check every dial runs
+// when the pool already has members, which is the steady state of a connection.
 func BenchmarkURLTestPoolWarmPath(b *testing.B) {
 	pool := &URLTestPool{
-		pool:           []string{"a"},
-		warmupWait:     defaultURLTestPoolWarmupWait,
-		warmupDeadline: defaultURLTestPoolWarmupDeadline,
+		pool:            []string{"a"},
+		firstResultWait: defaultURLTestPoolFirstResultWait,
 	}
 	ctx := context.Background()
 

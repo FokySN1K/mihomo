@@ -14,8 +14,16 @@ import (
 	P "github.com/metacubex/mihomo/constant/provider"
 )
 
+// defaultURLTestTolerance is how much faster a measured node must be than the
+// current one to replace it, in milliseconds. Without the hysteresis two nodes
+// with near-equal delays swap places on every check, and every swap is a new
+// handshake for the next connection. url-test-pool shares this default.
+const defaultURLTestTolerance uint16 = 150
+
 type URLTestOption struct {
-	Tolerance uint16 `group:"tolerance,omitempty"`
+	// Tolerance is how much faster a measured node must be than the current one
+	// to replace it, in milliseconds; 0 disables the hysteresis.
+	Tolerance *uint16 `group:"tolerance,omitempty"`
 }
 
 type URLTest struct {
@@ -196,6 +204,11 @@ func NewURLTest(option GroupCommonOption, urlTestOption URLTestOption, emptyFall
 	if emptyFallback == nil {
 		return nil, errors.New("empty fallback proxy not exist")
 	}
+	tolerance := defaultURLTestTolerance
+	if urlTestOption.Tolerance != nil {
+		tolerance = *urlTestOption.Tolerance
+	}
+
 	urlTest := &URLTest{
 		GroupBase: NewGroupBase(GroupBaseOption{
 			Name:           option.Name,
@@ -215,7 +228,7 @@ func NewURLTest(option GroupCommonOption, urlTestOption URLTestOption, emptyFall
 		disableUDP:     option.DisableUDP,
 		testUrl:        option.URL,
 		expectedStatus: option.ExpectedStatus,
-		tolerance:      urlTestOption.Tolerance,
+		tolerance:      tolerance,
 	}
 
 	return urlTest, nil

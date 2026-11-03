@@ -64,7 +64,9 @@ type CascadeOption struct {
 	DialTimeout    *int `group:"dial-timeout,omitempty"`
 	DialRetryLimit *int `group:"dial-retry-limit,omitempty"`
 	// PreferFirst returns to the first alive candidate after an outage instead
-	// of staying on the fallback that took over.
+	// of staying on the fallback that took over. It is on by default: cascade
+	// orders its candidates by priority, so a recovered priority candidate must
+	// not lose to a standby that merely took over earlier.
 	PreferFirst *bool `group:"prefer-first,omitempty"`
 	// AttemptTimeout bounds one candidate dial in milliseconds. A candidate
 	// that runs its own attempts (a nested pool or cascade) is left alone, so
@@ -777,7 +779,10 @@ func NewCascade(option GroupCommonOption, cascadeOption CascadeOption, emptyFall
 		log.Warnln("ProxyGroup: %s ignores dial-timeout/dial-retry-limit, the tunnel applies its own dial budget", option.Name)
 	}
 
-	preferFirst := false
+	// The configured order is the priority, so the group returns to the first
+	// alive candidate as soon as it answers again; prefer-first: false keeps the
+	// sticky behaviour for a profile that wants a switch only on failure.
+	preferFirst := true
 	if cascadeOption.PreferFirst != nil {
 		preferFirst = *cascadeOption.PreferFirst
 	}

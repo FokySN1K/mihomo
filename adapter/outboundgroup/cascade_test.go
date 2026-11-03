@@ -166,7 +166,7 @@ func TestCascadeDefaults(t *testing.T) {
 	require.Equal(t, 30*time.Second, group.failedCooldown)
 	require.Equal(t, 300*time.Second, group.interval)
 	require.Equal(t, C.DefaultTestURL, group.testUrl)
-	require.False(t, group.preferFirst)
+	require.True(t, group.preferFirst)
 	require.Zero(t, group.attemptTimeout)
 
 	_, err = NewCascade(GroupCommonOption{Name: "cascade"}, CascadeOption{}, nil, nil)
@@ -304,7 +304,8 @@ func TestCascadeRemembersLastActive(t *testing.T) {
 }
 
 func TestCascadeSettleActive(t *testing.T) {
-	group := newCascadeForTest(t, CascadeOption{}, newCascadeTestProxy("a"), newCascadeTestProxy("b"))
+	// the sticky mode stays reachable through the option
+	group := newCascadeForTest(t, CascadeOption{PreferFirst: boolPtr(false)}, newCascadeTestProxy("a"), newCascadeTestProxy("b"))
 	proxies := group.GetProxies(false)
 
 	group.mu.Lock()
