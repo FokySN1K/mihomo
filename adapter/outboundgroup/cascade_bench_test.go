@@ -1,6 +1,7 @@
 package outboundgroup
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -72,6 +73,39 @@ func BenchmarkURLTestPoolProxies(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		if got := pool.poolProxiesLocked(proxies); len(got) != len(names) {
 			b.Fatalf("unexpected pool size: %d", len(got))
+		}
+	}
+}
+
+// BenchmarkURLTestPoolWarmPath measures the warm-up check every dial runs when
+// the pool already has members, which is the steady state of a connection.
+func BenchmarkURLTestPoolWarmPath(b *testing.B) {
+	pool := &URLTestPool{
+		pool:           []string{"a"},
+		warmupWait:     defaultURLTestPoolWarmupWait,
+		warmupDeadline: defaultURLTestPoolWarmupDeadline,
+	}
+	ctx := context.Background()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		pool.waitWarm(ctx)
+	}
+}
+
+// BenchmarkCascadeRunsOwnAttempts measures deciding whether one candidate keeps
+// its own budget, which runs on every cascade attempt.
+func BenchmarkCascadeRunsOwnAttempts(b *testing.B) {
+	proxy := newCascadeTestProxy("node")
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		if runsOwnAttempts(proxy) {
+			b.Fatal("a leaf proxy must not be treated as a group")
 		}
 	}
 }

@@ -3,12 +3,14 @@ package outboundgroup
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/adapter/outbound"
 	"github.com/metacubex/mihomo/adapter/provider"
+	"github.com/metacubex/mihomo/common/utils"
 	C "github.com/metacubex/mihomo/constant"
 	P "github.com/metacubex/mihomo/constant/provider"
 
@@ -399,4 +401,213 @@ func TestURLTestPoolProxiesLockedKeepsPoolOrder(t *testing.T) {
 
 	pool := &URLTestPool{pool: []string{"c", "a", "removed"}}
 	require.Equal(t, []string{"c", "a"}, cascadeProxyNames(pool.poolProxiesLocked([]C.Proxy{a, b, c})))
+}
+
+func TestURLTestPoolWarmupOptions(t *testing.T) {
+	pool, err := NewURLTestPool(GroupCommonOption{Name: "pool"}, URLTestPoolOption{}, newPoolEmptyFallback(), nil)
+	require.NoError(t, err)
+	require.Equal(t, defaultURLTestPoolWarmupWait, pool.warmupWait)
+	require.Equal(t, defaultURLTestPoolWarmupDeadline, pool.warmupDeadline)
+
+	pool, err = NewURLTestPool(GroupCommonOption{Name: "pool"},
+		URLTestPoolOption{WarmupWait: intPtr(0), WarmupDeadline: intPtr(-1)}, newPoolEmptyFallback(), nil)
+	require.NoError(t, err)
+	require.Zero(t, pool.warmupWait, "warmup-wait 0 disables the warm-up wait")
+	require.Zero(t, pool.warmupDeadline, "a negative warmup-deadline means no cap")
+}
+
+// newColdPoolForTest builds a pool that never ran a check, so a dial starts one.
+func newColdPoolForTest(t *testing.T, opt URLTestPoolOption, proxies ...C.Proxy) *URLTestPool {
+	t.Helper()
+
+	pd, err := provider.NewCompatibleProvider("pool", proxies,
+		provider.NewHealthCheck(nil, "", 0, 0, false, nil))
+	require.NoError(t, err)
+
+	pool, err := NewURLTestPool(GroupCommonOption{Name: "pool", Interval: 300},
+		opt, newPoolEmptyFallback(), []P.ProxyProvider{pd})
+	require.NoError(t, err)
+	pool.testUrl = "http://127.0.0.1:1/"
+	return pool
+}
+
+// poolProbeProxy lets a test decide how a health check behaves, including
+// blocking it, without touching the network.
+type poolProbeProxy struct {
+	*cascadeFakeProxy
+	testFn func() (uint16, error)
+}
+
+func (p *poolProbeProxy) URLTest(context.Context, string, utils.IntRanges[uint16]) (uint16, error) {
+	return p.testFn()
+}
+
+func poolNames(pool *URLTestPool) []string {
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+	return append([]string(nil), pool.pool...)
+}
+
+func poolLastNames(pool *URLTestPool) []string {
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+	return append([]string(nil), pool.lastPool...)
+}
+
+func TestURLTestPoolFullCheckPublishesFirstWave(t *testing.T) {
+	release := make(chan struct{})
+	log := &dialLog{}
+
+	proxies := make([]C.Proxy, 0, 14)
+	for i := 0; i < 10; i++ {
+		probe := &poolProbeProxy{cascadeFakeProxy: newPoolSucceedingProxy(fmt.Sprintf("fast-%02d", i), log)}
+		probe.testFn = func() (uint16, error) { return 20, nil }
+		proxies = append(proxies, probe)
+	}
+	for i := 0; i < 4; i++ {
+		probe := &poolProbeProxy{cascadeFakeProxy: newPoolSucceedingProxy(fmt.Sprintf("slow-%02d", i), log)}
+		probe.testFn = func() (uint16, error) {
+			<-release
+			return 300, nil
+		}
+		proxies = append(proxies, probe)
+	}
+
+	pool := newColdPoolForTest(t, URLTestPoolOption{}, proxies...)
+	require.Equal(t, 10, pool.publishBatch(proxies))
+
+	done := make(chan struct{})
+	go func() {
+		pool.fullCheck()
+		close(done)
+	}()
+
+	require.Eventually(t, func() bool { return len(poolNames(pool)) == pool.poolSize }, 2*time.Second, 5*time.Millisecond,
+		"the first measured wave must be published before the whole list is probed")
+	for _, name := range poolNames(pool) {
+		require.Contains(t, name, "fast-", "only measured members may enter the partial pool")
+	}
+	require.Empty(t, poolLastNames(pool), "a partial result must not replace the recovery set")
+	select {
+	case <-done:
+		t.Fatal("the full check must still be running while the slow probes are blocked")
+	default:
+	}
+
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the full check did not finish")
+	}
+	require.Len(t, poolNames(pool), pool.poolSize)
+	require.Len(t, poolLastNames(pool), pool.poolSize, "the final result must update the recovery set")
+}
+
+func TestURLTestPoolWarmupWaitsForFirstResults(t *testing.T) {
+	release := make(chan struct{})
+	log := &dialLog{}
+
+	proxies := make([]C.Proxy, 0, 4)
+	for i := 0; i < 4; i++ {
+		probe := &poolProbeProxy{cascadeFakeProxy: newPoolSucceedingProxy(fmt.Sprintf("fast-%d", i), log)}
+		probe.testFn = func() (uint16, error) {
+			<-release
+			return 50, nil
+		}
+		proxies = append(proxies, probe)
+	}
+
+	pool := newColdPoolForTest(t, URLTestPoolOption{WarmupWait: intPtr(5000), WarmupDeadline: intPtr(10000)}, proxies...)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := pool.DialContext(context.Background(), &C.Metadata{})
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("the dial returned before the first measured members: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("the dial did not resume after the first measured members")
+	}
+	require.NotEmpty(t, poolNames(pool), "the dial must have waited for the first measured members")
+}
+
+func TestURLTestPoolWarmupWaitTimesOut(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+
+	probe := &poolProbeProxy{cascadeFakeProxy: newPoolSucceedingProxy("slow", &dialLog{})}
+	probe.testFn = func() (uint16, error) {
+		<-release
+		return 50, nil
+	}
+
+	pool := newColdPoolForTest(t, URLTestPoolOption{WarmupWait: intPtr(80), WarmupDeadline: intPtr(5000)}, probe)
+
+	start := time.Now()
+	conn, err := pool.DialContext(context.Background(), &C.Metadata{})
+	elapsed := time.Since(start)
+
+	require.NoError(t, err, "the dial must proceed on its own once the warm-up wait is over")
+	require.NotNil(t, conn)
+	require.GreaterOrEqual(t, elapsed, 80*time.Millisecond)
+	require.Less(t, elapsed, time.Second)
+}
+
+func TestURLTestPoolWarmupWaitsOncePerCheck(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+
+	probe := &poolProbeProxy{cascadeFakeProxy: newPoolSucceedingProxy("slow", &dialLog{})}
+	probe.testFn = func() (uint16, error) {
+		<-release
+		return 50, nil
+	}
+
+	pool := newColdPoolForTest(t, URLTestPoolOption{WarmupWait: intPtr(80), WarmupDeadline: intPtr(5000)}, probe)
+
+	start := time.Now()
+	_, err := pool.DialContext(context.Background(), &C.Metadata{})
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, time.Since(start), 80*time.Millisecond)
+
+	// the check still runs and the pool is still empty, but a retry of the
+	// connection must not spend its budget on the wait again
+	start = time.Now()
+	_, err = pool.DialContext(context.Background(), &C.Metadata{})
+	require.NoError(t, err)
+	require.Less(t, time.Since(start), 50*time.Millisecond, "a second dial must not pay the warm-up wait again")
+}
+
+func TestURLTestPoolWarmupRespectsCallerDeadline(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+
+	probe := &poolProbeProxy{cascadeFakeProxy: newPoolSucceedingProxy("slow", &dialLog{})}
+	probe.testFn = func() (uint16, error) {
+		<-release
+		return 50, nil
+	}
+
+	pool := newColdPoolForTest(t, URLTestPoolOption{WarmupWait: intPtr(5000), WarmupDeadline: intPtr(0)}, probe)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := pool.DialContext(ctx, &C.Metadata{})
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	require.Less(t, elapsed, 1500*time.Millisecond, "the warm-up must stay inside the caller's deadline")
 }

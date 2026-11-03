@@ -30,11 +30,11 @@ const (
 	urlTestPoolRecoveryTestInterval  = 5 * time.Second
 	urlTestPoolRecoveryTestTimeout   = 2 * time.Second
 	urlTestPoolRetryReserve          = 500 * time.Millisecond
-	// defaultURLTestPoolDialTimeout and defaultURLTestPoolDialRetryLimit are
-	// the pool's own dial budget: a connection through the pool is retried by
-	// the tunnel with these values unless the group overrides them.
-	defaultURLTestPoolDialTimeout    = C.DefaultTCPTimeout
-	defaultURLTestPoolDialRetryLimit = 10
+	// defaultURLTestPoolWarmupWait is how long the first dial of a cold start
+	// waits for measured members, and defaultURLTestPoolWarmupDeadline caps
+	// that wait counted from the start of the check.
+	defaultURLTestPoolWarmupWait     = time.Second
+	defaultURLTestPoolWarmupDeadline = 8 * time.Second
 )
 
 type URLTestPoolOption struct {
@@ -46,10 +46,17 @@ type URLTestPoolOption struct {
 	// 0 disables the early refill.
 	DegradedChecks *int   `group:"degraded-checks,omitempty"`
 	Tolerance      uint16 `group:"tolerance,omitempty"`
-	// DialTimeout is the budget of one connection through the pool, in milliseconds.
-	DialTimeout *int `group:"dial-timeout,omitempty"`
-	// DialRetryLimit is how many times the tunnel may retry such a connection.
+	// DialTimeout and DialRetryLimit are no longer used: the tunnel applies its
+	// own budget to every group. They are kept only to warn about profiles that
+	// still set them.
+	DialTimeout    *int `group:"dial-timeout,omitempty"`
 	DialRetryLimit *int `group:"dial-retry-limit,omitempty"`
+	// WarmupWait is how long the first dial of a cold start may wait for the
+	// first measured members, in milliseconds; 0 disables the wait.
+	WarmupWait *int `group:"warmup-wait,omitempty"`
+	// WarmupDeadline caps that wait counted from the start of the check, in
+	// milliseconds; 0 keeps only WarmupWait as the cap.
+	WarmupDeadline *int `group:"warmup-deadline,omitempty"`
 	// AttemptTimeout bounds one pool member dial, in milliseconds. When it is
 	// set, a failed member is followed by the next one while the caller's
 	// budget lasts; 0 keeps the single dial per call.
@@ -75,8 +82,8 @@ type URLTestPool struct {
 	poolSize       int
 	degradedChecks int
 	tolerance      uint16
-	dialTimeout    time.Duration
-	dialRetryLimit int
+	warmupWait     time.Duration
+	warmupDeadline time.Duration
 	attemptTimeout time.Duration
 	lazy           bool
 
@@ -89,6 +96,12 @@ type URLTestPool struct {
 	fastNode      C.Proxy
 	lastEmptyFull time.Time
 	degradedCount int
+	// warmCh is open while a full check is running and is closed once the first
+	// measured members are published; checkStart anchors warmup-deadline and
+	// warmWaited makes sure only one dial per check pays the wait.
+	warmCh     chan struct{}
+	checkStart time.Time
+	warmWaited bool
 
 	testing      atomic.Bool
 	recovering   atomic.Bool
@@ -100,6 +113,9 @@ type URLTestPool struct {
 
 // DialContext implements C.ProxyAdapter
 func (u *URLTestPool) DialContext(ctx context.Context, metadata *C.Metadata) (c C.Conn, err error) {
+	u.maybeScheduleCheck()
+	u.waitWarm(ctx)
+
 	var proxy C.Proxy
 	tried := make(map[string]struct{})
 
@@ -168,6 +184,9 @@ func (u *URLTestPool) attemptContext(ctx context.Context) (context.Context, cont
 
 // ListenPacketContext implements C.ProxyAdapter
 func (u *URLTestPool) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
+	u.maybeScheduleCheck()
+	u.waitWarm(ctx)
+
 	var lastErr error
 	tried := make(map[string]struct{})
 
@@ -219,16 +238,6 @@ func (u *URLTestPool) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 // Now implements ProxyGroup
 func (u *URLTestPool) Now() string {
 	return u.fast(false).Name()
-}
-
-// DialTimeout implements C.DialBudget
-func (u *URLTestPool) DialTimeout() time.Duration {
-	return u.dialTimeout
-}
-
-// DialRetryLimit implements C.DialBudget
-func (u *URLTestPool) DialRetryLimit() int {
-	return u.dialRetryLimit
 }
 
 // Providers implements ProxyGroup
@@ -513,14 +522,93 @@ func (u *URLTestPool) scheduleCheck(full bool) {
 	if !u.testing.CompareAndSwap(false, true) {
 		return
 	}
+	if full {
+		u.beginWarmup()
+	}
 	go func() {
 		defer u.testing.Store(false)
+		defer u.markWarm()
 		if full {
 			u.fullCheck()
 		} else {
 			u.quickCheck()
 		}
 	}()
+}
+
+// beginWarmup opens the channel a cold-start dial waits on until the first
+// measured members are published.
+func (u *URLTestPool) beginWarmup() {
+	u.mu.Lock()
+	if u.warmCh == nil {
+		u.warmCh = make(chan struct{})
+		u.checkStart = time.Now()
+		u.warmWaited = false
+	}
+	u.mu.Unlock()
+}
+
+// markWarm releases the dials waiting for the first results of the check.
+func (u *URLTestPool) markWarm() {
+	u.mu.Lock()
+	if u.warmCh != nil {
+		close(u.warmCh)
+		u.warmCh = nil
+	}
+	u.mu.Unlock()
+}
+
+// waitWarm lets the first dial of a cold start wait for measured members, so a
+// connection is not routed to the first proxy of the list only because nothing
+// has been measured yet. It never waits longer than warmup-wait, never past
+// warmup-deadline after the check started, and never past the caller's deadline.
+func (u *URLTestPool) waitWarm(ctx context.Context) {
+	if u.warmupWait <= 0 {
+		return
+	}
+
+	u.mu.RLock()
+	cold := len(u.pool) == 0
+	channel := u.warmCh
+	started := u.checkStart
+	waited := u.warmWaited
+	u.mu.RUnlock()
+	if !cold || channel == nil || waited {
+		return
+	}
+
+	wait := u.warmupWait
+	if u.warmupDeadline > 0 {
+		if remaining := u.warmupDeadline - time.Since(started); remaining < wait {
+			wait = remaining
+		}
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline) - urlTestPoolRetryReserve; remaining < wait {
+			wait = remaining
+		}
+	}
+	if wait <= 0 {
+		return
+	}
+
+	// Only the first dial of a check pays the wait: a retry of the same
+	// connection must not spend its budget waiting for a slow check again.
+	u.mu.Lock()
+	if u.warmCh != channel || u.warmWaited {
+		u.mu.Unlock()
+		return
+	}
+	u.warmWaited = true
+	u.mu.Unlock()
+
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-channel:
+	case <-timer.C:
+	case <-ctx.Done():
+	}
 }
 
 func (u *URLTestPool) quickCheck() {
@@ -671,10 +759,49 @@ func (u *URLTestPool) fullCheck() {
 	}
 
 	log.Debugln("ProxyGroup: %s start full health check for %d proxies", u.Name(), len(proxies))
-	u.applyResults(u.testProxies(proxies))
+	// Publish the first wave as soon as it is measured, so a cold pool starts
+	// routing by real delays instead of waiting for the whole list.
+	u.applyResults(u.testProxiesStreaming(proxies, u.publishBatch(proxies)))
+}
+
+// publishBatch is how many probes must finish before a partial pool is
+// published: enough to fill the pool, but never more than one probe wave.
+func (u *URLTestPool) publishBatch(proxies []C.Proxy) int {
+	batch := u.poolSize
+	if batch > len(proxies) {
+		batch = len(proxies)
+	}
+	if batch > urlTestPoolCheckLimit {
+		batch = urlTestPoolCheckLimit
+	}
+	if batch < 1 {
+		batch = 1
+	}
+	return batch
 }
 
 func (u *URLTestPool) applyResults(results map[string]uint16) {
+	u.publishPool(results, true)
+
+	now := time.Now()
+	u.lastFull.Store(now)
+	u.lastQuick.Store(now)
+	u.hasFullCheck.Store(true)
+	u.markWarm()
+}
+
+// publishPartial rebuilds the pool from the results collected so far, so dials
+// during the first full check already route by measured delays instead of the
+// first proxy of the list. The check bookkeeping is left to applyResults.
+func (u *URLTestPool) publishPartial(results map[string]uint16) {
+	u.publishPool(results, false)
+	u.markWarm()
+}
+
+// publishPool replaces the pool with the fastest measured proxies. Only a final
+// result set updates the emergency recovery set and the empty marker, because
+// the recovery check replays lastPool and the marker throttles the next one.
+func (u *URLTestPool) publishPool(results map[string]uint16, final bool) {
 	names := sortedProxyNames(results)
 	if len(names) > u.poolSize {
 		names = names[:u.poolSize]
@@ -683,34 +810,44 @@ func (u *URLTestPool) applyResults(results map[string]uint16) {
 	now := time.Now()
 	u.mu.Lock()
 	u.pool = names
-	if len(names) > 0 {
+	if final && len(names) > 0 {
 		u.lastPool = append([]string(nil), names...)
 	}
 	u.suspicious = make(map[string]struct{})
 	u.fastNode = nil
 	u.degradedCount = 0
-	if len(names) == 0 {
-		u.lastEmptyFull = now
-	} else {
-		u.lastEmptyFull = time.Time{}
+	if final {
+		if len(names) == 0 {
+			u.lastEmptyFull = now
+		} else {
+			u.lastEmptyFull = time.Time{}
+		}
 	}
 	u.mu.Unlock()
-
-	u.lastFull.Store(now)
-	u.lastQuick.Store(now)
-	u.hasFullCheck.Store(true)
 }
 
 // testProxies tests proxies concurrently and returns delay (ms) of alive proxies
 func (u *URLTestPool) testProxies(proxies []C.Proxy) map[string]uint16 {
-	return u.testProxiesWithTimeout(proxies, time.Duration(u.testTimeout)*time.Millisecond)
+	return u.probeProxies(proxies, time.Duration(u.testTimeout)*time.Millisecond, 0)
+}
+
+// testProxiesStreaming is testProxies that publishes the pool as soon as
+// publishEvery probes have found a member, so the pool is usable before the
+// whole list has been probed.
+func (u *URLTestPool) testProxiesStreaming(proxies []C.Proxy, publishEvery int) map[string]uint16 {
+	return u.probeProxies(proxies, time.Duration(u.testTimeout)*time.Millisecond, publishEvery)
 }
 
 // testProxiesWithTimeout is testProxies with a custom timeout, used by the
 // emergency recovery check to stay inside the connection deadline.
 func (u *URLTestPool) testProxiesWithTimeout(proxies []C.Proxy, timeout time.Duration) map[string]uint16 {
+	return u.probeProxies(proxies, timeout, 0)
+}
+
+func (u *URLTestPool) probeProxies(proxies []C.Proxy, timeout time.Duration, publishEvery int) map[string]uint16 {
 	results := make(map[string]uint16, len(proxies))
 	var mu sync.Mutex
+	pending, published := 0, false
 
 	group := new(errgroup.Group)
 	group.SetLimit(urlTestPoolCheckLimit)
@@ -727,7 +864,20 @@ func (u *URLTestPool) testProxiesWithTimeout(proxies []C.Proxy, timeout time.Dur
 
 			mu.Lock()
 			results[proxy.Name()] = delay
+			pending++
+			var snapshot map[string]uint16
+			if publishEvery > 0 && !published && pending >= publishEvery {
+				published = true
+				snapshot = make(map[string]uint16, len(results))
+				for name, delay := range results {
+					snapshot[name] = delay
+				}
+			}
 			mu.Unlock()
+
+			if snapshot != nil {
+				u.publishPartial(snapshot)
+			}
 			return nil
 		})
 	}
@@ -857,19 +1007,26 @@ func NewURLTestPool(option GroupCommonOption, poolOption URLTestPoolOption, empt
 		}
 	}
 
-	dialTimeout := defaultURLTestPoolDialTimeout
-	if poolOption.DialTimeout != nil {
-		dialTimeout = time.Duration(*poolOption.DialTimeout) * time.Millisecond
-		if dialTimeout <= 0 {
-			dialTimeout = defaultURLTestPoolDialTimeout
+	// The tunnel owns the dial budget of every group, so these keys no longer
+	// change anything. A profile that still sets them is told instead of being
+	// silently ignored by the decoder.
+	if poolOption.DialTimeout != nil || poolOption.DialRetryLimit != nil {
+		log.Warnln("ProxyGroup: %s ignores dial-timeout/dial-retry-limit, the tunnel applies its own dial budget", option.Name)
+	}
+
+	warmupWait := defaultURLTestPoolWarmupWait
+	if poolOption.WarmupWait != nil {
+		warmupWait = time.Duration(*poolOption.WarmupWait) * time.Millisecond
+		if warmupWait < 0 {
+			warmupWait = 0
 		}
 	}
 
-	dialRetryLimit := defaultURLTestPoolDialRetryLimit
-	if poolOption.DialRetryLimit != nil {
-		dialRetryLimit = *poolOption.DialRetryLimit
-		if dialRetryLimit < 1 {
-			dialRetryLimit = 1
+	warmupDeadline := defaultURLTestPoolWarmupDeadline
+	if poolOption.WarmupDeadline != nil {
+		warmupDeadline = time.Duration(*poolOption.WarmupDeadline) * time.Millisecond
+		if warmupDeadline < 0 {
+			warmupDeadline = 0
 		}
 	}
 
@@ -909,8 +1066,8 @@ func NewURLTestPool(option GroupCommonOption, poolOption URLTestPoolOption, empt
 		poolSize:       poolSize,
 		degradedChecks: degradedChecks,
 		tolerance:      poolOption.Tolerance,
-		dialTimeout:    dialTimeout,
-		dialRetryLimit: dialRetryLimit,
+		warmupWait:     warmupWait,
+		warmupDeadline: warmupDeadline,
 		attemptTimeout: attemptTimeout,
 		lazy:           option.Lazy,
 		suspicious:     make(map[string]struct{}),

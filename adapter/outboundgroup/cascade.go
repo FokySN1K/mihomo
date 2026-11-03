@@ -24,12 +24,22 @@ const (
 	// but never spends more than this many probes per cycle. That keeps the
 	// check cost bounded on a large member list with many dead entries.
 	cascadeProbeBudgetFactor = 2
-	// defaultCascadeDialTimeout and defaultCascadeDialRetryLimit are the
-	// cascade's own dial budget: one connection may try several candidates,
-	// and the tunnel retries the whole call with these values unless the
-	// group overrides them.
-	defaultCascadeDialTimeout    = C.DefaultTCPTimeout
-	defaultCascadeDialRetryLimit = 10
+	// A candidate cut by attempt-timeout is not dead: a slow handshake (a lost
+	// SYN) still means the node works. It is demoted for this long instead of
+	// the full failed-cooldown and rechecked in the background.
+	cascadeTimeoutCooldown = 3 * time.Second
+	// Repeated cuts inside cascadeTimeoutEscalateWindow escalate the candidate
+	// to the full failed-cooldown, so a node that is always too slow stops
+	// costing one cut per connection.
+	cascadeTimeoutEscalateAfter  = 3
+	cascadeTimeoutEscalateWindow = time.Minute
+	// cascadeRecheckTimeout bounds the background probe of a cut candidate and
+	// cascadeRecheckInterval throttles those probes per candidate.
+	cascadeRecheckTimeout  = 2 * time.Second
+	cascadeRecheckInterval = 5 * time.Second
+	// cascadeNestedDepthLimit is how deep selectors are followed when deciding
+	// whether a candidate runs its own attempts.
+	cascadeNestedDepthLimit = 3
 )
 
 // The dial order is rebuilt from these ranks: the pinned/active head first,
@@ -48,16 +58,17 @@ type CascadeOption struct {
 	MaxAttempts *int `group:"max-attempts,omitempty"`
 	// FailedCooldown is how long a failed candidate is demoted, in seconds.
 	FailedCooldown *int `group:"failed-cooldown,omitempty"`
-	// DialTimeout is the budget of one connection through the cascade, in milliseconds.
-	DialTimeout *int `group:"dial-timeout,omitempty"`
-	// DialRetryLimit is how many times the tunnel may retry such a connection.
+	// DialTimeout and DialRetryLimit are no longer used: the tunnel applies its
+	// own budget to every group. They are kept only to warn about profiles that
+	// still set them.
+	DialTimeout    *int `group:"dial-timeout,omitempty"`
 	DialRetryLimit *int `group:"dial-retry-limit,omitempty"`
 	// PreferFirst returns to the first alive candidate after an outage instead
 	// of staying on the fallback that took over.
 	PreferFirst *bool `group:"prefer-first,omitempty"`
-	// AttemptTimeout bounds one candidate dial in milliseconds. Candidates
-	// that expose their own DialBudget are left alone, so a nested pool keeps
-	// its full retry budget.
+	// AttemptTimeout bounds one candidate dial in milliseconds. A candidate
+	// that runs its own attempts (a nested pool or cascade) is left alone, so
+	// its own budget stays in charge.
 	AttemptTimeout *int `group:"attempt-timeout,omitempty"`
 }
 
@@ -66,6 +77,15 @@ type cascadeState struct {
 	delay       uint16
 	checkedAt   time.Time
 	failedUntil time.Time
+
+	// timeoutAt and timeoutCount track candidates cut by attempt-timeout, so a
+	// node that is always too slow escalates to the full cooldown.
+	timeoutAt    time.Time
+	timeoutCount int
+	// recheckedAt and rechecking throttle and single-flight the background probe
+	// that decides whether a cut candidate is alive.
+	recheckedAt time.Time
+	rechecking  bool
 }
 
 // Cascade is an ordered fallback that probes only the active candidate and a
@@ -83,8 +103,6 @@ type Cascade struct {
 	lookahead      int
 	maxAttempts    int
 	failedCooldown time.Duration
-	dialTimeout    time.Duration
-	dialRetryLimit int
 	preferFirst    bool
 	attemptTimeout time.Duration
 	lazy           bool
@@ -119,6 +137,8 @@ func (c *Cascade) DialContext(ctx context.Context, metadata *C.Metadata) (conn C
 		lastProxy = proxy
 		dialCtx, cancel := c.attemptContext(ctx, proxy)
 		conn, err = proxy.DialContext(dialCtx, metadata)
+		// our own attempt-timeout fired, the caller still has time left
+		cut := ctx.Err() == nil && dialCtx.Err() != nil
 		cancel()
 		if err == nil {
 			conn.AppendToChains(c)
@@ -136,7 +156,11 @@ func (c *Cascade) DialContext(ctx context.Context, metadata *C.Metadata) (conn C
 		}
 
 		lastErr = err
-		c.onAttemptFailed(proxy, err)
+		if cut {
+			c.onAttemptTimedOut(proxy)
+		} else {
+			c.onAttemptFailed(proxy, err)
+		}
 		// The caller's deadline covers every attempt; once it is gone there is
 		// no point in spending more candidate dials on this connection.
 		if ctx.Err() != nil {
@@ -149,18 +173,30 @@ func (c *Cascade) DialContext(ctx context.Context, metadata *C.Metadata) (conn C
 }
 
 // attemptContext bounds one candidate dial when attempt-timeout is set. A
-// candidate that reports its own dial budget (a nested pool, selector or
-// cascade) is not cut: its budget already covers the retries it wants to make.
+// candidate that runs its own attempts (a nested pool or cascade) is not cut:
+// its own budget already covers the retries it wants to make.
 func (c *Cascade) attemptContext(ctx context.Context, proxy C.Proxy) (context.Context, context.CancelFunc) {
-	if c.attemptTimeout <= 0 || proxyHasDialBudget(proxy) {
+	if c.attemptTimeout <= 0 || runsOwnAttempts(proxy) {
 		return ctx, func() {}
 	}
 	return context.WithTimeout(ctx, c.attemptTimeout)
 }
 
-func proxyHasDialBudget(proxy C.Proxy) bool {
-	budget, ok := proxy.Adapter().(C.DialBudget)
-	return ok && budget.DialTimeout() > 0
+// runsOwnAttempts reports whether the candidate retries its members itself:
+// a nested pool or cascade, also when reached through selectors. Bounding such
+// a candidate here would cut the attempts it is designed to make.
+func runsOwnAttempts(proxy C.Proxy) bool {
+	for depth := 0; depth <= cascadeNestedDepthLimit; depth++ {
+		switch adapter := proxy.Adapter().(type) {
+		case *URLTestPool, *Cascade:
+			return true
+		case *Selector:
+			proxy = adapter.selectedProxy(false)
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 // ListenPacketContext implements C.ProxyAdapter
@@ -183,6 +219,8 @@ func (c *Cascade) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
 		lastProxy = proxy
 		dialCtx, cancel := c.attemptContext(ctx, proxy)
 		pc, err = proxy.ListenPacketContext(dialCtx, metadata)
+		// our own attempt-timeout fired, the caller still has time left
+		cut := ctx.Err() == nil && dialCtx.Err() != nil
 		cancel()
 		if err == nil {
 			pc.AppendToChains(c)
@@ -191,7 +229,11 @@ func (c *Cascade) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
 		}
 
 		lastErr = err
-		c.onAttemptFailed(proxy, err)
+		if cut {
+			c.onAttemptTimedOut(proxy)
+		} else {
+			c.onAttemptFailed(proxy, err)
+		}
 		if ctx.Err() != nil {
 			break
 		}
@@ -222,16 +264,6 @@ func (c *Cascade) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 // Now implements ProxyGroup
 func (c *Cascade) Now() string {
 	return c.pick(false).Name()
-}
-
-// DialTimeout implements C.DialBudget
-func (c *Cascade) DialTimeout() time.Duration {
-	return c.dialTimeout
-}
-
-// DialRetryLimit implements C.DialBudget
-func (c *Cascade) DialRetryLimit() int {
-	return c.dialRetryLimit
 }
 
 // Providers implements ProxyGroup
@@ -516,6 +548,74 @@ func (c *Cascade) onAttemptFailed(proxy C.Proxy, err error) {
 	c.markUnavailable(proxy.Name())
 }
 
+// onAttemptTimedOut records a candidate that our own attempt-timeout cut. The
+// node is not dead — a slow handshake still means it works — so it is demoted
+// for cascadeTimeoutCooldown instead of the full failed-cooldown, and a
+// background probe clears the demotion as soon as the node answers. Repeated
+// cuts inside cascadeTimeoutEscalateWindow mean the node is genuinely too slow
+// and escalate it to the full failed-cooldown.
+func (c *Cascade) onAttemptTimedOut(proxy C.Proxy) {
+	now := time.Now()
+
+	c.mu.Lock()
+	state := c.ensureStateLocked(proxy.Name())
+	if !state.timeoutAt.IsZero() && now.Sub(state.timeoutAt) > cascadeTimeoutEscalateWindow {
+		state.timeoutCount = 0
+	}
+	state.timeoutAt = now
+	state.timeoutCount++
+	count := state.timeoutCount
+	escalated := count >= cascadeTimeoutEscalateAfter && c.failedCooldown > 0
+
+	cooldown := cascadeTimeoutCooldown
+	if escalated {
+		cooldown = c.failedCooldown
+	} else if c.failedCooldown > 0 && c.failedCooldown < cooldown {
+		cooldown = c.failedCooldown
+	}
+	if cooldown > 0 {
+		state.failedUntil = now.Add(cooldown)
+	}
+	if c.active == proxy.Name() {
+		c.active = ""
+	}
+
+	recheck := !escalated && !state.rechecking && now.Sub(state.recheckedAt) >= cascadeRecheckInterval
+	if recheck {
+		state.recheckedAt = now
+		state.rechecking = true
+	}
+	c.mu.Unlock()
+
+	if escalated {
+		log.Debugln("ProxyGroup: %s candidate %s was cut by attempt-timeout %d times, demoted for %s", c.Name(), proxy.Name(), count, c.failedCooldown)
+	}
+	if !recheck {
+		return
+	}
+	go c.recheckCandidate(proxy)
+}
+
+// recheckCandidate probes a cut candidate in the background, so a slow but
+// working node returns to the rotation without waiting for the next full check.
+func (c *Cascade) recheckCandidate(proxy C.Proxy) {
+	defer func() {
+		c.mu.Lock()
+		if state, ok := c.states[proxy.Name()]; ok {
+			state.rechecking = false
+		}
+		c.mu.Unlock()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), cascadeRecheckTimeout)
+	delay, err := proxy.URLTest(ctx, c.testUrl, c.expectedRanges)
+	cancel()
+	if err != nil {
+		return
+	}
+	c.markAlive(proxy.Name(), delay)
+}
+
 func (c *Cascade) markUnavailable(name string) {
 	c.mu.Lock()
 	state := c.ensureStateLocked(name)
@@ -670,20 +770,11 @@ func NewCascade(option GroupCommonOption, cascadeOption CascadeOption, emptyFall
 		}
 	}
 
-	dialTimeout := defaultCascadeDialTimeout
-	if cascadeOption.DialTimeout != nil {
-		dialTimeout = time.Duration(*cascadeOption.DialTimeout) * time.Millisecond
-		if dialTimeout <= 0 {
-			dialTimeout = defaultCascadeDialTimeout
-		}
-	}
-
-	dialRetryLimit := defaultCascadeDialRetryLimit
-	if cascadeOption.DialRetryLimit != nil {
-		dialRetryLimit = *cascadeOption.DialRetryLimit
-		if dialRetryLimit < 1 {
-			dialRetryLimit = 1
-		}
+	// The tunnel owns the dial budget of every group, so these keys no longer
+	// change anything. A profile that still sets them is told instead of being
+	// silently ignored by the decoder.
+	if cascadeOption.DialTimeout != nil || cascadeOption.DialRetryLimit != nil {
+		log.Warnln("ProxyGroup: %s ignores dial-timeout/dial-retry-limit, the tunnel applies its own dial budget", option.Name)
 	}
 
 	preferFirst := false
@@ -726,8 +817,6 @@ func NewCascade(option GroupCommonOption, cascadeOption CascadeOption, emptyFall
 		lookahead:      lookahead,
 		maxAttempts:    maxAttempts,
 		failedCooldown: failedCooldown,
-		dialTimeout:    dialTimeout,
-		dialRetryLimit: dialRetryLimit,
 		preferFirst:    preferFirst,
 		attemptTimeout: attemptTimeout,
 		lazy:           option.Lazy,
