@@ -668,3 +668,84 @@ func TestURLTestPoolFirstResultRespectsCallerDeadline(t *testing.T) {
 	require.NoError(t, err)
 	require.Less(t, elapsed, 1500*time.Millisecond, "the first-result wait must stay inside the caller's deadline")
 }
+
+// TestURLTestPoolWarmUpFillsThePoolBeforeADial guards the pre-warm: the pool is
+// measured as soon as the config is applied, so the first connection does not
+// pay for a probe of its own.
+func TestURLTestPoolWarmUpFillsThePoolBeforeADial(t *testing.T) {
+	probe := &poolProbeProxy{cascadeFakeProxy: newPoolSucceedingProxy("fast", &dialLog{})}
+	probe.testFn = func() (uint16, error) { return 20, nil }
+
+	pool := newColdPoolForTest(t, URLTestPoolOption{}, probe)
+	pool.WarmUp()
+
+	require.Eventually(t, func() bool { return len(poolNames(pool)) == 1 }, 2*time.Second, 5*time.Millisecond,
+		"the warm-up must fill the pool without waiting for a dial")
+	require.True(t, pool.hasFullCheck.Load())
+	require.Equal(t, []string{"fast"}, poolLastNames(pool))
+}
+
+// TestURLTestPoolWarmUpWaitsForProviders guards a group whose providers have not
+// finished loading: the check must wait for them instead of rebuilding the pool
+// from the empty fallback, and start as soon as they arrive.
+func TestURLTestPoolWarmUpWaitsForProviders(t *testing.T) {
+	probe := &poolProbeProxy{cascadeFakeProxy: newPoolSucceedingProxy("fast", &dialLog{})}
+	probe.testFn = func() (uint16, error) { return 20, nil }
+
+	inner, err := provider.NewCompatibleProvider("pool", []C.Proxy{probe},
+		provider.NewHealthCheck(nil, "", 0, 0, false, nil))
+	require.NoError(t, err)
+	pd := &delayedPoolProvider{ProxyProvider: inner, ready: make(chan struct{})}
+
+	pool, err := NewURLTestPool(GroupCommonOption{Name: "pool", Interval: 300},
+		URLTestPoolOption{}, newPoolEmptyFallback(), []P.ProxyProvider{pd})
+	require.NoError(t, err)
+	pool.testUrl = "http://127.0.0.1:1/"
+
+	pool.WarmUp()
+
+	time.Sleep(200 * time.Millisecond) // several polls of a provider that is still loading
+	require.False(t, pool.hasFullCheck.Load(), "a check over an empty provider must not mark the pool checked")
+
+	close(pd.ready)
+	require.Eventually(t, func() bool { return len(poolNames(pool)) == 1 }, 2*time.Second, 5*time.Millisecond,
+		"the warm-up must start the check once the provider arrives")
+}
+
+// delayedPoolProvider is a provider whose proxies arrive only when the test
+// releases them: an embedded core applies the config before its subscription
+// providers have loaded, and the group must wait for them.
+type delayedPoolProvider struct {
+	P.ProxyProvider
+	ready chan struct{}
+}
+
+func (d *delayedPoolProvider) Proxies() []C.Proxy {
+	select {
+	case <-d.ready:
+		return d.ProxyProvider.Proxies()
+	default:
+		return nil
+	}
+}
+
+// TestURLTestPoolWarmUpSkipsLazy guards the opt-out: a lazy pool runs a check
+// only when real traffic asks for it.
+func TestURLTestPoolWarmUpSkipsLazy(t *testing.T) {
+	probe := &poolProbeProxy{cascadeFakeProxy: newPoolSucceedingProxy("fast", &dialLog{})}
+	probe.testFn = func() (uint16, error) { return 20, nil }
+
+	pd, err := provider.NewCompatibleProvider("pool", []C.Proxy{probe},
+		provider.NewHealthCheck(nil, "", 0, 0, false, nil))
+	require.NoError(t, err)
+
+	pool, err := NewURLTestPool(GroupCommonOption{Name: "pool", Lazy: true},
+		URLTestPoolOption{}, newPoolEmptyFallback(), []P.ProxyProvider{pd})
+	require.NoError(t, err)
+	pool.testUrl = "http://127.0.0.1:1/"
+
+	pool.WarmUp()
+
+	require.False(t, pool.preWarming.Load(), "a lazy pool must not start a warm-up")
+	require.False(t, pool.hasFullCheck.Load())
+}

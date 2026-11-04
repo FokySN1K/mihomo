@@ -41,6 +41,16 @@ var _ SelfTester = (*Cascade)(nil)
 var _ SelfTester = (*URLTestPool)(nil)
 var _ SelfTester = (*LoadBalance)(nil)
 
+// Warmer is a group that measures its own members and can be asked to take the
+// first measurement before any traffic arrives. A group that inherits an
+// always-on provider health check needs nothing here; one that keeps the
+// provider ticker off would otherwise measure only on the first dial.
+type Warmer interface {
+	WarmUp()
+}
+
+var _ Warmer = (*URLTestPool)(nil)
+
 type SelectAble interface {
 	Set(string) error
 	ForceSet(name string)

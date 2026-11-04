@@ -35,6 +35,13 @@ const (
 	// timeout (a result cannot arrive sooner) and is counted from the start of
 	// the check, so a check cycle never delays dials longer than this.
 	defaultURLTestPoolFirstResultWait = 2 * time.Second
+	// urlTestPoolPreWarmPoll is how often a pre-warm looks for the proxies of
+	// the group: an embedded core builds the group before its providers finish
+	// loading, so the proxies may arrive after the config is applied.
+	urlTestPoolPreWarmPoll = 100 * time.Millisecond
+	// urlTestPoolPreWarmWait bounds that wait. A provider that takes longer
+	// leaves the group on the old path, where the first dial starts the check.
+	urlTestPoolPreWarmWait = 30 * time.Second
 )
 
 type URLTestPoolOption struct {
@@ -64,10 +71,12 @@ type URLTestPoolOption struct {
 // a full health check tests all proxies every `full-interval` and rebuilds
 // the pool. When the pool stays underfilled (some members are dead) for
 // several quick checks in a row, a full check is started early to refill it.
-// On a cold start every measured member is published as soon as its probe
-// returns, and a dial waits only for the first result (bounded by `timeout` and
-// a 2s cap), so it is not routed to the first proxy of the list only because
-// nothing has been measured.
+// The pool also fills itself before the first dial: the executor asks it to
+// warm up as soon as the config is applied, so the first connection does not
+// pay for the cold-start probe. On a cold start every measured member is
+// published as soon as its probe returns, and a dial waits only for the first
+// result (bounded by `timeout` and a 2s cap), so it is not routed to the first
+// proxy of the list only because nothing has been measured.
 // Dial failures mark the used proxy as suspicious so the next connection is
 // routed to the next best pool member; with `attempt-timeout` set, the next
 // member is tried inside the same call as well.
@@ -100,6 +109,10 @@ type URLTestPool struct {
 	// the whole check cycle never delays dials longer than the cap.
 	warmCh     chan struct{}
 	checkStart time.Time
+
+	// preWarming guards the single pre-warm of the group: the executor asks
+	// for it on every config apply, and only the first ask may start a wait.
+	preWarming atomic.Bool
 
 	testing      atomic.Bool
 	recovering   atomic.Bool
@@ -597,6 +610,46 @@ func (u *URLTestPool) waitWarm(ctx context.Context) {
 	case <-channel:
 	case <-timer.C:
 	case <-ctx.Done():
+	}
+}
+
+// WarmUp fills the pool before the first dial arrives. url-test and fallback
+// get that measurement from the health check of their provider; a pool keeps
+// its own schedule, which the provider ticker must not run, so the executor
+// asks it directly.
+//
+// The group exists before the providers of an embedded core finish loading, so
+// the check waits for them: a full check started over the empty fallback would
+// only mark the pool empty for the next interval. `lazy` opts out, because the
+// profile asked for checks driven only by real traffic.
+func (u *URLTestPool) WarmUp() {
+	if u.lazy {
+		return
+	}
+	if !u.preWarming.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		if !u.waitProvidersReady(urlTestPoolPreWarmWait) {
+			return
+		}
+		u.maybeScheduleCheck()
+	}()
+}
+
+// waitProvidersReady waits until the providers of the group have proxies and
+// reports whether they arrived within the given wait. It reads the proxy list
+// without touching the providers, so the wait never starts a check of its own.
+func (u *URLTestPool) waitProvidersReady(wait time.Duration) bool {
+	deadline := time.Now().Add(wait)
+	for {
+		if u.proxiesReady(u.GetProxies(false)) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(urlTestPoolPreWarmPoll)
 	}
 }
 

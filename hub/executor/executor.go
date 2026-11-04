@@ -112,6 +112,7 @@ func ApplyConfig(cfg *config.Config, force bool) {
 
 	initInnerTcp()
 	loadProvider(cfg.Providers)
+	warmUpGroups(cfg.Proxies)
 	updateProfile(cfg)
 	loadProvider(cfg.RuleProviders)
 	runtime.GC()
@@ -319,6 +320,19 @@ func updateHosts(tree *trie.DomainTrie[resolver.HostValue]) {
 
 func updateProxies(proxies map[string]C.Proxy, providers map[string]P.ProxyProvider) {
 	tunnel.UpdateProxies(proxies, providers)
+}
+
+// warmUpGroups asks the groups that keep their own measurements to take them
+// before the first dial arrives. url-test, fallback and load-balance get their
+// first measurement from the health check of their provider; a pool keeps the
+// provider ticker off and schedules its own check, which without this starts
+// only on the first connection.
+func warmUpGroups(proxies map[string]C.Proxy) {
+	for _, proxy := range proxies {
+		if warmer, ok := proxy.Adapter().(outboundgroup.Warmer); ok {
+			warmer.WarmUp()
+		}
+	}
 }
 
 func updateRules(rules []C.Rule, subRules map[string][]C.Rule, ruleProviders map[string]P.RuleProvider) {
