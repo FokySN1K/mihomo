@@ -40,7 +40,20 @@ const (
 	// cascadeNestedDepthLimit is how deep selectors are followed when deciding
 	// whether a candidate runs its own attempts.
 	cascadeNestedDepthLimit = 3
+	// cascadeMinGroupProbeTimeout is the least time granted to a candidate that
+	// answers as a group: its own check probes every member, so the tighter
+	// cascade `timeout` would cut members the group itself still accepts.
+	cascadeMinGroupProbeTimeout = 5 * time.Second
 )
+
+// errNoAliveMember reports a group candidate whose own check found nothing.
+var errNoAliveMember = errors.New("no alive member")
+
+// groupProber is the health check every group adapter runs over its members.
+// It is all a cascade needs from a candidate that is a group itself.
+type groupProber interface {
+	URLTest(ctx context.Context, url string, expectedStatus utils.IntRanges[uint16]) (map[string]uint16, error)
+}
 
 // The dial order is rebuilt from these ranks: the pinned/active head first,
 // then warm candidates in the configured order, then the cooling ones.
@@ -117,6 +130,9 @@ type Cascade struct {
 
 	testing   atomic.Bool
 	lastCheck atomic.TypedValue[time.Time]
+	// recoveryPending single-flights the timer that re-checks the group when a
+	// demoted candidate leaves its cooldown.
+	recoveryPending atomic.Bool
 }
 
 // DialContext implements C.ProxyAdapter
@@ -296,13 +312,25 @@ func (c *Cascade) ForceSet(name string) {
 	c.mu.Unlock()
 }
 
-// URLTest implements ProxyGroup
+// URLTest implements ProxyGroup. Testing the group's own URL re-runs the
+// group's own check, so a host that tests the group instead of its members lets
+// a recovered priority candidate take over. Any other URL is a plain per-member
+// test and only reports delays.
 func (c *Cascade) URLTest(ctx context.Context, url string, expectedStatus utils.IntRanges[uint16]) (map[string]uint16, error) {
-	mp, err := c.GroupBase.URLTest(ctx, url, expectedStatus)
-	if err == nil && url == c.testUrl {
-		c.applyResults(mp)
+	if url != c.testUrl {
+		return c.GroupBase.URLTest(ctx, url, expectedStatus)
 	}
-	return mp, err
+	results := c.runCheck(ctx, true)
+	if len(results) == 0 {
+		return results, errors.New("get delay: all proxies timeout")
+	}
+	return results, nil
+}
+
+// SelfTestTarget implements SelfTester: the URL and status the group checks
+// itself with, so a host can run the group's own test instead of dialing it.
+func (c *Cascade) SelfTestTarget() (string, utils.IntRanges[uint16]) {
+	return c.testUrl, c.expectedRanges
 }
 
 // MarshalJSON implements C.ProxyAdapter
@@ -489,47 +517,211 @@ func (c *Cascade) healthCheck() {
 	c.scheduleCheck()
 }
 
-// check probes the active candidate and then walks forward in the configured
+// check runs the periodic probe in the background.
+func (c *Cascade) check() {
+	c.runCheck(context.Background(), false)
+}
+
+// runCheck probes the active candidate and then walks forward in the configured
 // order until it has `lookahead+1` alive candidates or the probe budget is
 // exhausted. It never sweeps the whole member list, which is what separates
 // cascade from fallback.
-func (c *Cascade) check() {
+//
+// A demoted candidate ahead of the active one is probed even when the walk
+// already found enough alive candidates: with lookahead 0 the first alive
+// candidate ends the cycle, so without that probe the group would stay on the
+// fallback and the priority path would never come back. With force set the
+// candidate's cooldown is ignored, which is what an explicit test of the group
+// asks for.
+func (c *Cascade) runCheck(ctx context.Context, force bool) map[string]uint16 {
 	proxies := c.GetProxies(true)
 	if !c.proxiesReady(proxies) {
-		return
+		return nil
 	}
 
 	order := c.candidateOrder(proxies)
 	if len(order) == 0 {
-		return
+		return nil
 	}
 
 	target := c.lookahead + 1
 	budget := target * cascadeProbeBudgetFactor
+	results := make(map[string]uint16, budget+1)
+	tested := make(map[string]struct{}, budget+1)
 	alive := 0
 	probed := 0
 	for _, proxy := range order {
-		if alive >= target || probed >= budget {
+		if alive >= target || probed >= budget || ctx.Err() != nil {
 			break
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(c.testTimeout)*time.Millisecond)
-		delay, err := proxy.URLTest(ctx, c.testUrl, c.expectedRanges)
-		cancel()
 		probed++
-
+		tested[proxy.Name()] = struct{}{}
+		delay, err := c.probeCandidate(ctx, proxy)
 		if err != nil {
 			c.markUnavailable(proxy.Name())
 			continue
 		}
+		results[proxy.Name()] = delay
 		c.markAlive(proxy.Name(), delay)
 		alive++
+	}
+
+	if proxy, ok := c.recoveryCandidate(proxies, force); ok {
+		if _, alreadyTested := tested[proxy.Name()]; !alreadyTested {
+			probed++
+			delay, err := c.probeCandidate(ctx, proxy)
+			if err != nil {
+				c.markUnavailable(proxy.Name())
+			} else {
+				results[proxy.Name()] = delay
+				c.markAlive(proxy.Name(), delay)
+				alive++
+			}
+		}
 	}
 
 	c.settleActive(proxies)
 	c.pruneStates(proxies)
 	c.lastCheck.Store(time.Now())
+	c.rescheduleRecovery(proxies)
 	log.Debugln("ProxyGroup: %s cascade check probed %d candidates with %d alive", c.Name(), probed, alive)
+	return results
+}
+
+// probeCandidate measures one candidate for the group's own test URL. A
+// candidate that answers as a group (a pool, a load-balance or a nested
+// cascade) is asked through its own check: a single dial through it exercises
+// one member only, so one unlucky member must not demote a candidate whose
+// other members still work.
+func (c *Cascade) probeCandidate(ctx context.Context, proxy C.Proxy) (uint16, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, c.probeTimeout(proxy))
+	defer cancel()
+
+	group, ok := probeGroup(proxy)
+	if !ok {
+		return proxy.URLTest(probeCtx, c.testUrl, c.expectedRanges)
+	}
+
+	url, expected := c.testUrl, c.expectedRanges
+	if tester, ok := group.(SelfTester); ok {
+		url, expected = tester.SelfTestTarget()
+	}
+	results, err := group.URLTest(probeCtx, url, expected)
+	if err != nil {
+		return 0, err
+	}
+	return shortestDelay(results)
+}
+
+// probeGroup reports whether the candidate answers as a group with its own
+// health check, following selectors the same way runsOwnAttempts does.
+func probeGroup(proxy C.Proxy) (groupProber, bool) {
+	for depth := 0; depth <= cascadeNestedDepthLimit; depth++ {
+		switch adapter := proxy.Adapter().(type) {
+		case *URLTestPool:
+			return adapter, true
+		case *Cascade:
+			return adapter, true
+		case *LoadBalance:
+			return adapter, true
+		case *Selector:
+			proxy = adapter.selectedProxy(false)
+		default:
+			return nil, false
+		}
+	}
+	return nil, false
+}
+
+// probeTimeout bounds one candidate probe. A candidate that answers as a group
+// gets at least cascadeMinGroupProbeTimeout, so the cascade `timeout` does not
+// cut the members its own check still accepts.
+func (c *Cascade) probeTimeout(proxy C.Proxy) time.Duration {
+	timeout := time.Duration(c.testTimeout) * time.Millisecond
+	if _, ok := probeGroup(proxy); ok && timeout < cascadeMinGroupProbeTimeout {
+		timeout = cascadeMinGroupProbeTimeout
+	}
+	return timeout
+}
+
+// shortestDelay returns the best delay of a group check, so a candidate that
+// answers through any of its members is ranked by its fastest one.
+func shortestDelay(results map[string]uint16) (uint16, error) {
+	best := uint16(0xffff)
+	for _, delay := range results {
+		if delay < best {
+			best = delay
+		}
+	}
+	if best == 0xffff {
+		return 0, errNoAliveMember
+	}
+	return best, nil
+}
+
+// recoveryCandidate returns the highest-priority demoted candidate that ranks
+// above the active one. The check walk never reaches it once lookahead is
+// satisfied, so it is probed separately; with force set its cooldown is
+// ignored, which is what an explicit test of the group asks for.
+func (c *Cascade) recoveryCandidate(proxies []C.Proxy, force bool) (C.Proxy, bool) {
+	now := time.Now()
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	for _, proxy := range proxies {
+		if proxy.Name() == c.active {
+			break
+		}
+		state, ok := c.states[proxy.Name()]
+		if !ok || state.alive {
+			continue
+		}
+		if !force && state.failedUntil.After(now) {
+			continue
+		}
+		return proxy, true
+	}
+	return nil, false
+}
+
+// scheduleRecovery re-checks the group once the cooldown ends, so a demoted
+// priority candidate returns to the rotation by itself instead of waiting a
+// whole interval. Only one timer is armed at a time; the next check re-arms it
+// for whatever is still cooling.
+func (c *Cascade) scheduleRecovery(after time.Duration) {
+	if after <= 0 || !c.recoveryPending.CompareAndSwap(false, true) {
+		return
+	}
+	time.AfterFunc(after, func() {
+		c.recoveryPending.Store(false)
+		c.scheduleCheck()
+	})
+}
+
+// rescheduleRecovery arms the timer for the nearest cooldown expiry among the
+// candidates that rank above the active one.
+func (c *Cascade) rescheduleRecovery(proxies []C.Proxy) {
+	now := time.Now()
+
+	c.mu.RLock()
+	soonest := time.Duration(0)
+	for _, proxy := range proxies {
+		if proxy.Name() == c.active {
+			break
+		}
+		state, ok := c.states[proxy.Name()]
+		if !ok || state.alive || !state.failedUntil.After(now) {
+			continue
+		}
+		if wait := state.failedUntil.Sub(now); soonest == 0 || wait < soonest {
+			soonest = wait
+		}
+	}
+	c.mu.RUnlock()
+
+	c.scheduleRecovery(soonest)
 }
 
 func (c *Cascade) onAttemptSucceeded(name string) {
@@ -547,7 +739,18 @@ func (c *Cascade) onAttemptFailed(proxy C.Proxy, err error) {
 	if !shouldTrackDialFailure(proxy.Type(), err) {
 		return
 	}
-	c.markUnavailable(proxy.Name())
+	c.markUnavailableFor(proxy.Name(), c.failureCooldown(proxy))
+}
+
+// failureCooldown is how long a failed candidate is demoted. A candidate that
+// runs its own attempts (a pool or a nested cascade) is only briefly kept out
+// of the rotation: another of its members may still carry traffic, and one
+// failed dial must not lock the whole candidate out for the full cooldown.
+func (c *Cascade) failureCooldown(proxy C.Proxy) time.Duration {
+	if runsOwnAttempts(proxy) && c.failedCooldown > cascadeTimeoutCooldown {
+		return cascadeTimeoutCooldown
+	}
+	return c.failedCooldown
 }
 
 // onAttemptTimedOut records a candidate that our own attempt-timeout cut. The
@@ -609,8 +812,8 @@ func (c *Cascade) recheckCandidate(proxy C.Proxy) {
 		c.mu.Unlock()
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), cascadeRecheckTimeout)
-	delay, err := proxy.URLTest(ctx, c.testUrl, c.expectedRanges)
+	ctx, cancel := context.WithTimeout(context.Background(), c.recheckTimeout(proxy))
+	delay, err := c.probeCandidate(ctx, proxy)
 	cancel()
 	if err != nil {
 		return
@@ -618,17 +821,35 @@ func (c *Cascade) recheckCandidate(proxy C.Proxy) {
 	c.markAlive(proxy.Name(), delay)
 }
 
+// recheckTimeout bounds the background probe of a cut candidate, keeping the
+// floor a group candidate needs for its own check.
+func (c *Cascade) recheckTimeout(proxy C.Proxy) time.Duration {
+	timeout := c.probeTimeout(proxy)
+	if timeout < cascadeRecheckTimeout {
+		timeout = cascadeRecheckTimeout
+	}
+	return timeout
+}
+
 func (c *Cascade) markUnavailable(name string) {
+	c.markUnavailableFor(name, c.failedCooldown)
+}
+
+func (c *Cascade) markUnavailableFor(name string, cooldown time.Duration) {
 	c.mu.Lock()
 	state := c.ensureStateLocked(name)
 	state.alive = false
-	if c.failedCooldown > 0 {
-		state.failedUntil = time.Now().Add(c.failedCooldown)
+	if cooldown > 0 {
+		state.failedUntil = time.Now().Add(cooldown)
+	} else {
+		state.failedUntil = time.Time{}
 	}
 	if c.active == name {
 		c.active = ""
 	}
 	c.mu.Unlock()
+
+	c.scheduleRecovery(cooldown)
 }
 
 func (c *Cascade) markAlive(name string, delay uint16) {
@@ -682,34 +903,6 @@ func (c *Cascade) settleActive(proxies []C.Proxy) {
 			return
 		}
 	}
-}
-
-func (c *Cascade) applyResults(results map[string]uint16) {
-	proxies := c.GetProxies(false)
-	now := time.Now()
-
-	c.mu.Lock()
-	for name, delay := range results {
-		state := c.ensureStateLocked(name)
-		state.alive = true
-		state.delay = delay
-		state.failedUntil = time.Time{}
-		state.checkedAt = now
-	}
-	for _, proxy := range proxies {
-		if _, ok := results[proxy.Name()]; ok {
-			continue
-		}
-		state := c.ensureStateLocked(proxy.Name())
-		state.alive = false
-		if c.failedCooldown > 0 {
-			state.failedUntil = now.Add(c.failedCooldown)
-		}
-	}
-	c.mu.Unlock()
-
-	c.settleActive(proxies)
-	c.lastCheck.Store(now)
 }
 
 func (c *Cascade) pruneStates(proxies []C.Proxy) {

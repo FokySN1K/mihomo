@@ -30,6 +30,7 @@ type LoadBalance struct {
 	strategyFn     strategyFn
 	testUrl        string
 	expectedStatus string
+	expectedRanges utils.IntRanges[uint16]
 }
 
 type strategyFn = func(proxies []C.Proxy, metadata *C.Metadata, touch bool) C.Proxy
@@ -285,7 +286,18 @@ func (lb *LoadBalance) Now() string {
 	return ""
 }
 
+// SelfTestTarget implements SelfTester: the URL and status its members are
+// checked against, and the same target the strategies rank them by.
+func (lb *LoadBalance) SelfTestTarget() (string, utils.IntRanges[uint16]) {
+	return lb.testUrl, lb.expectedRanges
+}
+
 func NewLoadBalance(option GroupCommonOption, loadBalanceOption LoadBalanceOption, emptyFallback C.Proxy, providers []P.ProxyProvider) (lb *LoadBalance, err error) {
+	expectedRanges, err := utils.NewUnsignedRanges[uint16](option.ExpectedStatus)
+	if err != nil {
+		return nil, err
+	}
+
 	var strategyFn strategyFn
 	withKey, err := hashKey(loadBalanceOption.HashKey)
 	if err != nil {
@@ -325,5 +337,6 @@ func NewLoadBalance(option GroupCommonOption, loadBalanceOption LoadBalanceOptio
 		disableUDP:     option.DisableUDP,
 		testUrl:        option.URL,
 		expectedStatus: option.ExpectedStatus,
+		expectedRanges: expectedRanges,
 	}, nil
 }

@@ -249,7 +249,12 @@ func TestCascadeCandidateOrder(t *testing.T) {
 	group.states["b"].failedUntil = time.Time{}
 	group.mu.Unlock()
 
-	// a pinned candidate jumps the queue, the active one stays right after it
+	// a pinned candidate jumps the queue, and in sticky mode the active one
+	// stays right after it; prefer-first (the default) drops it back into the
+	// rank walk instead, so the configured order decides
+	group.mu.Lock()
+	group.preferFirst = false
+	group.mu.Unlock()
 	order = group.candidateOrder(group.GetProxies(false))
 	require.Equal(t, []string{"d", "b", "c", "a"}, cascadeProxyNames(order))
 }
@@ -674,4 +679,113 @@ func TestCascadeMarshalJSON(t *testing.T) {
 	require.Equal(t, "b", payload["fixed"])
 	require.Equal(t, float64(2), payload["lookahead"])
 	require.Equal(t, []any{"a", "b"}, payload["all"])
+}
+
+// TestCascadeCheckRecoversDemotedHead guards the case that kept the group on
+// the fallback: with lookahead 0 the walk stops at the first alive candidate,
+// so the demoted priority candidate is only reached by the recovery probe.
+func TestCascadeCheckRecoversDemotedHead(t *testing.T) {
+	group := newCascadeForTest(t, CascadeOption{Lookahead: intPtr(0)},
+		newCascadeTestProxy("ru"), newCascadeTestProxy("pool"))
+
+	group.mu.Lock()
+	group.states["ru"] = &cascadeState{failedUntil: time.Now().Add(-time.Second)}
+	group.states["pool"] = &cascadeState{alive: true}
+	group.active = "pool"
+	group.mu.Unlock()
+
+	group.runCheck(context.Background(), false)
+
+	group.mu.RLock()
+	defer group.mu.RUnlock()
+	require.True(t, group.states["ru"].alive, "the demoted head must be re-probed once its cooldown is over")
+	require.Equal(t, "ru", group.active, "a recovered priority candidate must take over again")
+}
+
+// TestCascadeCheckRespectsCooldown guards the other half: a candidate still
+// inside its cooldown is not probed by the periodic check, and the check arms a
+// timer for the moment the cooldown ends instead of waiting a whole interval.
+func TestCascadeCheckRespectsCooldown(t *testing.T) {
+	group := newCascadeForTest(t, CascadeOption{Lookahead: intPtr(0)},
+		newCascadeTestProxy("ru"), newCascadeTestProxy("pool"))
+
+	group.mu.Lock()
+	group.states["ru"] = &cascadeState{failedUntil: time.Now().Add(time.Minute)}
+	group.states["pool"] = &cascadeState{alive: true}
+	group.active = "pool"
+	group.mu.Unlock()
+
+	group.runCheck(context.Background(), false)
+
+	group.mu.RLock()
+	alive := group.states["ru"].alive
+	active := group.active
+	group.mu.RUnlock()
+	require.False(t, alive, "a cooling candidate must stay out of the periodic check")
+	require.Equal(t, "pool", active)
+	require.True(t, group.recoveryPending.Load(), "the check must arm a timer for the cooldown expiry")
+}
+
+// TestCascadeSelfTestForcesPriorityCandidate guards the explicit test a host
+// runs: it must re-probe a demoted priority candidate even inside its cooldown,
+// so testing the group can move it back.
+func TestCascadeSelfTestForcesPriorityCandidate(t *testing.T) {
+	group := newCascadeForTest(t, CascadeOption{Lookahead: intPtr(0)},
+		newCascadeTestProxy("ru"), newCascadeTestProxy("pool"))
+
+	group.mu.Lock()
+	group.states["ru"] = &cascadeState{failedUntil: time.Now().Add(time.Minute)}
+	group.states["pool"] = &cascadeState{alive: true}
+	group.active = "pool"
+	group.mu.Unlock()
+
+	results, err := group.URLTest(context.Background(), group.testUrl, nil)
+	require.NoError(t, err)
+	require.Contains(t, results, "ru", "an explicit test must measure the demoted candidate too")
+
+	group.mu.RLock()
+	defer group.mu.RUnlock()
+	require.Equal(t, "ru", group.active)
+}
+
+// TestCascadeProbesGroupCandidateAsGroup guards the reason the cascade kept
+// preferring the fallback: a single dial through a load-balancing candidate
+// exercises one member, and one dead member must not demote the candidate.
+func TestCascadeProbesGroupCandidateAsGroup(t *testing.T) {
+	dead := newCascadeUnreachableProxy("ru-dead")
+	alive := newCascadeTestProxy("ru-alive")
+	pd, err := provider.NewCompatibleProvider("ru", []C.Proxy{dead, alive},
+		provider.NewHealthCheck(nil, "", 0, 0, false, nil))
+	require.NoError(t, err)
+
+	balance, err := NewLoadBalance(GroupCommonOption{Name: "ru", URL: poolTestUrl},
+		LoadBalanceOption{Strategy: "round-robin"}, newPoolEmptyFallback(), []P.ProxyProvider{pd})
+	require.NoError(t, err)
+
+	group := newCascadeForTest(t, CascadeOption{Lookahead: intPtr(0)}, adapter.NewProxy(balance))
+	proxies := group.GetProxies(false)
+	require.Len(t, proxies, 1)
+
+	delay, err := group.probeCandidate(context.Background(), proxies[0])
+	require.NoError(t, err)
+	require.Equal(t, uint16(100), delay,
+		"a group candidate is alive while any of its members answers")
+}
+
+// TestCascadeGroupCandidateUsesSoftCooldown guards the dial path: one failed
+// dial through a group candidate must not lock it out for the full cooldown.
+func TestCascadeGroupCandidateUsesSoftCooldown(t *testing.T) {
+	pool, err := NewURLTestPool(GroupCommonOption{Name: "pool"}, URLTestPoolOption{}, newPoolEmptyFallback(), nil)
+	require.NoError(t, err)
+
+	group := newCascadeForTest(t, CascadeOption{}, newCascadeTestProxy("ru"))
+	group.onAttemptFailed(adapter.NewProxy(pool), errors.New("dial failed"))
+
+	group.mu.RLock()
+	state := group.states["pool"]
+	group.mu.RUnlock()
+	require.NotNil(t, state)
+	require.False(t, state.alive)
+	require.WithinDuration(t, time.Now().Add(cascadeTimeoutCooldown), state.failedUntil, 2*time.Second,
+		"a group candidate is demoted softly so the next dial may still reach its members")
 }

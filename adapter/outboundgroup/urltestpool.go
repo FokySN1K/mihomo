@@ -277,6 +277,12 @@ func (u *URLTestPool) URLTest(ctx context.Context, url string, expectedStatus ut
 	return mp, err
 }
 
+// SelfTestTarget implements SelfTester: the URL and status the pool measures
+// its members against.
+func (u *URLTestPool) SelfTestTarget() (string, utils.IntRanges[uint16]) {
+	return u.testUrl, u.expectedRanges
+}
+
 // MarshalJSON implements C.ProxyAdapter
 func (u *URLTestPool) MarshalJSON() ([]byte, error) {
 	all := make([]string, 0)
@@ -613,7 +619,7 @@ func (u *URLTestPool) quickCheck() {
 	}
 
 	log.Debugln("ProxyGroup: %s start quick health check for %d proxies", u.Name(), len(poolProxies))
-	results := u.testProxies(poolProxies)
+	results, tested := u.testProxies(poolProxies)
 	u.lastQuick.Store(time.Now())
 
 	if len(results) == 0 {
@@ -622,31 +628,47 @@ func (u *URLTestPool) quickCheck() {
 		return
 	}
 
+	// Republish so a member that just failed leaves the pool now instead of
+	// holding its slot until the next full check; the members that were not
+	// measured keep their place after the measured ones.
+	u.publishPartial(results, tested)
+
 	u.mu.Lock()
 	for name := range results {
 		delete(u.suspicious, name)
 	}
 	u.mu.Unlock()
 
-	if u.shouldRunFullCheck(len(results)) {
+	if u.shouldRunFullCheck(len(results), u.poolTarget(len(proxies))) {
 		log.Debugln("ProxyGroup: %s pool is underfilled for %d quick checks, start full health check", u.Name(), u.degradedChecks)
 		u.fullCheck()
 	}
 }
 
+// poolTarget is how many alive members the pool should hold: its configured
+// size, capped by how many proxies exist, so a provider smaller than the pool
+// does not look underfilled.
+func (u *URLTestPool) poolTarget(available int) int {
+	if available < u.poolSize {
+		return available
+	}
+	return u.poolSize
+}
+
 // shouldRunFullCheck counts consecutive quick checks with an underfilled pool
-// and reports whether a full check should rebuild the pool. The pool is
-// compared with its current length, so a pool smaller than pool-size (not
-// enough proxies configured) doesn't trigger pointless full checks.
-func (u *URLTestPool) shouldRunFullCheck(alive int) bool {
-	if u.degradedChecks <= 0 {
+// and reports whether a full check should rebuild the pool. The alive count is
+// compared with the target size rather than the current pool length: a member
+// that just failed has already left the pool, so comparing with it would never
+// see the pool as underfilled.
+func (u *URLTestPool) shouldRunFullCheck(alive, target int) bool {
+	if u.degradedChecks <= 0 || target <= 0 {
 		return false
 	}
 
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
-	if alive >= len(u.pool) {
+	if alive >= target {
 		u.degradedCount = 0
 		return false
 	}
@@ -716,7 +738,7 @@ func (u *URLTestPool) recoverAfterFailure(ctx context.Context) C.Proxy {
 	}
 
 	u.lastRecovery.Store(time.Now())
-	results := u.testProxiesWithTimeout(candidates, timeout)
+	results, _ := u.testProxiesWithTimeout(candidates, timeout)
 	if len(results) == 0 {
 		return nil
 	}
@@ -744,11 +766,12 @@ func (u *URLTestPool) fullCheck() {
 	log.Debugln("ProxyGroup: %s start full health check for %d proxies", u.Name(), len(proxies))
 	// Publish every measured member as it arrives, so a cold pool routes by a
 	// real delay from the first result instead of waiting for the whole list.
-	u.applyResults(u.testProxiesStreaming(proxies))
+	results, _ := u.testProxiesStreaming(proxies)
+	u.applyResults(results)
 }
 
 func (u *URLTestPool) applyResults(results map[string]uint16) {
-	u.publishPool(results, true)
+	u.publishPool(results, nil, true)
 
 	now := time.Now()
 	u.lastFull.Store(now)
@@ -759,11 +782,12 @@ func (u *URLTestPool) applyResults(results map[string]uint16) {
 
 // publishPartial rebuilds the pool from the results collected so far, so a dial
 // that arrives during a full check already routes by a measured delay instead
-// of the first proxy of the list. It runs for every new result, so the pool
-// reaches its full size while the slow members are still being probed. The
-// check bookkeeping is left to applyResults.
-func (u *URLTestPool) publishPartial(results map[string]uint16) {
-	u.publishPool(results, false)
+// of the first proxy of the list. It runs for every finished probe, so the pool
+// reaches its full size while the slow members are still being probed and a
+// member that failed leaves it at once. The check bookkeeping is left to
+// applyResults.
+func (u *URLTestPool) publishPartial(results map[string]uint16, tested map[string]struct{}) {
+	u.publishPool(results, tested, false)
 	u.markWarm()
 }
 
@@ -771,12 +795,12 @@ func (u *URLTestPool) publishPartial(results map[string]uint16) {
 // result set is published as soon as it arrives, so a dial during a check
 // already routes by a measured delay instead of the first proxy of the list;
 // the members that have not been measured yet are kept after it, so the pool a
-// dial can choose from never shrinks while the check is running. The dial
-// picker keeps its current node as long as it stays within the tolerance, and
-// only the measured nodes are cleared from the suspicious list. Only a final
-// result set updates the emergency recovery set and the empty marker, because
-// the recovery check replays lastPool and the marker throttles the next one.
-func (u *URLTestPool) publishPool(results map[string]uint16, final bool) {
+// dial can choose from never shrinks while the check is running. A member that
+// was measured and failed is not kept: it is known to be unavailable, and it
+// must not hold a slot until the next full check. Only a final result set
+// updates the emergency recovery set and the empty marker, because the recovery
+// check replays lastPool and the marker throttles the next one.
+func (u *URLTestPool) publishPool(results map[string]uint16, tested map[string]struct{}, final bool) {
 	names := sortedProxyNames(results)
 	if len(names) > u.poolSize {
 		names = names[:u.poolSize]
@@ -792,6 +816,9 @@ func (u *URLTestPool) publishPool(results map[string]uint16, final bool) {
 			if _, measured := results[name]; measured {
 				continue
 			}
+			if _, failed := tested[name]; failed {
+				continue
+			}
 			names = append(names, name)
 		}
 	}
@@ -802,8 +829,10 @@ func (u *URLTestPool) publishPool(results map[string]uint16, final bool) {
 	for name := range results {
 		delete(u.suspicious, name)
 	}
-	u.degradedCount = 0
 	if final {
+		// a full result set rebuilds the pool from every candidate, so the
+		// underfilled streak starts over
+		u.degradedCount = 0
 		if len(names) == 0 {
 			u.lastEmptyFull = now
 		} else {
@@ -814,25 +843,28 @@ func (u *URLTestPool) publishPool(results map[string]uint16, final bool) {
 }
 
 // testProxies tests proxies concurrently and returns delay (ms) of alive proxies
-func (u *URLTestPool) testProxies(proxies []C.Proxy) map[string]uint16 {
+// together with every proxy that was actually measured, alive or not, so the
+// pool can tell a failed member from one the check did not reach.
+func (u *URLTestPool) testProxies(proxies []C.Proxy) (map[string]uint16, map[string]struct{}) {
 	return u.probeProxies(proxies, time.Duration(u.testTimeout)*time.Millisecond, false)
 }
 
 // testProxiesStreaming is testProxies that publishes every measured member as
 // soon as its probe returns, so the pool is usable before the whole list has
 // been probed and a cold start routes by the first real result.
-func (u *URLTestPool) testProxiesStreaming(proxies []C.Proxy) map[string]uint16 {
+func (u *URLTestPool) testProxiesStreaming(proxies []C.Proxy) (map[string]uint16, map[string]struct{}) {
 	return u.probeProxies(proxies, time.Duration(u.testTimeout)*time.Millisecond, true)
 }
 
 // testProxiesWithTimeout is testProxies with a custom timeout, used by the
 // emergency recovery check to stay inside the connection deadline.
-func (u *URLTestPool) testProxiesWithTimeout(proxies []C.Proxy, timeout time.Duration) map[string]uint16 {
+func (u *URLTestPool) testProxiesWithTimeout(proxies []C.Proxy, timeout time.Duration) (map[string]uint16, map[string]struct{}) {
 	return u.probeProxies(proxies, timeout, false)
 }
 
-func (u *URLTestPool) probeProxies(proxies []C.Proxy, timeout time.Duration, publish bool) map[string]uint16 {
+func (u *URLTestPool) probeProxies(proxies []C.Proxy, timeout time.Duration, publish bool) (map[string]uint16, map[string]struct{}) {
 	results := make(map[string]uint16, len(proxies))
+	tested := make(map[string]struct{}, len(proxies))
 	var mu sync.Mutex
 
 	group := new(errgroup.Group)
@@ -844,24 +876,31 @@ func (u *URLTestPool) probeProxies(proxies []C.Proxy, timeout time.Duration, pub
 			defer cancel()
 
 			delay, err := proxy.URLTest(ctx, u.testUrl, u.expectedRanges)
-			if err != nil {
-				return nil
-			}
 
 			mu.Lock()
 			defer mu.Unlock()
+			tested[proxy.Name()] = struct{}{}
+			if err != nil {
+				if publish {
+					// the failed member leaves the pool now instead of
+					// holding a slot until the check ends
+					u.publishPartial(results, tested)
+				}
+				return nil
+			}
+
 			results[proxy.Name()] = delay
 			if publish {
 				// published under the results lock: a later publish always
 				// carries every earlier result, so the pool cannot shrink back
-				u.publishPartial(results)
+				u.publishPartial(results, tested)
 			}
 			return nil
 		})
 	}
 	_ = group.Wait()
 
-	return results
+	return results, tested
 }
 
 // proxiesReady reports whether the providers already loaded their proxies,

@@ -94,10 +94,10 @@ func TestURLTestPoolDegradedChecks(t *testing.T) {
 
 	pool.pool = []string{"a", "b", "c"}
 
-	require.False(t, pool.shouldRunFullCheck(3)) // a full pool resets the counter
-	require.False(t, pool.shouldRunFullCheck(2)) // first underfilled quick check
-	require.True(t, pool.shouldRunFullCheck(2))  // second one triggers a full check
-	require.False(t, pool.shouldRunFullCheck(2)) // the counter has been reset
+	require.False(t, pool.shouldRunFullCheck(3, 3)) // a full pool resets the counter
+	require.False(t, pool.shouldRunFullCheck(2, 3)) // first underfilled quick check
+	require.True(t, pool.shouldRunFullCheck(2, 3))  // second one triggers a full check
+	require.False(t, pool.shouldRunFullCheck(2, 3)) // the counter has been reset
 }
 
 func TestURLTestPoolDegradedChecksDisabled(t *testing.T) {
@@ -107,8 +107,8 @@ func TestURLTestPoolDegradedChecksDisabled(t *testing.T) {
 	require.Zero(t, pool.degradedChecks)
 
 	pool.pool = []string{"a", "b"}
-	require.False(t, pool.shouldRunFullCheck(1))
-	require.False(t, pool.shouldRunFullCheck(1))
+	require.False(t, pool.shouldRunFullCheck(1, 2))
+	require.False(t, pool.shouldRunFullCheck(1, 2))
 }
 
 func TestURLTestPoolDegradedChecksSmallPool(t *testing.T) {
@@ -117,8 +117,10 @@ func TestURLTestPoolDegradedChecksSmallPool(t *testing.T) {
 
 	// fewer proxies than pool-size: a fully alive small pool is not degraded
 	pool.pool = []string{"a", "b"}
-	require.False(t, pool.shouldRunFullCheck(2))
-	require.False(t, pool.shouldRunFullCheck(2))
+	target := pool.poolTarget(2)
+	require.Equal(t, 2, target)
+	require.False(t, pool.shouldRunFullCheck(2, target))
+	require.False(t, pool.shouldRunFullCheck(2, target))
 }
 
 func TestURLTestPoolProxiesReady(t *testing.T) {
@@ -515,19 +517,24 @@ func TestURLTestPoolPublishesEachResult(t *testing.T) {
 
 // TestURLTestPoolPartialPublishKeepsUnmeasured guards the pool a dial can choose
 // from: a check in progress must not drop the members it has not re-measured
-// yet, and only the final result may evict them.
+// yet, a member measured and failed must leave at once, and the final result
+// may evict whatever the check did not reach.
 func TestURLTestPoolPartialPublishKeepsUnmeasured(t *testing.T) {
-	pool := &URLTestPool{poolSize: 2, pool: []string{"a", "b"}}
+	pool := &URLTestPool{poolSize: 3, pool: []string{"a", "b", "c"}}
 
-	pool.publishPool(map[string]uint16{"b": 20}, false)
-	require.Equal(t, []string{"b", "a"}, poolNames(pool),
+	pool.publishPool(map[string]uint16{"b": 20}, nil, false)
+	require.Equal(t, []string{"b", "a", "c"}, poolNames(pool),
 		"the measured member goes first, the unmeasured ones stay behind it")
 
-	pool.publishPool(map[string]uint16{"b": 20, "a": 30}, true)
-	require.Equal(t, []string{"b", "a"}, poolNames(pool))
-	require.Equal(t, []string{"b", "a"}, poolLastNames(pool))
+	pool.publishPool(map[string]uint16{"b": 20}, map[string]struct{}{"b": {}, "a": {}}, false)
+	require.Equal(t, []string{"b", "c"}, poolNames(pool),
+		"a member measured and failed leaves the pool, only the unmeasured one stays")
 
-	pool.publishPool(map[string]uint16{"b": 20}, true)
+	pool.publishPool(map[string]uint16{"b": 20, "c": 30}, nil, true)
+	require.Equal(t, []string{"b", "c"}, poolNames(pool))
+	require.Equal(t, []string{"b", "c"}, poolLastNames(pool))
+
+	pool.publishPool(map[string]uint16{"b": 20}, nil, true)
 	require.Equal(t, []string{"b"}, poolNames(pool), "the final result evicts an unmeasured member")
 }
 
@@ -543,7 +550,7 @@ func TestURLTestPoolPublishKeepsFastNodeAndClearsMeasured(t *testing.T) {
 		suspicious: map[string]struct{}{"a": {}, "b": {}},
 	}
 
-	pool.publishPool(map[string]uint16{"a": 20}, false)
+	pool.publishPool(map[string]uint16{"a": 20}, nil, false)
 
 	require.NotNil(t, pool.fastNode, "a published result must not reset the fast node")
 	require.Equal(t, "a", pool.fastNode.Name())
