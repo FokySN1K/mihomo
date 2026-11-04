@@ -104,10 +104,7 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	updateGeneral(cfg.General, true)
 	updateDNS(cfg.DNS, cfg.General.IPv6)
 	updateNTP(cfg.NTP) // initialize NTP after DNS because an NTP server may be a hostname.
-	if !disableDefaultListeners.Load() {
-		updateListeners(cfg.General, cfg.Listeners, force)
-		updateTun(cfg.General) // tun should not care "force"
-	}
+	applyInboundListeners(cfg, force)
 	updateIPTables(cfg)
 	updateTunnels(cfg.Tunnels)
 
@@ -183,6 +180,17 @@ func GetGeneral() *config.General {
 	}
 
 	return general
+}
+
+// applyInboundListeners binds every inbound of a standalone run. An embedded
+// core opens them from the host's own lifecycle, so its ApplyConfig must leave
+// the ports down until the user starts the service.
+func applyInboundListeners(cfg *config.Config, force bool) {
+	if embedded.Load() {
+		return
+	}
+	updateListeners(cfg.General, cfg.Listeners, force)
+	updateTun(cfg.General) // tun should not care "force"
 }
 
 func updateListeners(general *config.General, listeners map[string]C.InboundListener, force bool) {
@@ -354,6 +362,13 @@ func loadProvider[T P.Provider](providers map[string]T) {
 			defer func() { <-ch; wg.Done() }()
 			load(pv)
 		}()
+	}
+	if !embedded.Load() {
+		// A standalone run serves the configured rules and proxies from the
+		// moment ApplyConfig returns, so it waits for the initial load like
+		// upstream does. An embedded host pulls the providers itself, which is
+		// what keeps its start fast.
+		wg.Wait()
 	}
 }
 

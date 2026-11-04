@@ -6,14 +6,15 @@ type ProviderLoadedHook func(providerName string)
 
 var DefaultProviderLoadedHook ProviderLoadedHook
 
-// disableDefaultListeners is set by a host that opens every inbound itself and
-// keeps the ports down until the user starts the service, which is what the
-// FlClash core does.
-var disableDefaultListeners atomic.Bool
+// embedded is set by a host that runs the core inside its own process and owns
+// the inbound lifecycle: ApplyConfig then leaves the ports down (the app starts
+// the service itself) and returns without waiting for the initial provider
+// load, because the app pulls the providers on its own schedule.
+var embedded atomic.Bool
 
-// DisableDefaultListeners stops ApplyConfig from creating the inbound
-// listeners. A standalone build never calls it and keeps binding mixed-port
-// and the rest from ApplyConfig.
+// DisableDefaultListeners marks this process as an embedded core. A standalone
+// build never calls it and keeps binding mixed-port and the rest from
+// ApplyConfig, and waits for the providers before it serves traffic.
 func DisableDefaultListeners() {
-	disableDefaultListeners.Store(true)
+	embedded.Store(true)
 }

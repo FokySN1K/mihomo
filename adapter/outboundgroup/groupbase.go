@@ -238,23 +238,31 @@ func (gb *GroupBase) GetProxies(touch bool) []C.Proxy {
 	return proxies
 }
 
+// defaultGroupURLCheckLimit caps how many members of a group are probed at the
+// same time. Every probe opens its own connection to the same test URL, so an
+// unbounded fan-out over a large provider is a burst of hundreds of handshakes
+// that only competes with itself; the cap keeps the test within a sane socket
+// count without serializing it.
+const defaultGroupURLCheckLimit = 50
+
 func (gb *GroupBase) URLTest(ctx context.Context, url string, expectedStatus utils.IntRanges[uint16]) (map[string]uint16, error) {
 	var wg sync.WaitGroup
 	var lock sync.Mutex
 	mp := map[string]uint16{}
 	proxies := gb.GetProxies(false)
+	limit := make(chan struct{}, defaultGroupURLCheckLimit)
 	for _, proxy := range proxies {
 		proxy := proxy
 		wg.Add(1)
+		limit <- struct{}{}
 		go func() {
+			defer func() { <-limit; wg.Done() }()
 			delay, err := proxy.URLTest(ctx, url, expectedStatus)
 			if err == nil {
 				lock.Lock()
 				mp[proxy.Name()] = delay
 				lock.Unlock()
 			}
-
-			wg.Done()
 		}()
 	}
 	wg.Wait()

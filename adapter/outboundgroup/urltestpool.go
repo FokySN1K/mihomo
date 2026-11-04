@@ -978,6 +978,12 @@ func shouldTrackDialFailure(adapterType C.AdapterType, err error) bool {
 	case C.Direct, C.Compatible, C.Reject, C.Pass, C.RejectDrop:
 		return false
 	}
+	// A cancelled dial means the caller gave up on the request, which says
+	// nothing about the member: only the proxy's own failure may cost it its
+	// place in the pool.
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
 	return !errors.Is(err, C.ErrNotSupport)
 }
 
