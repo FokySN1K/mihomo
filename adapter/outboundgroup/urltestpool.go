@@ -113,6 +113,10 @@ type URLTestPool struct {
 	// preWarming guards the single pre-warm of the group: the executor asks
 	// for it on every config apply, and only the first ask may start a wait.
 	preWarming atomic.Bool
+	// preWarmRecheck is the safety recheck of the pre-warm wait. It only covers
+	// a provider that finished loading before the group subscribed; a test
+	// stretches it to isolate the wake-up a provider change gives.
+	preWarmRecheck time.Duration
 
 	testing      atomic.Bool
 	recovering   atomic.Bool
@@ -709,10 +713,10 @@ func (u *URLTestPool) waitWarm(ctx context.Context) {
 //
 // The group exists before the providers of an embedded core finish loading, so
 // the check waits for them: a full check started over the empty fallback would
-// only mark the pool empty for the next interval. A load of one of the group's
-// providers wakes the wait, which turns it into one proxy list read per load
-// instead of a poll every interval. `lazy` opts out, because the profile asked
-// for checks driven only by real traffic.
+// only mark the pool empty for the next interval. A change of one of the
+// group's providers wakes the wait, which turns it into one proxy list read
+// per change instead of a poll every interval. `lazy` opts out, because the
+// profile asked for checks driven only by real traffic.
 func (u *URLTestPool) WarmUp() {
 	if u.lazy {
 		return
@@ -721,15 +725,15 @@ func (u *URLTestPool) WarmUp() {
 		return
 	}
 
-	// Only a load of one of the group's own providers can fill the pool, so a
-	// load of any other provider costs nothing.
+	// Only a change of one of the group's own providers can fill the pool, so a
+	// change of any other provider costs nothing.
 	own := make(map[string]struct{}, len(u.providers))
 	for _, provider := range u.providers {
 		own[provider.Name()] = struct{}{}
 	}
 
 	loaded := make(chan struct{}, 1)
-	cancel := P.OnLoaded(func(name string) {
+	cancel := P.OnChange(func(name string) {
 		if _, ok := own[name]; !ok {
 			return
 		}
@@ -751,11 +755,15 @@ func (u *URLTestPool) WarmUp() {
 // waitProvidersReady waits until the providers of the group have proxies and
 // reports whether they arrived within the given wait. It reads the proxy list
 // without touching the providers, so the wait never starts a check of its own,
-// and it re-reads it on a provider load rather than on a poll.
+// and it re-reads it on a provider change rather than on a poll.
 func (u *URLTestPool) waitProvidersReady(wait time.Duration, loaded <-chan struct{}) bool {
 	deadline := time.NewTimer(wait)
 	defer deadline.Stop()
-	recheck := time.NewTicker(urlTestPoolPreWarmRecheck)
+	recheckInterval := u.preWarmRecheck
+	if recheckInterval <= 0 {
+		recheckInterval = urlTestPoolPreWarmRecheck
+	}
+	recheck := time.NewTicker(recheckInterval)
 	defer recheck.Stop()
 
 	for {
@@ -1261,6 +1269,7 @@ func NewURLTestPool(option GroupCommonOption, poolOption URLTestPoolOption, empt
 		firstResultWait: firstResultWait,
 		attemptTimeout:  attemptTimeout,
 		lazy:            option.Lazy,
+		preWarmRecheck:  urlTestPoolPreWarmRecheck,
 		suspicious:      make(map[string]struct{}),
 	}, nil
 }

@@ -363,9 +363,6 @@ func loadProvider[T P.Provider](providers map[string]T) {
 			if DefaultProviderLoadedHook != nil {
 				DefaultProviderLoadedHook(name)
 			}
-			// Groups that build themselves from provider proxies wait for this
-			// instead of polling the provider list.
-			P.NotifyLoaded(name)
 		}
 	}
 

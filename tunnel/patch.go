@@ -11,9 +11,9 @@ import (
 
 func init() {
 	statistic.IsDirect = IsDirect
-	// A provider that finishes loading may carry direct-typed proxies, which
-	// the snapshot taken by the apply could not see yet.
-	P.OnLoaded(func(string) { publishDirectNamesFromTunnel() })
+	// A provider installs its list after the apply and replaces it on every
+	// refresh; both may carry direct-typed proxies the apply could not see.
+	P.OnChange(func(string) { publishDirectNamesFromTunnel() })
 }
 
 // directNames holds the names of the proxies whose type is direct. Statistics
@@ -61,10 +61,12 @@ func addDirectNames(names map[string]struct{}, proxies []C.Proxy) {
 }
 
 func publishDirectNamesFromTunnel() {
+	// The read and the store share one hold, the way AllProxies takes them: an
+	// apply that landed in between would publish its own set first and have
+	// this older one overwrite it for the rest of the config's life.
 	configMux.RLock()
-	currentProxies, currentProviders := proxies, providers
-	configMux.RUnlock()
-	publishDirectNames(currentProxies, currentProviders)
+	defer configMux.RUnlock()
+	publishDirectNames(proxies, providers)
 }
 
 var (

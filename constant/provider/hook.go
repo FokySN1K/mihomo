@@ -1,48 +1,65 @@
 package provider
 
-import "sync"
+import (
+	"sync"
 
-// The initial load of a provider is the moment a group built from provider
-// proxies can stop waiting for them. The loader reports it here, so such a
-// group reacts to the load itself instead of polling the provider list.
-var (
-	loadedMu   sync.Mutex
-	loadedSubs = make(map[uint64]func(name string))
-	loadedNext uint64
+	"github.com/metacubex/mihomo/log"
 )
 
-// NotifyLoaded reports that the provider with the given name finished its
-// initial load. Subscribers run in the goroutine of the loader, so they must
+// A provider installs its proxy list after the config has been applied, and
+// replaces that list later when the subscription refreshes. A group that
+// builds itself from provider proxies, and the tunnel's direct-name snapshot,
+// both have to react to that, so a provider reports it here instead of being
+// polled.
+var (
+	changedMu   sync.Mutex
+	changedSubs = make(map[uint64]func(name string))
+	changedNext uint64
+)
+
+// NotifyChanged reports that the provider with the given name installed a new
+// proxy list. Subscribers run in the goroutine of the provider, so they must
 // not block it.
-func NotifyLoaded(name string) {
-	loadedMu.Lock()
-	subs := make([]func(string), 0, len(loadedSubs))
-	for _, sub := range loadedSubs {
+func NotifyChanged(name string) {
+	changedMu.Lock()
+	subs := make([]func(string), 0, len(changedSubs))
+	for _, sub := range changedSubs {
 		subs = append(subs, sub)
 	}
-	loadedMu.Unlock()
+	changedMu.Unlock()
 
 	for _, sub := range subs {
-		sub(name)
+		notifyChanged(sub, name)
 	}
 }
 
-// OnLoaded subscribes to NotifyLoaded and returns the function that removes
+// notifyChanged runs one subscriber. A subscriber that panics must neither
+// take down the provider that loaded nor hide the change from the others.
+func notifyChanged(sub func(string), name string) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Errorln("provider %s: subscriber panicked: %v", name, r)
+		}
+	}()
+	sub(name)
+}
+
+// OnChange subscribes to NotifyChanged and returns the function that removes
 // the subscription.
-func OnLoaded(sub func(name string)) (cancel func()) {
+func OnChange(sub func(name string)) (cancel func()) {
 	if sub == nil {
 		return func() {}
 	}
 
-	loadedMu.Lock()
-	loadedNext++
-	id := loadedNext
-	loadedSubs[id] = sub
-	loadedMu.Unlock()
+	changedMu.Lock()
+	changedNext++
+	id := changedNext
+	changedSubs[id] = sub
+	changedMu.Unlock()
 
 	return func() {
-		loadedMu.Lock()
-		delete(loadedSubs, id)
-		loadedMu.Unlock()
+		changedMu.Lock()
+		delete(changedSubs, id)
+		changedMu.Unlock()
 	}
 }

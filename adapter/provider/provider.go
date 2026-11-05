@@ -205,7 +205,14 @@ func NewProxySetProvider(name string, interval time.Duration, payload []map[stri
 		hc.setProxies(proxies)
 	}
 
-	fetcher := resource.NewFetcher[[]C.Proxy](name, interval, vehicle, nil, parser, pd.setProxies)
+	// The fetcher reports every list it installs, the initial one and every
+	// refresh. Groups that wait for their providers and the tunnel's
+	// direct-name snapshot must see both, so the change is reported right after
+	// setProxies released the provider lock (a subscriber reads the list back).
+	fetcher := resource.NewFetcher[[]C.Proxy](name, interval, vehicle, nil, parser, func(proxies []C.Proxy) {
+		pd.setProxies(proxies)
+		P.NotifyChanged(name)
+	})
 	pd.Fetcher = fetcher
 	if httpVehicle, ok := vehicle.(*resource.HTTPVehicle); ok {
 		httpVehicle.SetInRead(func(resp *http.Response) {
