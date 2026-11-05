@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"sync"
+	"sync/atomic"
 
 	C "github.com/metacubex/mihomo/constant"
 	P "github.com/metacubex/mihomo/constant/provider"
@@ -9,10 +10,61 @@ import (
 )
 
 func init() {
-	statistic.IsDirect = func(name string) bool {
-		proxy, ok := AllProxies()[name]
-		return ok && proxy.Type() == C.Direct
+	statistic.IsDirect = IsDirect
+	// A provider that finishes loading may carry direct-typed proxies, which
+	// the snapshot taken by the apply could not see yet.
+	P.OnLoaded(func(string) { publishDirectNamesFromTunnel() })
+}
+
+// directNames holds the names of the proxies whose type is direct. Statistics
+// asks whether a connection was made directly for every tracker it creates,
+// which is on the connection path, so the answer must not take a lock an apply
+// or a route match may hold.
+var directNames atomic.Pointer[map[string]struct{}]
+
+// IsDirect reports whether the named outbound reaches the destination without
+// a proxy.
+func IsDirect(name string) bool {
+	names := directNames.Load()
+	if names == nil {
+		// Nothing has been applied yet, so the built-in adapter is all that is
+		// known; after an apply the set covers the names a profile chose.
+		return name == "DIRECT"
 	}
+	_, ok := (*names)[name]
+	return ok
+}
+
+// publishDirectNames installs the set built from the config proxies and the
+// proxies of the given providers. providers may be nil when the caller already
+// holds every proxy in one map.
+func publishDirectNames(proxies map[string]C.Proxy, providers map[string]P.ProxyProvider) {
+	names := make(map[string]struct{})
+	for _, proxy := range proxies {
+		if proxy.Type() == C.Direct {
+			names[proxy.Name()] = struct{}{}
+		}
+	}
+	for _, provider := range providers {
+		addDirectNames(names, provider.Proxies())
+	}
+	directNames.Store(&names)
+}
+
+// addDirectNames records the names of the direct-typed proxies in the list.
+func addDirectNames(names map[string]struct{}, proxies []C.Proxy) {
+	for _, proxy := range proxies {
+		if proxy.Type() == C.Direct {
+			names[proxy.Name()] = struct{}{}
+		}
+	}
+}
+
+func publishDirectNamesFromTunnel() {
+	configMux.RLock()
+	currentProxies, currentProviders := proxies, providers
+	configMux.RUnlock()
+	publishDirectNames(currentProxies, currentProviders)
 }
 
 var (
@@ -62,6 +114,9 @@ func AllProxies() map[string]C.Proxy {
 
 	allProxies = rebuilt
 	allProxiesVersions = versions
+	// The rebuild merged the config proxies and every provider list, so it is
+	// the freshest place to learn which names are direct.
+	publishDirectNames(rebuilt, nil)
 	return allProxies
 }
 

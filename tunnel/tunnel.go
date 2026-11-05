@@ -240,6 +240,9 @@ func UpdateProxies(newProxies map[string]C.Proxy, newProviders map[string]P.Prox
 	proxies = newProxies
 	providers = newProviders
 	invalidateAllProxies()
+	// Built from the config alone: a provider installs its list after the apply
+	// and reports the load, which refreshes this snapshot then.
+	publishDirectNames(newProxies, nil)
 	configMux.Unlock()
 }
 
