@@ -803,6 +803,36 @@ func TestURLTestPoolWarmUpWaitsForProviders(t *testing.T) {
 		"the warm-up must start the check once the provider arrives")
 }
 
+// TestURLTestPoolWarmUpWakesOnOwnProviderChange guards the subscription WarmUp
+// installs: a change of one of the group's providers must end the wait at once,
+// while a change of any other provider must not. The safety recheck is pushed
+// out of the way, so only the subscription can end the wait in time.
+func TestURLTestPoolWarmUpWakesOnOwnProviderChange(t *testing.T) {
+	probe := &poolProbeProxy{cascadeFakeProxy: newPoolSucceedingProxy("fast", &dialLog{})}
+	probe.testFn = func() (uint16, error) { return 20, nil }
+
+	inner, err := provider.NewCompatibleProvider("pool", []C.Proxy{probe},
+		provider.NewHealthCheck(nil, "", 0, 0, false, nil))
+	require.NoError(t, err)
+	pd := &delayedPoolProvider{ProxyProvider: inner, ready: make(chan struct{})}
+
+	pool, err := NewURLTestPool(GroupCommonOption{Name: "pool", Interval: 300},
+		URLTestPoolOption{}, newPoolEmptyFallback(), []P.ProxyProvider{pd})
+	require.NoError(t, err)
+	pool.testUrl = "http://127.0.0.1:1/"
+	pool.preWarmRecheck = 30 * time.Second
+
+	pool.WarmUp()
+	P.NotifyChanged("other")
+	time.Sleep(100 * time.Millisecond)
+	require.False(t, pool.hasFullCheck.Load(), "a change of another provider must not start the check")
+
+	close(pd.ready)
+	P.NotifyChanged("pool")
+	require.Eventually(t, func() bool { return pool.hasFullCheck.Load() }, 3*time.Second, 5*time.Millisecond,
+		"a change of the group's own provider must start the check at once")
+}
+
 // delayedPoolProvider is a provider whose proxies arrive only when the test
 // releases them: an embedded core applies the config before its subscription
 // providers have loaded, and the group must wait for them.
