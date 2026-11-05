@@ -168,6 +168,7 @@ func TestCascadeDefaults(t *testing.T) {
 	require.Equal(t, C.DefaultTestURL, group.testUrl)
 	require.True(t, group.preferFirst)
 	require.Zero(t, group.attemptTimeout)
+	require.Equal(t, defaultCascadeSwitchGrace, group.switchGrace)
 
 	_, err = NewCascade(GroupCommonOption{Name: "cascade"}, CascadeOption{}, nil, nil)
 	require.ErrorContains(t, err, "empty fallback proxy not exist")
@@ -202,6 +203,17 @@ func TestCascadeExplicitOptions(t *testing.T) {
 	require.Equal(t, 15*time.Second, group.failedCooldown)
 	require.True(t, group.preferFirst)
 	require.Equal(t, 1500*time.Millisecond, group.attemptTimeout)
+	require.Equal(t, defaultCascadeSwitchGrace, group.switchGrace)
+
+	group, err = NewCascade(GroupCommonOption{Name: "cascade"},
+		CascadeOption{SwitchGrace: intPtr(8)}, newPoolEmptyFallback(), nil)
+	require.NoError(t, err)
+	require.Equal(t, 8*time.Second, group.switchGrace)
+
+	group, err = NewCascade(GroupCommonOption{Name: "cascade"},
+		CascadeOption{SwitchGrace: intPtr(-1)}, newPoolEmptyFallback(), nil)
+	require.NoError(t, err)
+	require.Zero(t, group.switchGrace, "a negative switch-grace disables the grace window")
 }
 
 func TestCascadeAcceptsNestedGroup(t *testing.T) {
@@ -772,20 +784,107 @@ func TestCascadeProbesGroupCandidateAsGroup(t *testing.T) {
 		"a group candidate is alive while any of its members answers")
 }
 
-// TestCascadeGroupCandidateUsesSoftCooldown guards the dial path: one failed
-// dial through a group candidate must not lock it out for the full cooldown.
-func TestCascadeGroupCandidateUsesSoftCooldown(t *testing.T) {
-	pool, err := NewURLTestPool(GroupCommonOption{Name: "pool"}, URLTestPoolOption{}, newPoolEmptyFallback(), nil)
-	require.NoError(t, err)
+// TestCascadeProbesPoolMembersOnly guards the cost of a check: a pool candidate
+// is measured over the members the pool holds, not over every candidate of its
+// providers, and the measurement does not rebuild the pool from a sweep.
+func TestCascadeProbesPoolMembersOnly(t *testing.T) {
+	var probes atomic.Int32
+	newCounting := func(name string) C.Proxy {
+		proxy := &cascadeProbeProxy{cascadeFakeProxy: newCascadeTestProxy(name)}
+		proxy.testFn = func() (uint16, error) {
+			probes.Add(1)
+			return 100, nil
+		}
+		return proxy
+	}
 
-	group := newCascadeForTest(t, CascadeOption{}, newCascadeTestProxy("ru"))
-	group.onAttemptFailed(adapter.NewProxy(pool), errors.New("dial failed"))
+	pool := newPoolForTest(t, URLTestPoolOption{},
+		newCounting("a"), newCounting("b"), newCounting("outside"))
+	pool.pool = []string{"a", "b"}
+
+	group := newCascadeForTest(t, CascadeOption{}, adapter.NewProxy(pool))
+	proxies := group.GetProxies(false)
+	require.Len(t, proxies, 1)
+
+	delay, err := group.probeCandidate(context.Background(), proxies[0])
+	require.NoError(t, err)
+	require.Equal(t, uint16(100), delay)
+	require.Equal(t, int32(2), probes.Load(),
+		"a pool candidate must be measured over its pool, not over every member")
+}
+
+// TestCascadePoolKeepsTheConnection guards the dial path: one failed dial
+// through a pool that still has a working member must not hand the connection
+// to the next candidate, because the pool moves to that member by itself.
+func TestCascadePoolKeepsTheConnection(t *testing.T) {
+	log := &dialLog{}
+	pool := newPoolForTest(t, URLTestPoolOption{},
+		newPoolFailingProxy("dead", log),
+		newPoolSucceedingProxy("alive", log),
+	)
+	group := newCascadeForTest(t, CascadeOption{}, adapter.NewProxy(pool),
+		newCascadeSucceedingProxy("fallback", log))
+
+	conn, err := group.DialContext(context.Background(), &C.Metadata{})
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	require.Equal(t, []string{"dead", "alive"}, log.list(),
+		"the pool must keep the connection and move to its next member")
 
 	group.mu.RLock()
 	state := group.states["pool"]
 	group.mu.RUnlock()
 	require.NotNil(t, state)
+	require.True(t, state.alive, "a pool that still has a working member keeps its place")
+	require.True(t, state.failedUntil.IsZero())
+}
+
+// TestCascadePoolDemotedAfterSwitchGrace guards the window: a pool that keeps
+// failing after the grace has expired must lose its place, so the group finally
+// switches to the next candidate.
+func TestCascadePoolDemotedAfterSwitchGrace(t *testing.T) {
+	pool := newPoolForTest(t, URLTestPoolOption{},
+		newPoolDeadProxy("a"), newPoolDeadProxy("b"))
+	proxy := adapter.NewProxy(pool)
+	group := newCascadeForTest(t, CascadeOption{}, newCascadeTestProxy("ru"))
+	group.switchGrace = 30 * time.Millisecond
+
+	require.True(t, group.onAttemptFailed(proxy, errors.New("dial failed")),
+		"the first failure opens the window and keeps the candidate")
+	group.mu.RLock()
+	state := group.states["pool"]
+	group.mu.RUnlock()
+	require.True(t, state.failedUntil.IsZero(), "a kept candidate must not enter a cooldown")
+
+	time.Sleep(50 * time.Millisecond)
+
+	require.False(t, group.onAttemptFailed(proxy, errors.New("dial failed")),
+		"the failure after the window demotes the candidate")
+	group.mu.RLock()
+	state = group.states["pool"]
+	group.mu.RUnlock()
 	require.False(t, state.alive)
-	require.WithinDuration(t, time.Now().Add(cascadeTimeoutCooldown), state.failedUntil, 2*time.Second,
-		"a group candidate is demoted softly so the next dial may still reach its members")
+	require.WithinDuration(t, time.Now().Add(group.failedCooldown), state.failedUntil, 2*time.Second)
+}
+
+// TestCascadePoolWithoutAliveMemberIsDemoted guards the "no nodes available"
+// half: a pool that reports nothing alive is cut at once, without waiting for
+// the window.
+func TestCascadePoolWithoutAliveMemberIsDemoted(t *testing.T) {
+	pool, err := NewURLTestPool(GroupCommonOption{Name: "pool"}, URLTestPoolOption{}, newPoolEmptyFallback(), nil)
+	require.NoError(t, err)
+	// a finished check found nothing alive
+	pool.hasFullCheck.Store(true)
+
+	proxy := adapter.NewProxy(pool)
+	group := newCascadeForTest(t, CascadeOption{}, proxy)
+
+	require.False(t, group.onAttemptFailed(proxy, errors.New("dial failed")))
+	group.mu.RLock()
+	state := group.states["pool"]
+	group.mu.RUnlock()
+	require.NotNil(t, state)
+	require.False(t, state.alive)
+	require.WithinDuration(t, time.Now().Add(group.failedCooldown), state.failedUntil, 2*time.Second,
+		"a pool with nothing left takes the full cooldown")
 }

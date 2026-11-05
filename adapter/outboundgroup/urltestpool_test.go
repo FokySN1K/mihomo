@@ -246,6 +246,34 @@ func TestURLTestPoolTracksOnlyDialFailures(t *testing.T) {
 	require.True(t, shouldTrackDialFailure(C.URLTestPool, errDial))
 }
 
+func TestURLTestPoolAliveMember(t *testing.T) {
+	fresh, err := NewURLTestPool(GroupCommonOption{Name: "fresh"}, URLTestPoolOption{}, newPoolEmptyFallback(), nil)
+	require.NoError(t, err)
+	alive, known := fresh.AliveMember()
+	require.False(t, alive)
+	require.False(t, known, "a pool that has not been measured yet must not be cut on its first failure")
+
+	dead := newPoolDeadProxy("dead")
+	pool := newPoolForTest(t, URLTestPoolOption{}, newCascadeTestProxy("alive"), dead)
+	_, _ = dead.URLTest(context.Background(), pool.testUrl, pool.expectedRanges)
+
+	alive, known = pool.AliveMember()
+	require.True(t, alive, "a pool with a working member keeps its parent on it")
+	require.True(t, known)
+
+	pool.markSuspicious("alive")
+	alive, known = pool.AliveMember()
+	require.False(t, alive, "a pool whose every member failed has nothing left")
+	require.True(t, known)
+
+	pool.mu.Lock()
+	pool.pool = nil
+	pool.mu.Unlock()
+	alive, known = pool.AliveMember()
+	require.False(t, alive)
+	require.True(t, known)
+}
+
 func TestURLTestPoolProxiesByNames(t *testing.T) {
 	a := newPoolDeadProxy("a")
 	b := newPoolDeadProxy("b")

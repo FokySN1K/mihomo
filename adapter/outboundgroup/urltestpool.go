@@ -290,6 +290,85 @@ func (u *URLTestPool) URLTest(ctx context.Context, url string, expectedStatus ut
 	return mp, err
 }
 
+// PoolCheck measures only the members the pool holds and reports their delays.
+// A parent group probes a candidate through its own check: asking the pool for
+// its own view keeps the parent from sweeping every candidate of the providers
+// and from rebuilding the pool from that partial result. An empty pool has
+// nothing to measure, so a full check fills it, which is also what the pool's
+// own schedule would do.
+func (u *URLTestPool) PoolCheck(ctx context.Context) (map[string]uint16, error) {
+	u.mu.RLock()
+	names := append([]string(nil), u.pool...)
+	u.mu.RUnlock()
+
+	if len(names) == 0 {
+		return u.URLTest(ctx, u.testUrl, u.expectedRanges)
+	}
+
+	proxies := u.GetProxies(true)
+	members, complete := proxiesByNames(proxies, names)
+	if !complete {
+		// the proxy list has been changed, rebuild the pool
+		return u.URLTest(ctx, u.testUrl, u.expectedRanges)
+	}
+
+	results, tested := u.testProxies(members)
+	// A member that failed leaves the pool now instead of holding a slot: the
+	// parent asked precisely whether the pool can still carry traffic.
+	u.publishPartial(results, tested)
+	if len(results) == 0 {
+		return nil, errNoAliveMember
+	}
+
+	u.mu.Lock()
+	for name := range results {
+		delete(u.suspicious, name)
+	}
+	u.mu.Unlock()
+	u.lastQuick.Store(time.Now())
+	return results, nil
+}
+
+// AliveMember reports whether the pool still holds a member that can carry
+// traffic, and whether that is known at all: a pool that has not finished a
+// check yet is unknown, so a parent does not cut it on the first failure of a
+// cold start. A member measured dead, or one that failed a dial since its last
+// measurement, does not count: a pool whose every member failed answers
+// "nothing left", and the parent switches to its next candidate.
+func (u *URLTestPool) AliveMember() (alive, known bool) {
+	if !u.hasFullCheck.Load() {
+		return false, false
+	}
+
+	u.mu.RLock()
+	names := make(map[string]struct{}, len(u.pool))
+	for _, name := range u.pool {
+		names[name] = struct{}{}
+	}
+	suspicious := make(map[string]struct{}, len(u.suspicious))
+	for name := range u.suspicious {
+		suspicious[name] = struct{}{}
+	}
+	u.mu.RUnlock()
+
+	if len(names) == 0 {
+		return false, true
+	}
+
+	for _, proxy := range u.GetProxies(false) {
+		if _, ok := names[proxy.Name()]; !ok {
+			continue
+		}
+		if _, ok := suspicious[proxy.Name()]; ok {
+			continue
+		}
+		if proxy.AliveForTestUrl(u.testUrl) {
+			return true, true
+		}
+	}
+	return false, true
+}
+
 // SelfTestTarget implements SelfTester: the URL and status the pool measures
 // its members against.
 func (u *URLTestPool) SelfTestTarget() (string, utils.IntRanges[uint16]) {

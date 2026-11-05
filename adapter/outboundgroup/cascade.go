@@ -44,6 +44,16 @@ const (
 	// answers as a group: its own check probes every member, so the tighter
 	// cascade `timeout` would cut members the group itself still accepts.
 	cascadeMinGroupProbeTimeout = 5 * time.Second
+	// defaultCascadeSwitchGrace is how long a candidate that owns the failover
+	// between its own members (a pool or a nested cascade) keeps its place after
+	// a failed dial. The candidate switches to another member by itself, so one
+	// failed dial must not switch the whole group; the group moves on only when
+	// the candidate reports that nothing is left or the window expires.
+	defaultCascadeSwitchGrace = 5 * time.Second
+	// cascadeGraceRetries is how many extra dials such a candidate gets inside
+	// one connection. It is small on purpose: the tunnel retries the whole dial
+	// as well, and that retry enters the group again with the same priority.
+	cascadeGraceRetries = 2
 )
 
 // errNoAliveMember reports a group candidate whose own check found nothing.
@@ -53,6 +63,22 @@ var errNoAliveMember = errors.New("no alive member")
 // It is all a cascade needs from a candidate that is a group itself.
 type groupProber interface {
 	URLTest(ctx context.Context, url string, expectedStatus utils.IntRanges[uint16]) (map[string]uint16, error)
+}
+
+// poolChecker is the cheap check a parent asks of a candidate that keeps its own
+// member list: it measures the members the candidate holds instead of sweeping
+// every proxy of its providers.
+type poolChecker interface {
+	PoolCheck(ctx context.Context) (map[string]uint16, error)
+}
+
+// aliveMemberSource is a candidate that owns the failover between its own
+// members and can say whether anything is left to switch to.
+type aliveMemberSource interface {
+	// AliveMember reports whether the candidate can still carry traffic, and
+	// whether that is known at all: a candidate that has not measured itself
+	// yet must not be cut on its first failure.
+	AliveMember() (alive, known bool)
 }
 
 // The dial order is rebuilt from these ranks: the pinned/active head first,
@@ -85,6 +111,13 @@ type CascadeOption struct {
 	// that runs its own attempts (a nested pool or cascade) is left alone, so
 	// its own budget stays in charge.
 	AttemptTimeout *int `group:"attempt-timeout,omitempty"`
+	// SwitchGrace is how long a candidate that runs its own attempts (a nested
+	// pool or cascade) keeps its place after a failed dial, in seconds. The
+	// pool switches between its members by itself, so the group moves to the
+	// next candidate only when the pool reports that no member is left or when
+	// the window expires without a successful dial. 0 demotes on the first
+	// failure, like a plain proxy.
+	SwitchGrace *int `group:"switch-grace,omitempty"`
 }
 
 type cascadeState struct {
@@ -92,6 +125,10 @@ type cascadeState struct {
 	delay       uint16
 	checkedAt   time.Time
 	failedUntil time.Time
+	// softUntil is the end of the switch-grace window a failed dial opened for a
+	// candidate that owns its own failover. While the window lasts the candidate
+	// keeps its place and only its failed member is replaced.
+	softUntil time.Time
 
 	// timeoutAt and timeoutCount track candidates cut by attempt-timeout, so a
 	// node that is always too slow escalates to the full cooldown.
@@ -120,6 +157,7 @@ type Cascade struct {
 	failedCooldown time.Duration
 	preferFirst    bool
 	attemptTimeout time.Duration
+	switchGrace    time.Duration
 	lazy           bool
 
 	mu         sync.RWMutex
@@ -153,31 +191,43 @@ func (c *Cascade) DialContext(ctx context.Context, metadata *C.Metadata) (conn C
 	for i := 0; i < attempts; i++ {
 		proxy := order[i]
 		lastProxy = proxy
-		dialCtx, cancel := c.attemptContext(ctx, proxy)
-		conn, err = proxy.DialContext(dialCtx, metadata)
-		// our own attempt-timeout fired, the caller still has time left
-		cut := ctx.Err() == nil && dialCtx.Err() != nil
-		cancel()
-		if err == nil {
-			conn.AppendToChains(c)
-			c.onAttemptSucceeded(proxy.Name())
-			if N.NeedHandshake(conn) {
-				conn = callback.NewFirstWriteCallBackConn(conn, func(err error) {
-					if err == nil {
-						c.onDialSuccess()
-					} else {
-						c.onAttemptFailed(proxy, err)
-					}
-				})
+		retries := c.graceRetries(proxy)
+		for {
+			dialCtx, cancel := c.attemptContext(ctx, proxy)
+			conn, err = proxy.DialContext(dialCtx, metadata)
+			// our own attempt-timeout fired, the caller still has time left
+			cut := ctx.Err() == nil && dialCtx.Err() != nil
+			cancel()
+			if err == nil {
+				conn.AppendToChains(c)
+				c.onAttemptSucceeded(proxy.Name())
+				if N.NeedHandshake(conn) {
+					conn = callback.NewFirstWriteCallBackConn(conn, func(err error) {
+						if err == nil {
+							c.onDialSuccess()
+						} else {
+							c.onAttemptFailed(proxy, err)
+						}
+					})
+				}
+				return conn, nil
 			}
-			return conn, nil
-		}
 
-		lastErr = err
-		if cut {
-			c.onAttemptTimedOut(proxy)
-		} else {
-			c.onAttemptFailed(proxy, err)
+			lastErr = err
+			if cut {
+				c.onAttemptTimedOut(proxy)
+				break
+			}
+			if !c.onAttemptFailed(proxy, err) {
+				break
+			}
+			// The candidate owns its failover and still has a working member:
+			// it has already moved to another one, so the connection stays on
+			// the priority path instead of switching to the next group.
+			if retries <= 0 || ctx.Err() != nil {
+				break
+			}
+			retries--
 		}
 		// The caller's deadline covers every attempt; once it is gone there is
 		// no point in spending more candidate dials on this connection.
@@ -217,6 +267,24 @@ func runsOwnAttempts(proxy C.Proxy) bool {
 	return false
 }
 
+// aliveMemberOf returns the verdict of a candidate that owns its failover,
+// following selectors the same way runsOwnAttempts does.
+func aliveMemberOf(proxy C.Proxy) (aliveMemberSource, bool) {
+	for depth := 0; depth <= cascadeNestedDepthLimit; depth++ {
+		switch adapter := proxy.Adapter().(type) {
+		case *URLTestPool:
+			return adapter, true
+		case *Cascade:
+			return adapter, true
+		case *Selector:
+			proxy = adapter.selectedProxy(false)
+		default:
+			return nil, false
+		}
+	}
+	return nil, false
+}
+
 // ListenPacketContext implements C.ProxyAdapter
 func (c *Cascade) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (pc C.PacketConn, err error) {
 	c.maybeScheduleCheck()
@@ -235,22 +303,31 @@ func (c *Cascade) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
 	for i := 0; i < attempts; i++ {
 		proxy := order[i]
 		lastProxy = proxy
-		dialCtx, cancel := c.attemptContext(ctx, proxy)
-		pc, err = proxy.ListenPacketContext(dialCtx, metadata)
-		// our own attempt-timeout fired, the caller still has time left
-		cut := ctx.Err() == nil && dialCtx.Err() != nil
-		cancel()
-		if err == nil {
-			pc.AppendToChains(c)
-			c.onAttemptSucceeded(proxy.Name())
-			return pc, nil
-		}
+		retries := c.graceRetries(proxy)
+		for {
+			dialCtx, cancel := c.attemptContext(ctx, proxy)
+			pc, err = proxy.ListenPacketContext(dialCtx, metadata)
+			// our own attempt-timeout fired, the caller still has time left
+			cut := ctx.Err() == nil && dialCtx.Err() != nil
+			cancel()
+			if err == nil {
+				pc.AppendToChains(c)
+				c.onAttemptSucceeded(proxy.Name())
+				return pc, nil
+			}
 
-		lastErr = err
-		if cut {
-			c.onAttemptTimedOut(proxy)
-		} else {
-			c.onAttemptFailed(proxy, err)
+			lastErr = err
+			if cut {
+				c.onAttemptTimedOut(proxy)
+				break
+			}
+			if !c.onAttemptFailed(proxy, err) {
+				break
+			}
+			if retries <= 0 || ctx.Err() != nil {
+				break
+			}
+			retries--
 		}
 		if ctx.Err() != nil {
 			break
@@ -356,6 +433,7 @@ func (c *Cascade) MarshalJSON() ([]byte, error) {
 		"lookahead":      c.lookahead,
 		"preferFirst":    c.preferFirst,
 		"attemptTimeout": c.attemptTimeout.Milliseconds(),
+		"switchGrace":    c.switchGrace.Milliseconds(),
 		"testUrl":        c.testUrl,
 		"expectedStatus": c.expectedStatus,
 		"fixed":          selected,
@@ -380,6 +458,29 @@ func (c *Cascade) pick(touch bool) C.Proxy {
 		return c.EmptyFallback()
 	}
 	return order[0]
+}
+
+// AliveMember reports whether the group still holds a candidate that can carry
+// traffic, so a cascade that nests this one can keep it in charge while any of
+// its candidates works.
+func (c *Cascade) AliveMember() (alive, known bool) {
+	proxies := c.GetProxies(false)
+	if len(proxies) == 0 {
+		return false, true
+	}
+	if _, ok := c.lastCheck.LoadOk(); !ok {
+		return false, false
+	}
+
+	now := time.Now()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, proxy := range proxies {
+		if state, ok := c.states[proxy.Name()]; ok && state.alive && !state.failedUntil.After(now) {
+			return true, true
+		}
+	}
+	return false, true
 }
 
 // candidateOrder returns the dialing priority: the pinned candidate, the last
@@ -603,6 +704,18 @@ func (c *Cascade) probeCandidate(ctx context.Context, proxy C.Proxy) (uint16, er
 		return proxy.URLTest(probeCtx, c.testUrl, c.expectedRanges)
 	}
 
+	// A candidate that keeps its own member list is asked for its own view: its
+	// quick check measures the members it holds, while a group-wide check would
+	// sweep every candidate of its providers and rebuild it from that partial
+	// result.
+	if checker, ok := group.(poolChecker); ok {
+		results, err := checker.PoolCheck(probeCtx)
+		if err != nil {
+			return 0, err
+		}
+		return shortestDelay(results)
+	}
+
 	url, expected := c.testUrl, c.expectedRanges
 	if tester, ok := group.(SelfTester); ok {
 		url, expected = tester.SelfTestTarget()
@@ -729,28 +842,72 @@ func (c *Cascade) onAttemptSucceeded(name string) {
 	state := c.ensureStateLocked(name)
 	state.alive = true
 	state.failedUntil = time.Time{}
+	state.softUntil = time.Time{}
 	state.checkedAt = time.Now()
 	c.active = name
 	c.lastActive = name
 	c.mu.Unlock()
 }
 
-func (c *Cascade) onAttemptFailed(proxy C.Proxy, err error) {
+// onAttemptFailed records a failed dial and reports whether the candidate kept
+// its place. A candidate that owns the failover between its own members is not
+// demoted while it still has a working member inside the switch-grace window:
+// the pool moves to another member and the next attempt through it is expected
+// to succeed.
+func (c *Cascade) onAttemptFailed(proxy C.Proxy, err error) bool {
 	if !shouldTrackDialFailure(proxy.Type(), err) {
-		return
+		return false
 	}
-	c.markUnavailableFor(proxy.Name(), c.failureCooldown(proxy))
+	if c.softFailure(proxy) {
+		return true
+	}
+	c.markUnavailableFor(proxy.Name(), c.failedCooldown)
+	return false
 }
 
-// failureCooldown is how long a failed candidate is demoted. A candidate that
-// runs its own attempts (a pool or a nested cascade) is only briefly kept out
-// of the rotation: another of its members may still carry traffic, and one
-// failed dial must not lock the whole candidate out for the full cooldown.
-func (c *Cascade) failureCooldown(proxy C.Proxy) time.Duration {
-	if runsOwnAttempts(proxy) && c.failedCooldown > cascadeTimeoutCooldown {
-		return cascadeTimeoutCooldown
+// softFailure reports whether a failed dial must not demote the candidate. The
+// first failure opens the switch-grace window; the failures inside it keep the
+// candidate, and the first one after it demotes it so the group finally moves
+// on. A candidate that reports no working member is cut at once: there is
+// nothing left to switch to, which is the "no nodes available" case.
+func (c *Cascade) softFailure(proxy C.Proxy) bool {
+	if c.switchGrace <= 0 || !runsOwnAttempts(proxy) {
+		return false
 	}
-	return c.failedCooldown
+
+	if verdict, ok := aliveMemberOf(proxy); ok {
+		if alive, known := verdict.AliveMember(); known && !alive {
+			log.Debugln("ProxyGroup: %s candidate %s ran out of alive members", c.Name(), proxy.Name())
+			return false
+		}
+	}
+
+	now := time.Now()
+	c.mu.Lock()
+	state := c.ensureStateLocked(proxy.Name())
+	opened := state.softUntil.IsZero()
+	kept := opened || now.Before(state.softUntil)
+	if opened {
+		state.softUntil = now.Add(c.switchGrace)
+	} else if !kept {
+		state.softUntil = time.Time{}
+	}
+	c.mu.Unlock()
+
+	if opened {
+		log.Debugln("ProxyGroup: %s candidate %s keeps its place for %s after a failed dial", c.Name(), proxy.Name(), c.switchGrace)
+	}
+	return kept
+}
+
+// graceRetries is how many extra dials a candidate that owns its failover gets
+// inside one connection: every failed dial through it replaces the member that
+// failed, so an immediate retry stays on the priority path.
+func (c *Cascade) graceRetries(proxy C.Proxy) int {
+	if c.switchGrace <= 0 || !runsOwnAttempts(proxy) {
+		return 0
+	}
+	return cascadeGraceRetries
 }
 
 // onAttemptTimedOut records a candidate that our own attempt-timeout cut. The
@@ -839,6 +996,7 @@ func (c *Cascade) markUnavailableFor(name string, cooldown time.Duration) {
 	c.mu.Lock()
 	state := c.ensureStateLocked(name)
 	state.alive = false
+	state.softUntil = time.Time{}
 	if cooldown > 0 {
 		state.failedUntil = time.Now().Add(cooldown)
 	} else {
@@ -858,6 +1016,7 @@ func (c *Cascade) markAlive(name string, delay uint16) {
 	state.alive = true
 	state.delay = delay
 	state.failedUntil = time.Time{}
+	state.softUntil = time.Time{}
 	state.checkedAt = time.Now()
 	c.mu.Unlock()
 }
@@ -988,6 +1147,14 @@ func NewCascade(option GroupCommonOption, cascadeOption CascadeOption, emptyFall
 		}
 	}
 
+	switchGrace := defaultCascadeSwitchGrace
+	if cascadeOption.SwitchGrace != nil {
+		switchGrace = time.Duration(*cascadeOption.SwitchGrace) * time.Second
+		if switchGrace < 0 {
+			switchGrace = 0
+		}
+	}
+
 	testUrl := option.URL
 	if testUrl == "" {
 		testUrl = C.DefaultTestURL
@@ -1017,6 +1184,7 @@ func NewCascade(option GroupCommonOption, cascadeOption CascadeOption, emptyFall
 		failedCooldown: failedCooldown,
 		preferFirst:    preferFirst,
 		attemptTimeout: attemptTimeout,
+		switchGrace:    switchGrace,
 		lazy:           option.Lazy,
 		states:         make(map[string]*cascadeState),
 	}, nil

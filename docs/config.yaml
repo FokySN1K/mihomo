@@ -1810,6 +1810,9 @@ proxy-groups:
   # 默认只要高优先级节点恢复可用就会切回；prefer-first: false 时保持当前节点，只有失败才切换
   # attempt-timeout 会限制单个候选的拨号时间；自带重试的嵌套组（url-test-pool、cascade）不会被截断
   # attempt-timeout 截断的候选不算死亡：只降级 3 秒并在后台复测，1 分钟内被截断 3 次才按 failed-cooldown 降级
+  # switch-grace 是自带切换的候选（url-test-pool、嵌套 cascade）拨号失败后的宽限时间
+  # 池会自行切到其他成员，因此宽限期内不会整组降级；候选报告没有可用成员或窗口到期才切换到下一个候选
+  # 对嵌套组做检查时只测池内成员（url-test-pool 的快速检查），不会全量扫 provider
   # 全部节点都在冷却时，会优先重试上次成功的节点；其余失败节点排在最后，短时故障后仍会再次尝试
   # proxies 允许嵌套代理组（url-test-pool 不允许），嵌套时按所选组的行为转发
   # 注意：为 use 的 provider 关闭 health-check.enable，否则 provider 自带的检查仍会全量测试
@@ -1826,6 +1829,7 @@ proxy-groups:
     # failed-cooldown: 30 # 失败节点的降级时间(秒)
     # prefer-first: true # 高优先级节点恢复后是否自动切回，默认 true
     # attempt-timeout: 1500 # 单个候选的拨号上限(毫秒)，0 表示不限制；嵌套组自带的重试优先
+    # switch-grace: 5 # 自带切换的候选(url-test-pool、嵌套 cascade)失败后的宽限时间(秒)，默认 5，0 表示首次失败即降级
     # timeout: 5000 # 单次节点测试超时时间(毫秒)
     # lazy: true
     # expected-status: 204 # 当健康检查返回状态码与期望值不符时，认为节点不可用
