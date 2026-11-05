@@ -1,0 +1,39 @@
+name: Core Tests
+
+on:
+  push:
+    branches:
+      - Alpha
+    paths-ignore:
+      - "docs/**"
+      - "README.md"
+      - ".github/ISSUE_TEMPLATE/**"
+  pull_request:
+    branches:
+      - Alpha
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  groups:
+    # The fork's own check: the upstream Test workflow is gated to MetaCubeX,
+    # and the group state machines this fork adds are only exercised with the
+    # race detector, which that matrix does not run.
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: 1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+
+      - name: Vet
+        run: go vet ./adapter/outboundgroup/... ./config/... ./constant/provider/... ./tunnel/...
+
+      - name: Race tests
+        run: go test -race -count=1 ./adapter/outboundgroup/... ./config/... ./constant/provider/...
