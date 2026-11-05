@@ -35,10 +35,10 @@ const (
 	// timeout (a result cannot arrive sooner) and is counted from the start of
 	// the check, so a check cycle never delays dials longer than this.
 	defaultURLTestPoolFirstResultWait = 2 * time.Second
-	// urlTestPoolPreWarmPoll is how often a pre-warm looks for the proxies of
-	// the group: an embedded core builds the group before its providers finish
-	// loading, so the proxies may arrive after the config is applied.
-	urlTestPoolPreWarmPoll = 100 * time.Millisecond
+	// urlTestPoolPreWarmRecheck is the safety net of a pre-warm: a load of a
+	// provider of the group wakes the wait at once, and this only covers a load
+	// that finished before the group subscribed.
+	urlTestPoolPreWarmRecheck = time.Second
 	// urlTestPoolPreWarmWait bounds that wait. A provider that takes longer
 	// leaves the group on the old path, where the first dial starts the check.
 	urlTestPoolPreWarmWait = 30 * time.Second
@@ -141,11 +141,17 @@ func (u *URLTestPool) DialContext(ctx context.Context, metadata *C.Metadata) (c 
 
 		dialCtx, cancel := u.attemptContext(ctx)
 		c, err = proxy.DialContext(dialCtx, metadata)
+		// The attempt context ended only by its own timeout, while the caller
+		// still waits: the member did not connect within attempt-timeout.
+		cut := ctx.Err() == nil && dialCtx.Err() != nil
 		cancel()
 		if err == nil {
 			break
 		}
 
+		if cut {
+			log.Debugln("ProxyGroup: %s: %s did not connect within %s", u.Name(), proxy.Name(), u.attemptTimeout)
+		}
 		u.onProxyFailed(proxy, err)
 
 		if recovery {
@@ -210,6 +216,7 @@ func (u *URLTestPool) ListenPacketContext(ctx context.Context, metadata *C.Metad
 
 		dialCtx, cancel := u.attemptContext(ctx)
 		pc, err := proxy.ListenPacketContext(dialCtx, metadata)
+		cut := ctx.Err() == nil && dialCtx.Err() != nil
 		cancel()
 		if err == nil {
 			pc.AppendToChains(u)
@@ -217,6 +224,9 @@ func (u *URLTestPool) ListenPacketContext(ctx context.Context, metadata *C.Metad
 			return pc, nil
 		}
 
+		if cut {
+			log.Debugln("ProxyGroup: %s: %s did not connect within %s", u.Name(), proxy.Name(), u.attemptTimeout)
+		}
 		lastErr = err
 		u.onProxyFailed(proxy, err)
 		if u.attemptTimeout <= 0 || ctx.Err() != nil {
@@ -699,8 +709,10 @@ func (u *URLTestPool) waitWarm(ctx context.Context) {
 //
 // The group exists before the providers of an embedded core finish loading, so
 // the check waits for them: a full check started over the empty fallback would
-// only mark the pool empty for the next interval. `lazy` opts out, because the
-// profile asked for checks driven only by real traffic.
+// only mark the pool empty for the next interval. A load of one of the group's
+// providers wakes the wait, which turns it into one proxy list read per load
+// instead of a poll every interval. `lazy` opts out, because the profile asked
+// for checks driven only by real traffic.
 func (u *URLTestPool) WarmUp() {
 	if u.lazy {
 		return
@@ -708,8 +720,28 @@ func (u *URLTestPool) WarmUp() {
 	if !u.preWarming.CompareAndSwap(false, true) {
 		return
 	}
+
+	// Only a load of one of the group's own providers can fill the pool, so a
+	// load of any other provider costs nothing.
+	own := make(map[string]struct{}, len(u.providers))
+	for _, provider := range u.providers {
+		own[provider.Name()] = struct{}{}
+	}
+
+	loaded := make(chan struct{}, 1)
+	cancel := P.OnLoaded(func(name string) {
+		if _, ok := own[name]; !ok {
+			return
+		}
+		select {
+		case loaded <- struct{}{}:
+		default:
+		}
+	})
+
 	go func() {
-		if !u.waitProvidersReady(urlTestPoolPreWarmWait) {
+		defer cancel()
+		if !u.waitProvidersReady(urlTestPoolPreWarmWait, loaded) {
 			return
 		}
 		u.maybeScheduleCheck()
@@ -718,17 +750,24 @@ func (u *URLTestPool) WarmUp() {
 
 // waitProvidersReady waits until the providers of the group have proxies and
 // reports whether they arrived within the given wait. It reads the proxy list
-// without touching the providers, so the wait never starts a check of its own.
-func (u *URLTestPool) waitProvidersReady(wait time.Duration) bool {
-	deadline := time.Now().Add(wait)
+// without touching the providers, so the wait never starts a check of its own,
+// and it re-reads it on a provider load rather than on a poll.
+func (u *URLTestPool) waitProvidersReady(wait time.Duration, loaded <-chan struct{}) bool {
+	deadline := time.NewTimer(wait)
+	defer deadline.Stop()
+	recheck := time.NewTicker(urlTestPoolPreWarmRecheck)
+	defer recheck.Stop()
+
 	for {
 		if u.proxiesReady(u.GetProxies(false)) {
 			return true
 		}
-		if time.Now().After(deadline) {
-			return false
+		select {
+		case <-loaded:
+		case <-recheck.C:
+		case <-deadline.C:
+			return u.proxiesReady(u.GetProxies(false))
 		}
-		time.Sleep(urlTestPoolPreWarmPoll)
 	}
 }
 

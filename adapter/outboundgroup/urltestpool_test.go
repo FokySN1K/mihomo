@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -130,6 +131,68 @@ func TestURLTestPoolProxiesReady(t *testing.T) {
 
 	require.False(t, pool.proxiesReady([]C.Proxy{emptyFallback}))
 	require.True(t, pool.proxiesReady([]C.Proxy{emptyFallback, adapter.NewProxy(outbound.NewDirect())}))
+}
+
+// mutableProvider is a provider whose list arrives after the group was built,
+// the way an embedded core loads it after applying the config.
+type mutableProvider struct {
+	P.ProxyProvider
+	name string
+
+	mu      sync.RWMutex
+	proxies []C.Proxy
+	version uint32
+}
+
+func (m *mutableProvider) Name() string { return m.name }
+
+func (m *mutableProvider) Proxies() []C.Proxy {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.proxies
+}
+
+func (m *mutableProvider) Version() uint32 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.version
+}
+
+func (m *mutableProvider) set(proxies ...C.Proxy) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.proxies = proxies
+	m.version++
+}
+
+func TestURLTestPoolWaitProvidersReadyWakesOnLoad(t *testing.T) {
+	pd := &mutableProvider{name: "pd"}
+	pool, err := NewURLTestPool(GroupCommonOption{Name: "pool"}, URLTestPoolOption{},
+		newPoolEmptyFallback(), []P.ProxyProvider{pd})
+	require.NoError(t, err)
+
+	loaded := make(chan struct{}, 1)
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		pd.set(namedProxy("pd-hk"))
+		loaded <- struct{}{}
+	}()
+
+	start := time.Now()
+	require.True(t, pool.waitProvidersReady(5*time.Second, loaded))
+	require.Less(t, time.Since(start), urlTestPoolPreWarmRecheck,
+		"the wait must end on the load signal, not on the recheck tick")
+}
+
+func TestURLTestPoolWaitProvidersReadyGivesUp(t *testing.T) {
+	pd := &mutableProvider{name: "pd"}
+	pool, err := NewURLTestPool(GroupCommonOption{Name: "pool"}, URLTestPoolOption{},
+		newPoolEmptyFallback(), []P.ProxyProvider{pd})
+	require.NoError(t, err)
+
+	start := time.Now()
+	require.False(t, pool.waitProvidersReady(50*time.Millisecond, make(chan struct{})))
+	require.GreaterOrEqual(t, time.Since(start), 50*time.Millisecond)
 }
 
 func TestURLTestPoolNoRecoveryCheckWithoutEmptyPool(t *testing.T) {
