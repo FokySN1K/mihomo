@@ -660,6 +660,11 @@ func (c *Cascade) runCheck(ctx context.Context, force bool) map[string]uint16 {
 		tested[proxy.Name()] = struct{}{}
 		delay, err := c.probeCandidate(ctx, proxy)
 		if err != nil {
+			if ctx.Err() != nil {
+				// the caller gave up: the probe was cut, so it says nothing
+				// about the candidate and the walk ends here
+				break
+			}
 			c.markUnavailable(proxy.Name())
 			continue
 		}
@@ -668,12 +673,14 @@ func (c *Cascade) runCheck(ctx context.Context, force bool) map[string]uint16 {
 		alive++
 	}
 
-	if proxy, ok := c.recoveryCandidate(proxies, force); ok {
+	if proxy, ok := c.recoveryCandidate(proxies, force); ok && ctx.Err() == nil {
 		if _, alreadyTested := tested[proxy.Name()]; !alreadyTested {
 			probed++
 			delay, err := c.probeCandidate(ctx, proxy)
 			if err != nil {
-				c.markUnavailable(proxy.Name())
+				if ctx.Err() == nil {
+					c.markUnavailable(proxy.Name())
+				}
 			} else {
 				results[proxy.Name()] = delay
 				c.markAlive(proxy.Name(), delay)

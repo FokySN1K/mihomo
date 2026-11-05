@@ -30,6 +30,11 @@ const (
 	urlTestPoolRecoveryTestInterval  = 5 * time.Second
 	urlTestPoolRecoveryTestTimeout   = 2 * time.Second
 	urlTestPoolRetryReserve          = 500 * time.Millisecond
+	// urlTestPoolRecoveryWait is the head start an exhausted dial gives the
+	// emergency test before it falls back to the last known good proxy. The
+	// first probe of the test usually answers within it, so the dial leaves on
+	// a measured member instead of paying for a blind dial of the old one.
+	urlTestPoolRecoveryWait = 500 * time.Millisecond
 	// defaultURLTestPoolFirstResultWait caps how long a dial of a cold start
 	// waits for the first measured member. The wait is also bounded by the probe
 	// timeout (a result cannot arrive sooner) and is counted from the start of
@@ -80,6 +85,11 @@ type URLTestPoolOption struct {
 // Dial failures mark the used proxy as suspicious so the next connection is
 // routed to the next best pool member; with `attempt-timeout` set, the next
 // member is tried inside the same call as well.
+// When no member is measured alive at all (an outage, a network that changed),
+// the dial starts an emergency test of the last pool before it falls back to
+// the last known good proxy, and leaves on the first member that test finds.
+// A packet flow chooses among the members that carry UDP, and the group reports
+// UDP support as long as any member has it.
 type URLTestPool struct {
 	*GroupBase
 	disableUDP      bool
@@ -93,15 +103,24 @@ type URLTestPool struct {
 	tolerance       uint16
 	firstResultWait time.Duration
 	attemptTimeout  time.Duration
+	recoveryWait    time.Duration
 	lazy            bool
 
-	mu            sync.RWMutex
-	selected      string
-	pool          []string
-	lastPool      []string
-	lastGood      string
-	suspicious    map[string]struct{}
+	mu       sync.RWMutex
+	selected string
+	pool     []string
+	lastPool []string
+	lastGood string
+	// suspicious holds the members that failed a dial, with the time the mark
+	// expires: a member is not skipped forever, and a check that does not reach
+	// it must not keep it out of the pool either.
+	suspicious    map[string]time.Time
+	suspiciousTTL time.Duration
 	fastNode      C.Proxy
+	// measuring is the emergency test of lastPool that runs while the pool has
+	// nothing measured alive. Every dial of the exhausted pool joins it instead
+	// of probing on its own; it is cleared as the test ends.
+	measuring     *poolMeasurement
 	lastEmptyFull time.Time
 	degradedCount int
 	// warmCh is open while a full check is running and is closed once the first
@@ -119,11 +138,25 @@ type URLTestPool struct {
 	preWarmRecheck time.Duration
 
 	testing      atomic.Bool
-	recovering   atomic.Bool
 	lastQuick    atomic.TypedValue[time.Time]
 	lastFull     atomic.TypedValue[time.Time]
 	lastRecovery atomic.TypedValue[time.Time]
 	hasFullCheck atomic.Bool
+}
+
+// poolMeasurement is one emergency test of the last non-empty pool. A dial of
+// an exhausted pool joins it: alive is closed once the first alive member is
+// published, so the dial leaves on a measured member at once, and done is
+// closed when the test ends, so a dial that has nothing else to try can take
+// whatever the test found.
+type poolMeasurement struct {
+	alive    chan struct{}
+	done     chan struct{}
+	aliveHit bool
+}
+
+func newPoolMeasurement() *poolMeasurement {
+	return &poolMeasurement{alive: make(chan struct{}), done: make(chan struct{})}
 }
 
 // DialContext implements C.ProxyAdapter
@@ -135,12 +168,11 @@ func (u *URLTestPool) DialContext(ctx context.Context, metadata *C.Metadata) (c 
 	tried := make(map[string]struct{})
 
 	for {
-		var recovery bool
-		proxy, recovery = u.fastForDial(true)
-		if _, ok := tried[proxy.Name()]; ok {
-			// every fresh member has already been tried
+		candidate := u.nextCandidate(ctx, tried, false)
+		if !candidate.ok {
 			break
 		}
+		proxy = candidate.proxy
 		tried[proxy.Name()] = struct{}{}
 
 		dialCtx, cancel := u.attemptContext(ctx)
@@ -158,9 +190,10 @@ func (u *URLTestPool) DialContext(ctx context.Context, metadata *C.Metadata) (c 
 		}
 		u.onProxyFailed(proxy, err)
 
-		if recovery {
-			if fallback := u.recoverAfterFailure(ctx); fallback != nil {
+		if candidate.exhausted {
+			if fallback := u.failedDialFallback(ctx, tried, candidate); fallback != nil {
 				proxy = fallback
+				tried[proxy.Name()] = struct{}{}
 				c, err = proxy.DialContext(ctx, metadata)
 				if err != nil {
 					u.onProxyFailed(proxy, err)
@@ -212,27 +245,34 @@ func (u *URLTestPool) ListenPacketContext(ctx context.Context, metadata *C.Metad
 	tried := make(map[string]struct{})
 
 	for {
-		proxy, _ := u.fastForDial(true)
-		if _, ok := tried[proxy.Name()]; ok {
+		candidate := u.nextCandidate(ctx, tried, true)
+		if !candidate.ok {
 			break
 		}
+		proxy := candidate.proxy
 		tried[proxy.Name()] = struct{}{}
 
-		dialCtx, cancel := u.attemptContext(ctx)
-		pc, err := proxy.ListenPacketContext(dialCtx, metadata)
-		cut := ctx.Err() == nil && dialCtx.Err() != nil
-		cancel()
+		pc, err := u.packetAttempt(ctx, proxy, metadata)
 		if err == nil {
-			pc.AppendToChains(u)
-			u.noteDialSucceeded(proxy)
 			return pc, nil
-		}
-
-		if cut {
-			log.Debugln("ProxyGroup: %s: %s did not connect within %s", u.Name(), proxy.Name(), u.attemptTimeout)
 		}
 		lastErr = err
 		u.onProxyFailed(proxy, err)
+
+		if candidate.exhausted {
+			if fallback := u.failedDialFallback(ctx, tried, candidate); fallback != nil {
+				proxy = fallback
+				tried[proxy.Name()] = struct{}{}
+				pc, err = u.packetAttempt(ctx, proxy, metadata)
+				if err == nil {
+					return pc, nil
+				}
+				lastErr = err
+				u.onProxyFailed(proxy, err)
+			}
+			break
+		}
+
 		if u.attemptTimeout <= 0 || ctx.Err() != nil {
 			break
 		}
@@ -241,18 +281,129 @@ func (u *URLTestPool) ListenPacketContext(ctx context.Context, metadata *C.Metad
 	return nil, lastErr
 }
 
+// packetAttempt opens the packet flow of one member, reporting a member that
+// did not answer within attempt-timeout while the caller still waited.
+func (u *URLTestPool) packetAttempt(ctx context.Context, proxy C.Proxy, metadata *C.Metadata) (C.PacketConn, error) {
+	dialCtx, cancel := u.attemptContext(ctx)
+	pc, err := proxy.ListenPacketContext(dialCtx, metadata)
+	cut := ctx.Err() == nil && dialCtx.Err() != nil
+	cancel()
+	if err != nil {
+		if cut {
+			log.Debugln("ProxyGroup: %s: %s did not connect within %s", u.Name(), proxy.Name(), u.attemptTimeout)
+		}
+		return nil, err
+	}
+
+	pc.AppendToChains(u)
+	u.noteDialSucceeded(proxy)
+	return pc, nil
+}
+
+// poolDialCandidate is one attempt of a traffic flow: the member to try and how
+// the dial reacts to its failure.
+type poolDialCandidate struct {
+	proxy C.Proxy
+	// exhausted marks a dial of a pool with nothing measured alive: its failure
+	// is followed by the emergency test instead of the next pool member.
+	exhausted bool
+	// measured marks a member the emergency test found, not the blind
+	// last-known-good fallback.
+	measured bool
+	// udp marks a packet flow: its fallbacks stay on the members that carry UDP.
+	udp bool
+	// ok reports whether there is a member to try at all.
+	ok bool
+}
+
+// nextCandidate selects the member of the next attempt. A dial of an exhausted
+// pool starts the emergency test of the last pool before the blind last-good
+// dial and gives it a head start, so the connection leaves on a measured member
+// as soon as one answers instead of paying for a failed last-good dial first.
+func (u *URLTestPool) nextCandidate(ctx context.Context, tried map[string]struct{}, udp bool) poolDialCandidate {
+	var proxy C.Proxy
+	var exhausted bool
+	if udp {
+		proxy, exhausted = u.fastForPacket(true)
+	} else {
+		proxy, exhausted = u.fastForDial(true)
+	}
+	if _, ok := tried[proxy.Name()]; ok {
+		// every fresh member has already been tried
+		return poolDialCandidate{}
+	}
+
+	if exhausted {
+		if measured := u.awaitRecovery(ctx, u.recoveryWait); measured != nil {
+			if _, ok := tried[measured.Name()]; !ok && (!udp || measured.SupportUDP()) {
+				log.Debugln("ProxyGroup: %s: leaving on %s measured by the emergency test", u.Name(), measured.Name())
+				return poolDialCandidate{proxy: measured, exhausted: true, measured: true, udp: udp, ok: true}
+			}
+		}
+		log.Debugln("ProxyGroup: %s: nothing measured alive, dialing %s", u.Name(), proxy.Name())
+	}
+
+	return poolDialCandidate{proxy: proxy, exhausted: exhausted, udp: udp, ok: true}
+}
+
+// failedDialFallback returns the member of the last attempt of an exhausted
+// dial: the best member the emergency test reported, or the blind last-known-
+// good dial when the attempt was the test's member and the test found nothing
+// better. A packet flow keeps to the members that carry UDP.
+func (u *URLTestPool) failedDialFallback(ctx context.Context, tried map[string]struct{}, candidate poolDialCandidate) C.Proxy {
+	if !candidate.exhausted {
+		return nil
+	}
+
+	if best := u.recoverAfterFailure(ctx); best != nil && (!candidate.udp || best.SupportUDP()) {
+		if _, ok := tried[best.Name()]; !ok {
+			return best
+		}
+	}
+
+	if !candidate.measured {
+		return nil
+	}
+	proxies := u.GetProxies(true)
+	if candidate.udp {
+		proxies = udpProxies(proxies)
+	}
+	if last := u.lastGoodProxy(proxies); last != nil {
+		if _, ok := tried[last.Name()]; !ok {
+			log.Debugln("ProxyGroup: %s: %s found by the emergency test failed, dialing the last known good %s", u.Name(), candidate.proxy.Name(), last.Name())
+			return last
+		}
+	}
+	return nil
+}
+
 // SupportUDP implements C.ProxyAdapter
 func (u *URLTestPool) SupportUDP() bool {
 	if u.disableUDP {
 		return false
 	}
 
-	return u.fast(false).SupportUDP()
+	// The group carries UDP when any member does: the packet path picks its
+	// member among them (fastForPacket), so a mixed pool keeps its packet flows
+	// working instead of losing them whenever the fast member changes.
+	for _, proxy := range u.GetProxies(false) {
+		if proxy.SupportUDP() {
+			return true
+		}
+	}
+	return false
 }
 
 // IsL3Protocol implements C.ProxyAdapter
 func (u *URLTestPool) IsL3Protocol(metadata *C.Metadata) bool {
-	return u.fast(false).IsL3Protocol(metadata)
+	// The same "any member" rule as SupportUDP: an L3 member must not be handed
+	// a domain, which is what the dns module decides by this answer.
+	for _, proxy := range u.GetProxies(false) {
+		if proxy.IsL3Protocol(metadata) {
+			return true
+		}
+	}
+	return false
 }
 
 // Unwrap implements C.ProxyAdapter
@@ -326,11 +477,16 @@ func (u *URLTestPool) PoolCheck(ctx context.Context) (map[string]uint16, error) 
 		return u.URLTest(ctx, u.testUrl, u.expectedRanges)
 	}
 
-	results, tested := u.testProxies(members)
+	results, tested := u.testProxies(ctx, members)
 	// A member that failed leaves the pool now instead of holding a slot: the
-	// parent asked precisely whether the pool can still carry traffic.
+	// parent asked precisely whether the pool can still carry traffic. A probe
+	// the caller cut is not in the verdicts at all, so an interrupted check
+	// cannot empty the pool.
 	u.publishPartial(results, tested)
 	if len(results) == 0 {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, errNoAliveMember
 	}
 
@@ -360,8 +516,11 @@ func (u *URLTestPool) AliveMember() (alive, known bool) {
 		names[name] = struct{}{}
 	}
 	suspicious := make(map[string]struct{}, len(u.suspicious))
-	for name := range u.suspicious {
-		suspicious[name] = struct{}{}
+	now := time.Now()
+	for name, until := range u.suspicious {
+		if now.Before(until) {
+			suspicious[name] = struct{}{}
+		}
 	}
 	u.mu.RUnlock()
 
@@ -400,7 +559,17 @@ func (u *URLTestPool) MarshalJSON() ([]byte, error) {
 	u.mu.RLock()
 	pool := append([]string(nil), u.pool...)
 	selected := u.selected
+	lastGood := u.lastGood
+	recovering := u.measuring != nil
+	ts := time.Now()
+	suspicious := make([]string, 0, len(u.suspicious))
+	for name, until := range u.suspicious {
+		if ts.Before(until) {
+			suspicious = append(suspicious, name)
+		}
+	}
 	u.mu.RUnlock()
+	sort.Strings(suspicious)
 
 	// The type is the adapter's own name: hosts that know url-test-pool show it
 	// as such, and the built-in fields below still let the rest render the group
@@ -414,6 +583,9 @@ func (u *URLTestPool) MarshalJSON() ([]byte, error) {
 		"testUrl":        u.testUrl,
 		"expectedStatus": u.expectedStatus,
 		"fixed":          selected,
+		"lastGood":       lastGood,
+		"recovering":     recovering,
+		"suspicious":     suspicious,
 		"hidden":         u.Hidden(),
 		"icon":           u.Icon(),
 		"emptyFallback":  u.EmptyFallback().Name(),
@@ -429,6 +601,29 @@ func (u *URLTestPool) fast(touch bool) C.Proxy {
 // last-known-good fallback: the pool has no usable member, so the next failure
 // should trigger an emergency test of the last pool instead of another blind dial.
 func (u *URLTestPool) fastForDial(touch bool) (C.Proxy, bool) {
+	return u.fastForTraffic(touch, nil)
+}
+
+// fastForPacket is fastForDial restricted to the members that carry UDP, so a
+// packet flow of a mixed pool never lands on a member that drops it.
+func (u *URLTestPool) fastForPacket(touch bool) (C.Proxy, bool) {
+	return u.fastForTraffic(touch, udpProxies)
+}
+
+// udpProxies keeps the members that carry UDP. A list that filters down to
+// nothing is left to the caller: the dial then reports the failure instead of
+// silently leaving the group.
+func udpProxies(proxies []C.Proxy) []C.Proxy {
+	filtered := make([]C.Proxy, 0, len(proxies))
+	for _, proxy := range proxies {
+		if proxy.SupportUDP() {
+			filtered = append(filtered, proxy)
+		}
+	}
+	return filtered
+}
+
+func (u *URLTestPool) fastForTraffic(touch bool, usable func([]C.Proxy) []C.Proxy) (C.Proxy, bool) {
 	// with lazy enabled the checks are driven only by real traffic,
 	// but the very first observation always starts the initial full check
 	if touch || !u.lazy || !u.hasFullCheck.Load() {
@@ -436,6 +631,11 @@ func (u *URLTestPool) fastForDial(touch bool) (C.Proxy, bool) {
 	}
 
 	proxies := u.GetProxies(touch)
+	if usable != nil {
+		if filtered := usable(proxies); len(filtered) > 0 {
+			proxies = filtered
+		}
+	}
 	if len(proxies) == 0 {
 		return u.EmptyFallback(), false
 	}
@@ -540,8 +740,8 @@ func (u *URLTestPool) bestAliveLocked(candidates []C.Proxy, skipSuspicious bool)
 }
 
 func (u *URLTestPool) isSuspiciousLocked(name string) bool {
-	_, ok := u.suspicious[name]
-	return ok
+	until, ok := u.suspicious[name]
+	return ok && time.Now().Before(until)
 }
 
 func (u *URLTestPool) onProxyFailed(proxy C.Proxy, err error) {
@@ -562,16 +762,16 @@ func (u *URLTestPool) healthCheck() {
 func (u *URLTestPool) markSuspicious(name string) {
 	u.mu.Lock()
 	if u.suspicious == nil {
-		u.suspicious = make(map[string]struct{})
+		u.suspicious = make(map[string]time.Time)
 	}
-	u.suspicious[name] = struct{}{}
+	u.suspicious[name] = time.Now().Add(u.suspiciousTTL)
 	if u.fastNode != nil && u.fastNode.Name() == name {
 		u.fastNode = nil
 	}
 
 	exhausted := len(u.pool) > 0
 	for _, poolName := range u.pool {
-		if _, ok := u.suspicious[poolName]; !ok {
+		if !u.isSuspiciousLocked(poolName) {
 			exhausted = false
 			break
 		}
@@ -798,7 +998,10 @@ func (u *URLTestPool) quickCheck() {
 	}
 
 	log.Debugln("ProxyGroup: %s start quick health check for %d proxies", u.Name(), len(poolProxies))
-	results, tested := u.testProxies(poolProxies)
+	// Every result is published as it arrives, so a member that just failed
+	// leaves the pool now instead of holding its slot until the next full
+	// check, and a member that answered is usable before the slow ones end.
+	results, _ := u.testProxiesStreaming(context.Background(), poolProxies)
 	u.lastQuick.Store(time.Now())
 
 	if len(results) == 0 {
@@ -806,11 +1009,6 @@ func (u *URLTestPool) quickCheck() {
 		u.fullCheck()
 		return
 	}
-
-	// Republish so a member that just failed leaves the pool now instead of
-	// holding its slot until the next full check; the members that were not
-	// measured keep their place after the measured ones.
-	u.publishPartial(results, tested)
 
 	u.mu.Lock()
 	for name := range results {
@@ -878,62 +1076,200 @@ func (u *URLTestPool) noteDialSucceeded(proxy C.Proxy) {
 	u.scheduleCheck(true)
 }
 
-// recoverAfterFailure runs an emergency test of the last non-empty pool after
-// the last-good proxy failed. It is single-flight and throttled, so an ongoing
-// outage cannot turn every dial into a burst of probes.
+// recoverAfterFailure joins the emergency test of the last non-empty pool and
+// waits for its outcome: the first alive member as soon as its probe answers,
+// or the end of the test. A dial that has already failed the last-good fallback
+// has nothing better to do, and the wait leaves the retry reserve of the tunnel
+// untouched.
 func (u *URLTestPool) recoverAfterFailure(ctx context.Context) C.Proxy {
-	if last, ok := u.lastRecovery.LoadOk(); ok && time.Since(last) < urlTestPoolRecoveryTestInterval {
+	if !u.ensureRecovery(ctx) {
 		return nil
-	}
-	if !u.recovering.CompareAndSwap(false, true) {
-		return nil
-	}
-	defer u.recovering.Store(false)
-
-	timeout := urlTestPoolRecoveryTestTimeout
-	if deadline, ok := ctx.Deadline(); ok {
-		remaining := time.Until(deadline) - urlTestPoolRetryReserve
-		if remaining <= 0 {
-			return nil
-		}
-		if remaining < timeout {
-			timeout = remaining
-		}
 	}
 
 	u.mu.RLock()
+	measure := u.measuring
+	u.mu.RUnlock()
+	if measure == nil {
+		return u.bestMeasuredAlive()
+	}
+
+	timeout, bounded := recoveryWaitLeft(ctx)
+	if bounded && timeout <= 0 {
+		return u.bestMeasuredAlive()
+	}
+	var expire <-chan time.Time
+	if bounded {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		expire = timer.C
+	}
+
+	select {
+	case <-measure.alive:
+	case <-measure.done:
+	case <-expire:
+	case <-ctx.Done():
+	}
+	return u.bestMeasuredAlive()
+}
+
+// ensureRecovery starts the emergency test of the last non-empty pool when none
+// is running, and reports whether a test is running at all. It is single-flight
+// and throttled, so an ongoing outage cannot turn every dial into a burst of
+// probes; a dial that arrives while a test runs joins it.
+func (u *URLTestPool) ensureRecovery(ctx context.Context) bool {
+	u.mu.RLock()
+	running := u.measuring != nil
 	names := append([]string(nil), u.lastPool...)
 	u.mu.RUnlock()
+	if running {
+		return true
+	}
+
+	if !u.recoveryStartAllowed(ctx) {
+		return false
+	}
+	if last, ok := u.lastRecovery.LoadOk(); ok && time.Since(last) < urlTestPoolRecoveryTestInterval {
+		return false
+	}
+
 	if len(names) == 0 {
 		u.requestFullCheckOnExhaustion()
-		return nil
+		return false
 	}
 
 	proxies := u.GetProxies(true)
 	candidates, _ := proxiesByNames(proxies, names)
 	if len(candidates) == 0 {
 		u.requestFullCheckOnExhaustion()
-		return nil
+		return false
 	}
+
+	measure := newPoolMeasurement()
+	u.mu.Lock()
+	if u.measuring != nil {
+		u.mu.Unlock()
+		return true
+	}
+	u.measuring = measure
+	u.mu.Unlock()
 
 	u.lastRecovery.Store(time.Now())
-	results, _ := u.testProxiesWithTimeout(candidates, timeout)
-	if len(results) == 0 {
+	log.Debugln("ProxyGroup: %s: no member measured alive, testing %d members of the last pool", u.Name(), len(candidates))
+
+	// The test runs on its own context: a dial that leaves on its first result
+	// must not cancel the rest, the members still being probed are what the
+	// next connection needs.
+	go func() {
+		// The probe timeout is the recovery one, never what the starting dial
+		// has left: every later dial joins this test, and a short budget of one
+		// caller must not turn a slow member into a dead one.
+		results, tested := u.probeProxies(context.Background(), candidates, urlTestPoolRecoveryTestTimeout, true)
+		u.applyRecovery(results, tested, len(candidates))
+		u.finishMeasurement(measure)
+	}()
+	return true
+}
+
+// awaitRecovery starts or joins the emergency test and waits at most `wait` for
+// the first member it finds alive. A zero wait only accepts a member that is
+// already measured, which is how an exhausted dial decides between a measured
+// member and the last-good fallback.
+func (u *URLTestPool) awaitRecovery(ctx context.Context, wait time.Duration) C.Proxy {
+	if !u.ensureRecovery(ctx) {
 		return nil
 	}
-	u.applyResults(results)
 
 	u.mu.RLock()
-	best := ""
-	if len(u.pool) > 0 {
-		best = u.pool[0]
-	}
+	measure := u.measuring
 	u.mu.RUnlock()
-	if best == "" {
+	if measure == nil {
+		return u.bestMeasuredAlive()
+	}
+	if best := u.bestMeasuredAlive(); best != nil {
+		return best
+	}
+
+	if left, bounded := recoveryWaitLeft(ctx); bounded && left < wait {
+		wait = left
+	}
+	if wait <= 0 {
 		return nil
 	}
 
-	return proxyByName(proxies, best)
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-measure.alive:
+	case <-measure.done:
+	case <-timer.C:
+	case <-ctx.Done():
+	}
+	return u.bestMeasuredAlive()
+}
+
+// recoveryStartAllowed reports whether the caller still has enough budget left
+// to leave on the result of an emergency test. The test itself always probes
+// with the recovery timeout: it is shared with every dial that joins it, so it
+// must not inherit the leftover budget of the dial that started it.
+func (u *URLTestPool) recoveryStartAllowed(ctx context.Context) bool {
+	left, bounded := recoveryWaitLeft(ctx)
+	return !bounded || left > 0
+}
+
+// recoveryWaitLeft returns how long the caller can still wait for an emergency
+// test while keeping its retry reserve, and whether its deadline bounds that
+// wait at all.
+func recoveryWaitLeft(ctx context.Context) (time.Duration, bool) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return 0, false
+	}
+	return time.Until(deadline) - urlTestPoolRetryReserve, true
+}
+
+// bestMeasuredAlive returns the fastest member the pool can use right now, as
+// published by the emergency test. It is the member a dial of an exhausted pool
+// leaves on.
+func (u *URLTestPool) bestMeasuredAlive() C.Proxy {
+	proxies := u.GetProxies(false)
+
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+
+	candidates := u.poolProxiesLocked(proxies)
+	if len(candidates) == 0 {
+		candidates = proxies
+	}
+	return u.bestAliveLocked(candidates, true)
+}
+
+// finishMeasurement closes the emergency test of the pool: a dial still waiting
+// for its outcome wakes up and takes whatever the test found.
+func (u *URLTestPool) finishMeasurement(measure *poolMeasurement) {
+	u.mu.Lock()
+	if u.measuring == measure {
+		u.measuring = nil
+	}
+	u.mu.Unlock()
+	close(measure.done)
+}
+
+// applyRecovery publishes an emergency test without consuming the periodic
+// schedule: the pool is rebuilt from what is alive right now, but a full check
+// that is due stays due. Recording the test as a full check would postpone the
+// sweep of every candidate by the full interval, and that sweep is what leaves
+// the members of a network that is gone behind.
+func (u *URLTestPool) applyRecovery(results map[string]uint16, tested map[string]struct{}, candidates int) {
+	u.publishPool(results, tested, false)
+	u.lastQuick.Store(time.Now())
+	// Only a sweep that reached every candidate is a verdict about the pool: a
+	// test that walked all of them and found nothing may tell a parent it has
+	// nothing left, a partial one must not.
+	if len(results) > 0 || len(tested) >= candidates {
+		u.hasFullCheck.Store(true)
+	}
+	u.markWarm()
 }
 
 func (u *URLTestPool) fullCheck() {
@@ -945,7 +1281,7 @@ func (u *URLTestPool) fullCheck() {
 	log.Debugln("ProxyGroup: %s start full health check for %d proxies", u.Name(), len(proxies))
 	// Publish every measured member as it arrives, so a cold pool routes by a
 	// real delay from the first result instead of waiting for the whole list.
-	results, _ := u.testProxiesStreaming(proxies)
+	results, _ := u.testProxiesStreaming(context.Background(), proxies)
 	u.applyResults(results)
 }
 
@@ -1008,6 +1344,13 @@ func (u *URLTestPool) publishPool(results map[string]uint16, tested map[string]s
 	for name := range results {
 		delete(u.suspicious, name)
 	}
+	if measure := u.measuring; measure != nil && !measure.aliveHit && len(results) > 0 {
+		// A dial of the exhausted pool waits for a member it can leave on, and
+		// results holds only measured alive members: whichever check measured
+		// one, the pool now has it.
+		measure.aliveHit = true
+		close(measure.alive)
+	}
 	if final {
 		// a full result set rebuilds the pool from every candidate, so the
 		// underfilled streak starts over
@@ -1024,24 +1367,18 @@ func (u *URLTestPool) publishPool(results map[string]uint16, tested map[string]s
 // testProxies tests proxies concurrently and returns delay (ms) of alive proxies
 // together with every proxy that was actually measured, alive or not, so the
 // pool can tell a failed member from one the check did not reach.
-func (u *URLTestPool) testProxies(proxies []C.Proxy) (map[string]uint16, map[string]struct{}) {
-	return u.probeProxies(proxies, time.Duration(u.testTimeout)*time.Millisecond, false)
+func (u *URLTestPool) testProxies(ctx context.Context, proxies []C.Proxy) (map[string]uint16, map[string]struct{}) {
+	return u.probeProxies(ctx, proxies, time.Duration(u.testTimeout)*time.Millisecond, false)
 }
 
 // testProxiesStreaming is testProxies that publishes every measured member as
 // soon as its probe returns, so the pool is usable before the whole list has
 // been probed and a cold start routes by the first real result.
-func (u *URLTestPool) testProxiesStreaming(proxies []C.Proxy) (map[string]uint16, map[string]struct{}) {
-	return u.probeProxies(proxies, time.Duration(u.testTimeout)*time.Millisecond, true)
+func (u *URLTestPool) testProxiesStreaming(ctx context.Context, proxies []C.Proxy) (map[string]uint16, map[string]struct{}) {
+	return u.probeProxies(ctx, proxies, time.Duration(u.testTimeout)*time.Millisecond, true)
 }
 
-// testProxiesWithTimeout is testProxies with a custom timeout, used by the
-// emergency recovery check to stay inside the connection deadline.
-func (u *URLTestPool) testProxiesWithTimeout(proxies []C.Proxy, timeout time.Duration) (map[string]uint16, map[string]struct{}) {
-	return u.probeProxies(proxies, timeout, false)
-}
-
-func (u *URLTestPool) probeProxies(proxies []C.Proxy, timeout time.Duration, publish bool) (map[string]uint16, map[string]struct{}) {
+func (u *URLTestPool) probeProxies(ctx context.Context, proxies []C.Proxy, timeout time.Duration, publish bool) (map[string]uint16, map[string]struct{}) {
 	results := make(map[string]uint16, len(proxies))
 	tested := make(map[string]struct{}, len(proxies))
 	var mu sync.Mutex
@@ -1051,15 +1388,22 @@ func (u *URLTestPool) probeProxies(proxies []C.Proxy, timeout time.Duration, pub
 	for _, proxy := range proxies {
 		proxy := proxy
 		group.Go(func() error {
-			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			// a caller that gives up (a parent's probe budget, a cascade that
+			// moved on) ends its probes too instead of keeping them running
+			probeCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
 
-			delay, err := proxy.URLTest(ctx, u.testUrl, u.expectedRanges)
+			delay, err := proxy.URLTest(probeCtx, u.testUrl, u.expectedRanges)
 
 			mu.Lock()
 			defer mu.Unlock()
-			tested[proxy.Name()] = struct{}{}
 			if err != nil {
+				if ctx.Err() != nil {
+					// the caller gave up, so the probe was cut instead of
+					// failing: that is not a verdict about the member
+					return nil
+				}
+				tested[proxy.Name()] = struct{}{}
 				if publish {
 					// the failed member leaves the pool now instead of
 					// holding a slot until the check ends
@@ -1068,6 +1412,7 @@ func (u *URLTestPool) probeProxies(proxies []C.Proxy, timeout time.Duration, pub
 				return nil
 			}
 
+			tested[proxy.Name()] = struct{}{}
 			results[proxy.Name()] = delay
 			if publish {
 				// published under the results lock: a later publish always
@@ -1140,16 +1485,6 @@ func proxiesByNames(proxies []C.Proxy, names []string) ([]C.Proxy, bool) {
 		}
 	}
 	return resolved, len(resolved) == len(names)
-}
-
-// proxyByName returns the member with the given name, if it still exists.
-func proxyByName(proxies []C.Proxy, name string) C.Proxy {
-	for _, proxy := range proxies {
-		if proxy.Name() == name {
-			return proxy
-		}
-	}
-	return nil
 }
 
 func shouldTrackDialFailure(adapterType C.AdapterType, err error) bool {
@@ -1268,8 +1603,12 @@ func NewURLTestPool(option GroupCommonOption, poolOption URLTestPoolOption, empt
 		tolerance:       tolerance,
 		firstResultWait: firstResultWait,
 		attemptTimeout:  attemptTimeout,
+		recoveryWait:    urlTestPoolRecoveryWait,
 		lazy:            option.Lazy,
 		preWarmRecheck:  urlTestPoolPreWarmRecheck,
-		suspicious:      make(map[string]struct{}),
+		// a member that failed a dial is skipped until the next quick check
+		// could have re-measured it
+		suspiciousTTL: interval,
+		suspicious:    make(map[string]time.Time),
 	}, nil
 }

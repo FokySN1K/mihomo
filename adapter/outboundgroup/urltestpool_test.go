@@ -2,15 +2,18 @@ package outboundgroup
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/adapter/outbound"
 	"github.com/metacubex/mihomo/adapter/provider"
+	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
 	C "github.com/metacubex/mihomo/constant"
 	P "github.com/metacubex/mihomo/constant/provider"
@@ -296,6 +299,168 @@ func TestURLTestPoolRecoverySkipsWithoutTime(t *testing.T) {
 	require.Nil(t, pool.recoverAfterFailure(context.Background()), "the recovery test must be throttled")
 }
 
+// newExhaustedPoolForTest builds a pool with nothing usable left whose last
+// pool still holds the given members, the state a dial of an outage sees: the
+// names the pool lists no longer resolve, which pickFast treats as stale.
+func newExhaustedPoolForTest(t *testing.T, proxies ...C.Proxy) *URLTestPool {
+	t.Helper()
+
+	pool := newPoolForTest(t, URLTestPoolOption{}, proxies...)
+	pool.mu.Lock()
+	pool.pool = []string{"gone"}
+	pool.lastPool = cascadeProxyNames(proxies)
+	pool.mu.Unlock()
+	return pool
+}
+
+// A probe the caller cut says nothing about the member: PoolCheck must report
+// the cancellation instead of wiping the pool the parent dials through.
+func TestURLTestPoolPoolCheckRespectsCallerDeadline(t *testing.T) {
+	held := newPoolRelease()
+	t.Cleanup(held.close)
+
+	blocked := newPoolControlledProxy("blocked", nil, poolProbeHeld(held))
+	pool := newPoolForTest(t, URLTestPoolOption{}, blocked)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	results, err := pool.PoolCheck(ctx)
+	require.Error(t, err)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Nil(t, results)
+	require.Equal(t, []string{"blocked"}, poolNames(pool),
+		"a probe the caller cut must not be taken as a dead member")
+}
+
+// PoolCheck publishes what it measured even when the caller cuts the rest, and
+// keeps the members it did not reach instead of dropping them.
+func TestURLTestPoolPoolCheckPublishesWhatItMeasured(t *testing.T) {
+	held := newPoolRelease()
+	t.Cleanup(held.close)
+
+	fast := newPoolControlledProxy("fast", nil, poolProbeOk(10))
+	slow := newPoolControlledProxy("slow", nil, poolProbeHeld(held))
+	pool := newPoolForTest(t, URLTestPoolOption{}, fast, slow)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	results, err := pool.PoolCheck(ctx)
+	require.NoError(t, err)
+	require.Equal(t, map[string]uint16{"fast": 10}, results)
+	require.Equal(t, []string{"fast", "slow"}, poolNames(pool),
+		"the measured member goes first and the member the check did not reach stays in the pool")
+}
+
+// Every dial of one outage joins the same emergency test instead of starting a
+// probe of its own.
+func TestURLTestPoolRecoveryJoinsOneTest(t *testing.T) {
+	var probes atomic.Int32
+	measured := newPoolControlledProxy("measured", nil, func(context.Context) (uint16, error) {
+		probes.Add(1)
+		time.Sleep(200 * time.Millisecond)
+		return 10, nil
+	})
+
+	pool := newExhaustedPoolForTest(t, measured)
+
+	found := make(chan C.Proxy, 3)
+	start := make(chan struct{})
+	for i := 0; i < cap(found); i++ {
+		go func() {
+			<-start
+			found <- pool.recoverAfterFailure(context.Background())
+		}()
+	}
+	close(start)
+
+	for i := 0; i < cap(found); i++ {
+		require.NotNil(t, <-found, "every dial of the outage must get the measured member")
+	}
+	require.Equal(t, int32(1), probes.Load(),
+		"dials of one outage must join the running test instead of probing on their own")
+}
+
+// A second test within the cooldown must not start: an ongoing outage cannot
+// turn every connection into a burst of probes.
+func TestURLTestPoolRecoveryThrottled(t *testing.T) {
+	var probes atomic.Int32
+	measured := newPoolControlledProxy("measured", nil, func(context.Context) (uint16, error) {
+		probes.Add(1)
+		return 10, nil
+	})
+
+	pool := newExhaustedPoolForTest(t, measured)
+	require.NotNil(t, pool.recoverAfterFailure(context.Background()))
+
+	require.Eventually(t, func() bool {
+		pool.mu.RLock()
+		defer pool.mu.RUnlock()
+		return pool.measuring == nil
+	}, time.Second, time.Millisecond, "the test must end before the cooldown is checked")
+
+	require.Nil(t, pool.recoverAfterFailure(context.Background()),
+		"a second test within the cooldown must not start")
+	require.Equal(t, int32(1), probes.Load())
+}
+
+// A dial whose budget is already inside the retry reserve must not spend it
+// waiting for the emergency test.
+func TestURLTestPoolRecoveryKeepsTheRetryReserve(t *testing.T) {
+	held := newPoolRelease()
+	t.Cleanup(held.close)
+
+	measured := newPoolControlledProxy("measured", nil, poolProbeHeld(held))
+	pool := newExhaustedPoolForTest(t, measured)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	require.Nil(t, pool.recoverAfterFailure(ctx))
+	require.Less(t, time.Since(start), 200*time.Millisecond,
+		"a dial with no budget left for a retry must not wait for the emergency test")
+}
+
+// The dial of an exhausted pool leaves on the member the emergency test found
+// instead of paying for a blind last-good dial first.
+func TestURLTestPoolExhaustedDialLeavesOnMeasuredMember(t *testing.T) {
+	log := &dialLog{}
+	held := newPoolRelease()
+	t.Cleanup(held.close)
+
+	measured := newPoolControlledProxy("measured", func(context.Context, *C.Metadata) (C.Conn, error) {
+		log.record("measured")
+		return &cascadeFakeConn{}, nil
+	}, poolProbeOk(10))
+	blind := newPoolControlledProxy("blind", func(context.Context, *C.Metadata) (C.Conn, error) {
+		log.record("blind")
+		return &cascadeFakeConn{}, nil
+	}, poolProbeHeld(held))
+
+	pool := newExhaustedPoolForTest(t, measured, blind)
+
+	conn, err := pool.DialContext(context.Background(), &C.Metadata{})
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	require.Equal(t, []string{"measured"}, log.list(),
+		"an exhausted dial must leave on the member the emergency test measured")
+}
+
+// Only a sweep that reached every candidate is a verdict about the pool.
+func TestURLTestPoolRecoveryMarksOnlyFullSweeps(t *testing.T) {
+	pool := &URLTestPool{poolSize: 10, suspicious: map[string]time.Time{}}
+
+	pool.applyRecovery(nil, map[string]struct{}{"a": {}}, 2)
+	require.False(t, pool.hasFullCheck.Load(),
+		"a test that did not reach every candidate is not a verdict about the pool")
+
+	pool.applyRecovery(nil, map[string]struct{}{"a": {}, "b": {}}, 2)
+	require.True(t, pool.hasFullCheck.Load(),
+		"a test that reached every candidate and found nothing tells a parent the pool is empty")
+}
+
 func TestURLTestPoolTracksOnlyDialFailures(t *testing.T) {
 	errDial := errors.New("dial failed")
 
@@ -390,6 +555,95 @@ func newPoolSucceedingProxy(name string, log *dialLog) *cascadeFakeProxy {
 		return &cascadeFakeConn{}, nil
 	}, nil, 0)
 }
+
+// poolRelease unblocks the probes a test holds, so a measurement that a test
+// left running ends with the test instead of waiting for its own timeout.
+type poolRelease struct {
+	once sync.Once
+	ch   chan struct{}
+}
+
+func newPoolRelease() *poolRelease {
+	return &poolRelease{ch: make(chan struct{})}
+}
+
+func (r *poolRelease) close() {
+	r.once.Do(func() { close(r.ch) })
+}
+
+// poolProbeOk answers a health check with a fixed delay.
+func poolProbeOk(delay uint16) func(context.Context) (uint16, error) {
+	return func(context.Context) (uint16, error) { return delay, nil }
+}
+
+// poolProbeHeld blocks a health check the way a member that does not answer
+// behaves: it ends only when the test releases it or the probe is cut.
+func poolProbeHeld(held *poolRelease) func(context.Context) (uint16, error) {
+	return func(ctx context.Context) (uint16, error) {
+		select {
+		case <-held.ch:
+			return 0, errors.New("probe released")
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
+}
+
+// poolControlledProxy is a member whose health check, dial and packet flow a
+// test decides, so the dial path is exercised without touching the network.
+type poolControlledProxy struct {
+	*cascadeFakeProxy
+
+	mu       sync.Mutex
+	udp      bool
+	probe    func(context.Context) (uint16, error)
+	packetFn func() error
+}
+
+// newPoolControlledProxy builds a member that dials successfully unless the
+// test gives it a dial of its own.
+func newPoolControlledProxy(name string, dialFn func(context.Context, *C.Metadata) (C.Conn, error), probe func(context.Context) (uint16, error)) *poolControlledProxy {
+	if dialFn == nil {
+		dialFn = func(context.Context, *C.Metadata) (C.Conn, error) {
+			return &cascadeFakeConn{}, nil
+		}
+	}
+	return &poolControlledProxy{
+		cascadeFakeProxy: newCascadeFakeProxy(name, C.Shadowsocks, dialFn, nil, 0),
+		udp:              true,
+		probe:            probe,
+		packetFn:         func() error { return nil },
+	}
+}
+
+func (p *poolControlledProxy) URLTest(ctx context.Context, _ string, _ utils.IntRanges[uint16]) (uint16, error) {
+	return p.probe(ctx)
+}
+
+func (p *poolControlledProxy) SupportUDP() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.udp
+}
+
+func (p *poolControlledProxy) ListenPacketContext(context.Context, *C.Metadata) (C.PacketConn, error) {
+	if err := p.packetFn(); err != nil {
+		return nil, err
+	}
+	return &poolFakePacketConn{}, nil
+}
+
+// poolFakePacketConn satisfies C.PacketConn for a packet flow that is only
+// recorded, never written to.
+type poolFakePacketConn struct {
+	N.EnhancePacketConn
+}
+
+func (c *poolFakePacketConn) Chains() C.Chain                               { return nil }
+func (c *poolFakePacketConn) ProviderChains() C.Chain                       { return nil }
+func (c *poolFakePacketConn) AppendToChains(C.ProxyAdapter)                 {}
+func (c *poolFakePacketConn) RemoteDestination() string                     { return "" }
+func (c *poolFakePacketConn) ResolveUDP(context.Context, *C.Metadata) error { return nil }
 
 func TestURLTestPoolAttemptTimeoutTriesNextMember(t *testing.T) {
 	log := &dialLog{}
@@ -638,7 +892,7 @@ func TestURLTestPoolPublishKeepsFastNodeAndClearsMeasured(t *testing.T) {
 		poolSize:   10,
 		pool:       []string{"a"},
 		fastNode:   a,
-		suspicious: map[string]struct{}{"a": {}, "b": {}},
+		suspicious: map[string]time.Time{"a": time.Now().Add(time.Hour), "b": time.Now().Add(time.Hour)},
 	}
 
 	pool.publishPool(map[string]uint16{"a": 20}, nil, false)
@@ -869,4 +1123,169 @@ func TestURLTestPoolWarmUpSkipsLazy(t *testing.T) {
 
 	require.False(t, pool.preWarming.Load(), "a lazy pool must not start a warm-up")
 	require.False(t, pool.hasFullCheck.Load())
+}
+
+// The emergency test is shared with every dial that joins it, so its probes get
+// the recovery timeout and not the leftover budget of the dial that started it.
+func TestURLTestPoolRecoveryProbeKeepsItsTimeout(t *testing.T) {
+	held := newPoolRelease()
+	t.Cleanup(held.close)
+
+	measured := newPoolControlledProxy("measured", nil, func(context.Context) (uint16, error) {
+		time.Sleep(300 * time.Millisecond)
+		return 10, nil
+	})
+	blind := newPoolControlledProxy("blind", nil, poolProbeHeld(held))
+
+	pool := newExhaustedPoolForTest(t, measured, blind)
+	pool.mu.Lock()
+	pool.lastGood = "blind"
+	pool.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
+	defer cancel()
+
+	// the dial itself leaves on the blind fallback once the 200ms it has left
+	// are gone, only the shared test keeps probing
+	_, err := pool.DialContext(ctx, &C.Metadata{})
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		alive, _ := pool.AliveMember()
+		return alive
+	}, time.Second, 10*time.Millisecond,
+		"a 300ms probe must survive the 200ms the starting dial had left")
+	require.Equal(t, "measured", poolNames(pool)[0])
+}
+
+// A member the emergency test found still gets its dial, and when that dial
+// fails the connection keeps the blind last-good attempt instead of dying.
+func TestURLTestPoolMeasuredMemberFailureFallsBackToLastGood(t *testing.T) {
+	log := &dialLog{}
+	held := newPoolRelease()
+	t.Cleanup(held.close)
+
+	measured := newPoolControlledProxy("measured", func(context.Context, *C.Metadata) (C.Conn, error) {
+		log.record("measured")
+		return nil, errors.New("dial failed")
+	}, poolProbeOk(10))
+	blind := newPoolControlledProxy("blind", func(context.Context, *C.Metadata) (C.Conn, error) {
+		log.record("blind")
+		return &cascadeFakeConn{}, nil
+	}, poolProbeHeld(held))
+
+	pool := newExhaustedPoolForTest(t, measured, blind)
+	pool.mu.Lock()
+	pool.lastGood = "blind"
+	pool.mu.Unlock()
+
+	conn, err := pool.DialContext(context.Background(), &C.Metadata{})
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	require.Equal(t, []string{"measured", "blind"}, log.list(),
+		"a measured member that failed its dial must not cost the connection the last-good attempt")
+}
+
+// A packet flow of an exhausted pool gets the same last-good fallback as a TCP
+// dial when the member the emergency test found fails its flow.
+func TestURLTestPoolPacketFlowFallsBackToLastGood(t *testing.T) {
+	log := &dialLog{}
+	held := newPoolRelease()
+	t.Cleanup(held.close)
+
+	measured := newPoolControlledProxy("measured", nil, poolProbeOk(10))
+	measured.packetFn = func() error {
+		log.record("measured")
+		return errors.New("packet failed")
+	}
+	blind := newPoolControlledProxy("blind", nil, poolProbeHeld(held))
+	blind.packetFn = func() error {
+		log.record("blind")
+		return nil
+	}
+
+	pool := newExhaustedPoolForTest(t, measured, blind)
+	pool.mu.Lock()
+	pool.lastGood = "blind"
+	pool.mu.Unlock()
+
+	pc, err := pool.ListenPacketContext(context.Background(), &C.Metadata{})
+	require.NoError(t, err)
+	require.NotNil(t, pc)
+	require.Equal(t, []string{"measured", "blind"}, log.list(),
+		"a packet flow must get the same last-good fallback as a TCP dial")
+}
+
+// A mixed pool reports UDP while any member carries it and keeps its packet
+// flows on those members, so the group does not lose UDP when the fastest
+// member changes to one without it.
+func TestURLTestPoolPacketFlowSkipsMemberWithoutUDP(t *testing.T) {
+	log := &dialLog{}
+
+	fast := newPoolControlledProxy("fast", nil, poolProbeOk(10))
+	fast.udp = false
+	fast.packetFn = func() error {
+		log.record("fast")
+		return nil
+	}
+	slow := newPoolControlledProxy("slow", nil, poolProbeOk(200))
+	slow.packetFn = func() error {
+		log.record("slow")
+		return nil
+	}
+
+	pool := newPoolForTest(t, URLTestPoolOption{}, fast, slow)
+	_, _ = fast.URLTest(context.Background(), pool.testUrl, pool.expectedRanges)
+	_, _ = slow.URLTest(context.Background(), pool.testUrl, pool.expectedRanges)
+
+	require.True(t, pool.SupportUDP(), "the group carries UDP while any member does")
+
+	pc, err := pool.ListenPacketContext(context.Background(), &C.Metadata{})
+	require.NoError(t, err)
+	require.NotNil(t, pc)
+	require.Equal(t, []string{"slow"}, log.list(),
+		"a packet flow must land on a member that carries UDP, not on the fastest one")
+	require.Equal(t, "fast", pool.Now(), "a tcp dial still picks the fastest member")
+
+	slow.mu.Lock()
+	slow.udp = false
+	slow.mu.Unlock()
+	require.False(t, pool.SupportUDP(), "a pool without a UDP member must not report UDP")
+}
+
+// A member is not skipped forever after one failed dial: the mark of a
+// suspicion expires on its own.
+func TestURLTestPoolSuspicionExpires(t *testing.T) {
+	pool := newPoolForTest(t, URLTestPoolOption{}, newCascadeTestProxy("a"))
+	pool.suspiciousTTL = 20 * time.Millisecond
+	pool.markSuspicious("a")
+
+	pool.mu.RLock()
+	require.True(t, pool.isSuspiciousLocked("a"))
+	pool.mu.RUnlock()
+
+	require.Eventually(t, func() bool {
+		pool.mu.RLock()
+		defer pool.mu.RUnlock()
+		return !pool.isSuspiciousLocked("a")
+	}, time.Second, 5*time.Millisecond, "a suspicion must not outlive its ttl")
+}
+
+// The state a ui needs to explain a slow switch is part of the group's json.
+func TestURLTestPoolMarshalJSONState(t *testing.T) {
+	pool := newPoolForTest(t, URLTestPoolOption{}, newCascadeTestProxy("a"))
+
+	pool.mu.Lock()
+	pool.lastGood = "a"
+	pool.suspicious["a"] = time.Now().Add(time.Hour)
+	pool.mu.Unlock()
+
+	data, err := pool.MarshalJSON()
+	require.NoError(t, err)
+
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal(data, &decoded))
+	require.Equal(t, "a", decoded["lastGood"])
+	require.Equal(t, false, decoded["recovering"])
+	require.Equal(t, []any{"a"}, decoded["suspicious"])
 }
