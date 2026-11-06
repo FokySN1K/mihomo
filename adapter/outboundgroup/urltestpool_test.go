@@ -1289,3 +1289,116 @@ func TestURLTestPoolMarshalJSONState(t *testing.T) {
 	require.Equal(t, false, decoded["recovering"])
 	require.Equal(t, []any{"a"}, decoded["suspicious"])
 }
+
+// An explicit test of the pool's own target is the pool's own full check: it
+// sweeps every candidate and rebuilds the pool, so the pool a manual test
+// leaves cannot depend on which of the two ran last.
+func TestURLTestPoolManualTestRunsTheOwnCheck(t *testing.T) {
+	slow := newPoolControlledProxy("slow", nil, poolProbeOk(300))
+	fast := newPoolControlledProxy("fast", nil, poolProbeOk(10))
+
+	pool := newPoolForTest(t, URLTestPoolOption{}, slow, fast)
+	pool.mu.Lock()
+	pool.pool = []string{"slow"}
+	pool.mu.Unlock()
+
+	results, err := pool.URLTest(context.Background(), pool.testUrl, pool.expectedRanges)
+	require.NoError(t, err)
+	require.Equal(t, map[string]uint16{"fast": 10, "slow": 300}, results,
+		"a manual test must answer with every candidate the sweep measured")
+	require.Equal(t, []string{"fast", "slow"}, poolNames(pool),
+		"a manual test must rebuild the pool the way a scheduled full check does")
+}
+
+// A test that lands while a check is running joins it: the pool answers with
+// what that check measures instead of sweeping the same candidates again.
+func TestURLTestPoolManualTestJoinsRunningCheck(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	var probes atomic.Int32
+
+	member := newPoolControlledProxy("member", nil, func(ctx context.Context) (uint16, error) {
+		probes.Add(1)
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		select {
+		case <-release:
+			return 42, nil
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	})
+
+	pool := newPoolForTest(t, URLTestPoolOption{}, member)
+	pool.scheduleCheck(true)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("the scheduled check did not start its probe")
+	}
+
+	answered := make(chan map[string]uint16, 1)
+	go func() {
+		results, _ := pool.URLTest(context.Background(), pool.testUrl, pool.expectedRanges)
+		answered <- results
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	require.EqualValues(t, 1, probes.Load(), "a test that joins a running check must not probe again")
+	require.True(t, pool.testing.Load(), "the joined test must not end the check it joined")
+
+	close(release)
+	select {
+	case results := <-answered:
+		require.Equal(t, map[string]uint16{"member": 42}, results)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the joined test never answered")
+	}
+}
+
+// The caller's budget bounds only its answer: a test that gives up must not cut
+// the sweep nor rebuild the pool from the members it happened to measure.
+func TestURLTestPoolManualTestOutlivesCaller(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+
+	member := newPoolControlledProxy("member", nil, func(ctx context.Context) (uint16, error) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		select {
+		case <-release:
+			return 42, nil
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	})
+
+	pool := newPoolForTest(t, URLTestPoolOption{}, member)
+	pool.mu.Lock()
+	pool.pool = nil
+	pool.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	results, err := pool.URLTest(ctx, pool.testUrl, pool.expectedRanges)
+	require.NoError(t, err)
+	require.Empty(t, results, "a caller that gave up answers with what is measured, not with a verdict")
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("the sweep did not reach the member")
+	}
+	require.True(t, pool.testing.Load(), "the caller's context must not cut the sweep")
+	require.Empty(t, poolNames(pool), "a caller that gave up must not publish a pool of its own")
+
+	close(release)
+	require.Eventually(t, func() bool {
+		return pool.lastResultsCopy()["member"] == 42 && len(poolNames(pool)) == 1
+	}, 5*time.Second, 10*time.Millisecond, "the sweep must publish its result after the caller is gone")
+}

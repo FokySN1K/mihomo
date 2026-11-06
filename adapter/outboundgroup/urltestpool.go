@@ -142,6 +142,11 @@ type URLTestPool struct {
 	lastFull     atomic.TypedValue[time.Time]
 	lastRecovery atomic.TypedValue[time.Time]
 	hasFullCheck atomic.Bool
+	// checkDone is closed when the check that holds `testing` ends, so an
+	// explicit test joins a running check instead of sweeping the candidates a
+	// second time, and checkResults is what that check measured alive.
+	checkDone    chan struct{}
+	checkResults map[string]uint16
 }
 
 // poolMeasurement is one emergency test of the last non-empty pool. A dial of
@@ -447,34 +452,43 @@ func (u *URLTestPool) ForceSet(name string) {
 }
 
 // URLTest implements ProxyGroup
+//
+// A probe for the pool's own target is the pool's own full check: an explicit
+// test measures the members with the timeout, the concurrency and the rebuild
+// a scheduled check uses, so the pool it leaves cannot depend on which of the
+// two ran last. The caller's context bounds only the answer; the sweep keeps
+// going after it is gone, because the members still being probed are what the
+// next connections need.
 func (u *URLTestPool) URLTest(ctx context.Context, url string, expectedStatus utils.IntRanges[uint16]) (map[string]uint16, error) {
-	mp, err := u.GroupBase.URLTest(ctx, url, expectedStatus)
-	if err == nil && url == u.testUrl {
-		u.applyResults(mp)
+	if url != u.testUrl {
+		return u.GroupBase.URLTest(ctx, url, expectedStatus)
 	}
-	return mp, err
+
+	done, _ := u.beginCheck(true)
+	u.waitCheck(ctx, done)
+	return u.lastResultsCopy(), nil
 }
 
 // PoolCheck measures only the members the pool holds and reports their delays.
 // A parent group probes a candidate through its own check: asking the pool for
 // its own view keeps the parent from sweeping every candidate of the providers
-// and from rebuilding the pool from that partial result. An empty pool has
-// nothing to measure, so a full check fills it, which is also what the pool's
-// own schedule would do.
+// and from rebuilding the pool from that partial result. A pool that holds no
+// member to measure is swept on the parent's budget instead of waiting for the
+// pool's own check, which the parent may not outlive.
 func (u *URLTestPool) PoolCheck(ctx context.Context) (map[string]uint16, error) {
 	u.mu.RLock()
 	names := append([]string(nil), u.pool...)
 	u.mu.RUnlock()
 
 	if len(names) == 0 {
-		return u.URLTest(ctx, u.testUrl, u.expectedRanges)
+		return u.parentCheck(ctx)
 	}
 
 	proxies := u.GetProxies(true)
 	members, complete := proxiesByNames(proxies, names)
 	if !complete {
 		// the proxy list has been changed, rebuild the pool
-		return u.URLTest(ctx, u.testUrl, u.expectedRanges)
+		return u.parentCheck(ctx)
 	}
 
 	results, tested := u.testProxies(ctx, members)
@@ -496,6 +510,19 @@ func (u *URLTestPool) PoolCheck(ctx context.Context) (map[string]uint16, error) 
 	}
 	u.mu.Unlock()
 	u.lastQuick.Store(time.Now())
+	return results, nil
+}
+
+// parentCheck sweeps every candidate on the caller's budget and rebuilds the
+// pool from what it measured. It is the answer for a pool that holds no member
+// to measure: the parent asks whether the pool can carry traffic at all, and it
+// cannot outlive its own probe budget.
+func (u *URLTestPool) parentCheck(ctx context.Context) (map[string]uint16, error) {
+	results, err := u.GroupBase.URLTest(ctx, u.testUrl, u.expectedRanges)
+	if err != nil {
+		return results, err
+	}
+	u.applyResults(results)
 	return results, nil
 }
 
@@ -829,14 +856,40 @@ func (u *URLTestPool) shouldRequestFullCheckOnExhaustion(now time.Time) bool {
 }
 
 func (u *URLTestPool) scheduleCheck(full bool) {
+	u.beginCheck(full)
+}
+
+// beginCheck marks the pool as checking and returns the channel that is closed
+// when the check ends. started reports whether this call runs it; a check that
+// already holds the pool hands its own channel over, so an explicit test joins
+// it instead of probing the same candidates again.
+func (u *URLTestPool) beginCheck(full bool) (done <-chan struct{}, started bool) {
 	if !u.testing.CompareAndSwap(false, true) {
-		return
+		u.mu.RLock()
+		done = u.checkDone
+		u.mu.RUnlock()
+		return done, false
 	}
+
+	channel := make(chan struct{})
+	u.mu.Lock()
+	u.checkDone = channel
+	u.checkResults = nil
+	u.mu.Unlock()
+
 	if full {
 		u.beginWarmup()
 	}
 	go func() {
-		defer u.testing.Store(false)
+		defer func() {
+			u.testing.Store(false)
+			u.mu.Lock()
+			if u.checkDone == channel {
+				u.checkDone = nil
+			}
+			u.mu.Unlock()
+			close(channel)
+		}()
 		defer u.markWarm()
 		if full {
 			u.fullCheck()
@@ -844,6 +897,43 @@ func (u *URLTestPool) scheduleCheck(full bool) {
 			u.quickCheck()
 		}
 	}()
+	return channel, true
+}
+
+// waitCheck waits for the check to end or the caller to give up. A nil channel
+// means the running check has not registered itself yet: the caller takes what
+// is measured right now instead of waiting for a check it cannot see.
+func (u *URLTestPool) waitCheck(ctx context.Context, done <-chan struct{}) {
+	if done == nil {
+		return
+	}
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+}
+
+// storeResults keeps what a check measured, so an explicit test that joined it
+// answers with the numbers the check published.
+func (u *URLTestPool) storeResults(results map[string]uint16) {
+	u.mu.Lock()
+	u.checkResults = results
+	u.mu.Unlock()
+}
+
+// lastResultsCopy reports what the last check measured alive.
+func (u *URLTestPool) lastResultsCopy() map[string]uint16 {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	if len(u.checkResults) == 0 {
+		return nil
+	}
+
+	results := make(map[string]uint16, len(u.checkResults))
+	for name, delay := range u.checkResults {
+		results[name] = delay
+	}
+	return results
 }
 
 // beginWarmup opens the channel a cold-start dial waits on until the first
@@ -1002,6 +1092,7 @@ func (u *URLTestPool) quickCheck() {
 	// leaves the pool now instead of holding its slot until the next full
 	// check, and a member that answered is usable before the slow ones end.
 	results, _ := u.testProxiesStreaming(context.Background(), poolProxies)
+	u.storeResults(results)
 	u.lastQuick.Store(time.Now())
 
 	if len(results) == 0 {
@@ -1282,6 +1373,7 @@ func (u *URLTestPool) fullCheck() {
 	// Publish every measured member as it arrives, so a cold pool routes by a
 	// real delay from the first result instead of waiting for the whole list.
 	results, _ := u.testProxiesStreaming(context.Background(), proxies)
+	u.storeResults(results)
 	u.applyResults(results)
 }
 
