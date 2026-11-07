@@ -15,6 +15,7 @@ import (
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/ech"
+	"github.com/metacubex/mihomo/component/fragment"
 	tlsC "github.com/metacubex/mihomo/component/tls"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/gun"
@@ -75,6 +76,7 @@ type VlessOption struct {
 	RestlsOpts        RestlsOptions     `proxy:"restls-opts,omitempty"`
 	JLSOpts           JLSOptions        `proxy:"jls-opts,omitempty"`
 	RealityOpts       RealityOptions    `proxy:"reality-opts,omitempty"`
+	Fragment          *fragment.Config  `proxy:"fragment,omitempty"`
 	HTTPOpts          HTTPOptions       `proxy:"http-opts,omitempty"`
 	HTTP2Opts         HTTP2Options      `proxy:"h2-opts,omitempty"`
 	GrpcOpts          GrpcOptions       `proxy:"grpc-opts,omitempty"`
@@ -153,6 +155,9 @@ type XHTTPDownloadSettings struct {
 }
 
 func (v *Vless) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.Metadata) (_ net.Conn, err error) {
+	// The raw conn is wrapped here, before any network layer builds its TLS
+	// handshake on top of it, so `fragment` covers tcp, ws, http, h2 and xhttp.
+	c = fragment.NewConn(c, v.option.Fragment)
 	switch v.option.Network {
 	case "ws":
 		host, port, _ := net.SplitHostPort(v.addr)

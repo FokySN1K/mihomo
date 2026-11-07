@@ -164,6 +164,37 @@ func TestConvertsV2RayMieruMinimal(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+func TestConvertsV2RayVlessFinalMaskFragment(t *testing.T) {
+	vlessTest := "vless://a1b2c3d4-eacc-4433-981b-7e5f9a8b@142.98.76.54:443?encryption=none&security=reality&type=tcp&sni=142.98.76.54&fp=firefox&pbk=ppQ9FwLrLIa0AOrp1WvcyiaQ37vg2WSy_CD4bIdiTUw&sid=6ba85179f3a2b4c5&flow=xtls-rprx-vision&fm=%7B%22tcp%22%3A%5B%7B%22type%22%3A%22fragment%22%2C%22settings%22%3A%7B%22delay%22%3A%220%22%2C%22length%22%3A%2210-20%22%2C%22packets%22%3A%22tlshello%22%7D%7D%5D%7D#frag"
+
+	proxies, err := ConvertsV2Ray([]byte(vlessTest))
+
+	assert.Nil(t, err)
+	assert.Len(t, proxies, 1)
+	assert.Equal(t, map[string]any{
+		"enabled": true,
+		"packets": "tlshello",
+		"length":  "10-20",
+		"delay":   "0",
+	}, proxies[0]["fragment"])
+
+	_, err = adapter.ParseProxy(proxies[0])
+	assert.NoError(t, err)
+}
+
+func TestConvertsV2RayFinalMaskFragmentUnsupportedMode(t *testing.T) {
+	vlessTest := "vless://a1b2c3d4-eacc-4433-981b-7e5f9a8b@142.98.76.54:443?encryption=none&security=reality&type=tcp&sni=142.98.76.54&pbk=ppQ9FwLrLIa0AOrp1WvcyiaQ37vg2WSy_CD4bIdiTUw&sid=6ba85179f3a2b4c5&fm=%7B%22tcp%22%3A%5B%7B%22type%22%3A%22fragment%22%2C%22settings%22%3A%7B%22packets%22%3A%221-3%22%7D%7D%5D%7D#frag"
+
+	proxies, err := ConvertsV2Ray([]byte(vlessTest))
+
+	assert.Nil(t, err)
+	assert.Len(t, proxies, 1)
+	assert.NotContains(t, proxies[0], "fragment")
+
+	_, err = adapter.ParseProxy(proxies[0])
+	assert.NoError(t, err)
+}
+
 func TestConvertsV2RayMieruFragment(t *testing.T) {
 	mierusTest := "mierus://user:pass@example.com?port=443&protocol=TCP&profile=default#myproxy"
 

@@ -11,6 +11,7 @@ import (
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/ech"
+	"github.com/metacubex/mihomo/component/fragment"
 	tlsC "github.com/metacubex/mihomo/component/tls"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/gun"
@@ -62,6 +63,7 @@ type TrojanOption struct {
 	RestlsOpts        RestlsOptions    `proxy:"restls-opts,omitempty"`
 	JLSOpts           JLSOptions       `proxy:"jls-opts,omitempty"`
 	RealityOpts       RealityOptions   `proxy:"reality-opts,omitempty"`
+	Fragment          *fragment.Config `proxy:"fragment,omitempty"`
 	GrpcOpts          GrpcOptions      `proxy:"grpc-opts,omitempty"`
 	WSOpts            WSOptions        `proxy:"ws-opts,omitempty"`
 	SSOpts            TrojanSSOption   `proxy:"ss-opts,omitempty"`
@@ -76,6 +78,9 @@ type TrojanSSOption struct {
 }
 
 func (t *Trojan) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.Metadata) (_ net.Conn, err error) {
+	// The raw conn is wrapped here, before any network layer builds its TLS
+	// handshake on top of it, so `fragment` covers tcp, ws and grpc.
+	c = fragment.NewConn(c, t.option.Fragment)
 	switch t.option.Network {
 	case "ws":
 		host, port, _ := net.SplitHostPort(t.addr)

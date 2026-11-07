@@ -217,6 +217,12 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 				trojan["fingerprint"] = pcs
 			}
 
+			if rawFragment := query.Get("fm"); rawFragment != "" {
+				if fragmentOpts := parseFinalMaskFragment(rawFragment); fragmentOpts != nil {
+					trojan["fragment"] = fragmentOpts
+				}
+			}
+
 			proxies = append(proxies, trojan)
 
 		case "vless":

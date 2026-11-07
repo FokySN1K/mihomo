@@ -55,6 +55,11 @@ func handleVShareLink(names map[string]int, url *url.URL, scheme string, proxy m
 		}
 		proxy["reality-opts"] = realityOpts
 	}
+	if rawFragment := query.Get("fm"); rawFragment != "" {
+		if fragmentOpts := parseFinalMaskFragment(rawFragment); fragmentOpts != nil {
+			proxy["fragment"] = fragmentOpts
+		}
+	}
 
 	switch query.Get("packetEncoding") {
 	case "none":
@@ -165,6 +170,45 @@ func handleVShareLink(names map[string]int, url *url.URL, scheme string, proxy m
 		proxy["xhttp-opts"] = xhttpOpts
 	}
 
+	return nil
+}
+
+// parseFinalMaskFragment maps the xray FinalMask tcp fragment settings carried
+// by `fm` onto the proxy `fragment` option. Only the tlshello mode has a
+// counterpart here, any other mode answers nil and is dropped.
+func parseFinalMaskFragment(raw string) map[string]any {
+	var finalMask struct {
+		TCP []struct {
+			Type     string `json:"type"`
+			Settings struct {
+				Delay   string `json:"delay"`
+				Length  string `json:"length"`
+				Packets string `json:"packets"`
+			} `json:"settings"`
+		} `json:"tcp"`
+	}
+	if err := json.Unmarshal([]byte(raw), &finalMask); err != nil {
+		return nil
+	}
+	for _, entry := range finalMask.TCP {
+		if entry.Type != "fragment" {
+			continue
+		}
+		if packets := strings.ToLower(entry.Settings.Packets); packets != "" && packets != "tlshello" {
+			return nil
+		}
+		fragmentOpts := map[string]any{
+			"enabled": true,
+			"packets": "tlshello",
+		}
+		if entry.Settings.Length != "" {
+			fragmentOpts["length"] = entry.Settings.Length
+		}
+		if entry.Settings.Delay != "" {
+			fragmentOpts["delay"] = entry.Settings.Delay
+		}
+		return fragmentOpts
+	}
 	return nil
 }
 
