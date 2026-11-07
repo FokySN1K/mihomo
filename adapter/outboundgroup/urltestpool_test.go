@@ -668,6 +668,56 @@ func TestURLTestPoolAliveMember(t *testing.T) {
 	require.True(t, known)
 }
 
+// UsableMembers is what a parent reads: only the members that can carry traffic
+// right now count, so a pool whose last member failed answers that it has
+// nothing left.
+func TestURLTestPoolUsableMembers(t *testing.T) {
+	pool := newPoolForTest(t, URLTestPoolOption{}, newCascadeTestProxy("a"), newCascadeTestProxy("b"))
+	require.Equal(t, 2, pool.UsableMembers())
+
+	pool.markCut("a")
+	require.Equal(t, 1, pool.UsableMembers(), "a cut member leaves the count for the grace")
+
+	pool.markSuspicious("b")
+	require.Equal(t, 0, pool.UsableMembers(), "a member that failed a dial does not count")
+}
+
+// A dial the caller's budget cut is not a verdict on the member: it only earns
+// the grace, while a caller that canceled on its own earns nothing at all.
+func TestURLTestPoolCallerDeadlineMarksOnlyTheGrace(t *testing.T) {
+	hang := func(ctx context.Context, _ *C.Metadata) (C.Conn, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	pool := newPoolForTest(t, URLTestPoolOption{}, newCascadeFakeProxy("hanging", C.Shadowsocks, hang, nil, 0))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	_, err := pool.DialContext(ctx, &C.Metadata{})
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+
+	pool.mu.RLock()
+	until, cut := pool.cutMarks["hanging"]
+	_, reported := pool.suspicious["hanging"]
+	pool.mu.RUnlock()
+	require.True(t, cut, "a dial the caller cut leaves the member only for the grace")
+	require.False(t, reported, "a cut must not earn the whole interval a failed dial does")
+	require.LessOrEqual(t, time.Until(until), urlTestPoolCutGrace+time.Second)
+
+	canceled := newPoolForTest(t, URLTestPoolOption{}, newCascadeFakeProxy("other", C.Shadowsocks, hang, nil, 0))
+	canceledCtx, cancelDial := context.WithCancel(context.Background())
+	cancelDial()
+
+	_, err = canceled.DialContext(canceledCtx, &C.Metadata{})
+	require.Error(t, err)
+
+	canceled.mu.RLock()
+	defer canceled.mu.RUnlock()
+	require.Empty(t, canceled.suspicious, "a caller that canceled on its own says nothing about the member")
+	require.Empty(t, canceled.cutMarks)
+}
+
 func TestURLTestPoolProxiesByNames(t *testing.T) {
 	a := newPoolDeadProxy("a")
 	b := newPoolDeadProxy("b")

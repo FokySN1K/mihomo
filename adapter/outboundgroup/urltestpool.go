@@ -219,12 +219,7 @@ func (u *URLTestPool) DialContext(ctx context.Context, metadata *C.Metadata) (c 
 			break
 		}
 
-		if cut {
-			log.Debugln("ProxyGroup: %s: %s did not connect within %s", u.Name(), proxy.Name(), u.attemptTimeout)
-			u.onProxyCut(proxy, err)
-		} else {
-			u.onProxyFailed(proxy, err)
-		}
+		u.noteDialFailure(ctx, proxy, err, cut)
 
 		if candidate.exhausted {
 			if fallback := u.failedDialFallback(ctx, tried, candidate); fallback != nil {
@@ -232,7 +227,7 @@ func (u *URLTestPool) DialContext(ctx context.Context, metadata *C.Metadata) (c 
 				tried[proxy.Name()] = struct{}{}
 				c, err = proxy.DialContext(ctx, metadata)
 				if err != nil {
-					u.onProxyFailed(proxy, err)
+					u.noteDialFailure(ctx, proxy, err, false)
 				}
 			}
 			break
@@ -272,6 +267,25 @@ func (u *URLTestPool) attemptContext(ctx context.Context) (context.Context, cont
 	return context.WithTimeout(ctx, u.attemptTimeout)
 }
 
+// noteDialFailure records a member that did not carry the dial. The caller's
+// budget says nothing about the member: a client that went away is not a
+// verdict at all, and a budget that ended before the handshake is a cut. Only
+// a failure the member owns keeps it out for the whole interval.
+func (u *URLTestPool) noteDialFailure(ctx context.Context, proxy C.Proxy, err error, cut bool) {
+	switch {
+	case ctx.Err() != nil:
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			log.Debugln("ProxyGroup: %s: %s did not connect within the caller budget", u.Name(), proxy.Name())
+			u.onProxyCut(proxy, err)
+		}
+	case cut:
+		log.Debugln("ProxyGroup: %s: %s did not connect within %s", u.Name(), proxy.Name(), u.attemptTimeout)
+		u.onProxyCut(proxy, err)
+	default:
+		u.onProxyFailed(proxy, err)
+	}
+}
+
 // ListenPacketContext implements C.ProxyAdapter
 func (u *URLTestPool) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
 	u.maybeScheduleCheck()
@@ -293,11 +307,7 @@ func (u *URLTestPool) ListenPacketContext(ctx context.Context, metadata *C.Metad
 			return pc, nil
 		}
 		lastErr = err
-		if cut {
-			u.onProxyCut(proxy, err)
-		} else {
-			u.onProxyFailed(proxy, err)
-		}
+		u.noteDialFailure(ctx, proxy, err, cut)
 
 		if candidate.exhausted {
 			if fallback := u.failedDialFallback(ctx, tried, candidate); fallback != nil {
@@ -308,11 +318,7 @@ func (u *URLTestPool) ListenPacketContext(ctx context.Context, metadata *C.Metad
 					return pc, nil
 				}
 				lastErr = err
-				if cut {
-					u.onProxyCut(proxy, err)
-				} else {
-					u.onProxyFailed(proxy, err)
-				}
+				u.noteDialFailure(ctx, proxy, err, cut)
 			}
 			break
 		}
@@ -325,17 +331,14 @@ func (u *URLTestPool) ListenPacketContext(ctx context.Context, metadata *C.Metad
 	return nil, lastErr
 }
 
-// packetAttempt opens the packet flow of one member, reporting a member that
-// did not answer within attempt-timeout while the caller still waited.
+// packetAttempt opens the packet flow of one member, reporting whether our own
+// attempt-timeout cut it while the caller still waited.
 func (u *URLTestPool) packetAttempt(ctx context.Context, proxy C.Proxy, metadata *C.Metadata) (C.PacketConn, bool, error) {
 	dialCtx, cancel := u.attemptContext(ctx)
 	pc, err := proxy.ListenPacketContext(dialCtx, metadata)
 	cut := ctx.Err() == nil && dialCtx.Err() != nil
 	cancel()
 	if err != nil {
-		if cut {
-			log.Debugln("ProxyGroup: %s: %s did not connect within %s", u.Name(), proxy.Name(), u.attemptTimeout)
-		}
 		return nil, cut, err
 	}
 
@@ -586,44 +589,52 @@ func (u *URLTestPool) AliveMember() (alive, known bool) {
 	if !u.hasFullCheck.Load() {
 		return false, false
 	}
+	return u.UsableMembers() > 0, true
+}
 
+// UsableMembers counts the members that can carry traffic right now: measured
+// alive and not sitting out the grace a cut or a failed dial earned. A parent
+// reads it to tell a pool that still has something to switch to from one that
+// would only repeat the dial that just failed.
+func (u *URLTestPool) UsableMembers() int {
 	u.mu.RLock()
 	names := make(map[string]struct{}, len(u.pool))
 	for _, name := range u.pool {
 		names[name] = struct{}{}
 	}
-	suspicious := make(map[string]struct{}, len(u.suspicious)+len(u.cutMarks))
 	now := time.Now()
-	for name, until := range u.suspicious {
-		if now.Before(until) {
-			suspicious[name] = struct{}{}
-		}
-	}
 	// a member cut by our own attempt-timeout cannot carry traffic within the
 	// grace either, so a parent must not count it as a reason to stay
+	marks := make(map[string]struct{}, len(u.suspicious)+len(u.cutMarks))
+	for name, until := range u.suspicious {
+		if now.Before(until) {
+			marks[name] = struct{}{}
+		}
+	}
 	for name, until := range u.cutMarks {
 		if now.Before(until) {
-			suspicious[name] = struct{}{}
+			marks[name] = struct{}{}
 		}
 	}
 	u.mu.RUnlock()
 
 	if len(names) == 0 {
-		return false, true
+		return 0
 	}
 
+	usable := 0
 	for _, proxy := range u.GetProxies(false) {
 		if _, ok := names[proxy.Name()]; !ok {
 			continue
 		}
-		if _, ok := suspicious[proxy.Name()]; ok {
+		if _, marked := marks[proxy.Name()]; marked {
 			continue
 		}
 		if proxy.AliveForTestUrl(u.testUrl) {
-			return true, true
+			usable++
 		}
 	}
-	return false, true
+	return usable
 }
 
 // SelfTestTarget implements SelfTester: the URL and status the pool measures
