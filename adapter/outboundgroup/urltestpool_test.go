@@ -580,11 +580,51 @@ func TestURLTestPoolAttemptTimeoutCutKeepsTheMemberForTheGrace(t *testing.T) {
 	require.Equal(t, []string{"b"}, log.list())
 
 	pool.mu.RLock()
-	until, marked := pool.suspicious["hanging"]
+	until, marked := pool.cutMarks["hanging"]
+	_, reported := pool.suspicious["hanging"]
 	pool.mu.RUnlock()
 	require.True(t, marked, "a cut member leaves the next choices")
+	require.False(t, reported, "a cut is not a verdict a host reports as suspicious")
 	require.LessOrEqual(t, time.Until(until), urlTestPoolCutGrace+time.Second,
 		"a cut member must come back after the grace, not sit out the whole interval")
+}
+
+// A cut says nothing about the node, so it must not shorten the interval a
+// failed dial earned: the member keeps sitting out the whole suspicion.
+func TestURLTestPoolCutDoesNotShortenAFailureMark(t *testing.T) {
+	pool := newPoolForTest(t, URLTestPoolOption{}, newCascadeTestProxy("a"))
+
+	pool.markSuspicious("a")
+	pool.mu.RLock()
+	failedUntil := pool.suspicious["a"]
+	pool.mu.RUnlock()
+
+	pool.markCut("a")
+
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+	require.Equal(t, failedUntil, pool.suspicious["a"], "a cut must not touch the failure mark")
+	require.True(t, pool.isSuspiciousLocked("a"))
+	require.WithinDuration(t, failedUntil, time.Now().Add(pool.suspiciousTTL), time.Second,
+		"the failure mark keeps its whole interval")
+}
+
+// A member that answers a check is back at once, whether the mark that kept it
+// out was a failure or a cut.
+func TestURLTestPoolMeasuredMemberDropsItsCutMark(t *testing.T) {
+	pool := newPoolForTest(t, URLTestPoolOption{}, newPoolControlledProxy("a", nil, poolProbeOk(10)))
+	pool.markCut("a")
+
+	pool.mu.Lock()
+	measured := pool.isSuspiciousLocked("a")
+	pool.mu.Unlock()
+	require.True(t, measured, "the cut keeps the member out first")
+
+	pool.quickCheck()
+
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+	require.False(t, pool.isSuspiciousLocked("a"), "a member a check measured alive is back at once")
 }
 
 func TestURLTestPoolTracksOnlyDialFailures(t *testing.T) {
@@ -1412,6 +1452,7 @@ func TestURLTestPoolMarshalJSONState(t *testing.T) {
 	pool.mu.Lock()
 	pool.lastGood = "a"
 	pool.suspicious["a"] = time.Now().Add(time.Hour)
+	pool.cutMarks["b"] = time.Now().Add(time.Hour)
 	pool.mu.Unlock()
 
 	data, err := pool.MarshalJSON()
@@ -1421,7 +1462,8 @@ func TestURLTestPoolMarshalJSONState(t *testing.T) {
 	require.NoError(t, json.Unmarshal(data, &decoded))
 	require.Equal(t, "a", decoded["lastGood"])
 	require.Equal(t, false, decoded["recovering"])
-	require.Equal(t, []any{"a"}, decoded["suspicious"])
+	require.Equal(t, []any{"a"}, decoded["suspicious"],
+		"a member only cut by our own timeout is not reported as suspicious")
 }
 
 // An explicit test of the pool's own target is the pool's own full check: it

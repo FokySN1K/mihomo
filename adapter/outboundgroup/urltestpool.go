@@ -135,7 +135,12 @@ type URLTestPool struct {
 	// it must not keep it out of the pool either.
 	suspicious    map[string]time.Time
 	suspiciousTTL time.Duration
-	fastNode      C.Proxy
+	// cutMarks holds the members our own attempt-timeout cut, with the time the
+	// grace expires. A cut is not a verdict on the node, so it is kept apart
+	// from suspicious: it only stays out of the next choices, and a failure mark
+	// that is already there is never shortened by it.
+	cutMarks map[string]time.Time
+	fastNode C.Proxy
 	// measuring is the emergency test of lastPool that runs while the pool has
 	// nothing measured alive. Every dial of the exhausted pool joins it instead
 	// of probing on its own; it is cleared as the test ends.
@@ -551,6 +556,7 @@ func (u *URLTestPool) PoolCheck(ctx context.Context) (map[string]uint16, error) 
 	u.mu.Lock()
 	for name := range results {
 		delete(u.suspicious, name)
+		delete(u.cutMarks, name)
 	}
 	u.mu.Unlock()
 	u.lastQuick.Store(time.Now())
@@ -586,9 +592,16 @@ func (u *URLTestPool) AliveMember() (alive, known bool) {
 	for _, name := range u.pool {
 		names[name] = struct{}{}
 	}
-	suspicious := make(map[string]struct{}, len(u.suspicious))
+	suspicious := make(map[string]struct{}, len(u.suspicious)+len(u.cutMarks))
 	now := time.Now()
 	for name, until := range u.suspicious {
+		if now.Before(until) {
+			suspicious[name] = struct{}{}
+		}
+	}
+	// a member cut by our own attempt-timeout cannot carry traffic within the
+	// grace either, so a parent must not count it as a reason to stay
+	for name, until := range u.cutMarks {
 		if now.Before(until) {
 			suspicious[name] = struct{}{}
 		}
@@ -811,8 +824,12 @@ func (u *URLTestPool) bestAliveLocked(candidates []C.Proxy, skipSuspicious bool)
 }
 
 func (u *URLTestPool) isSuspiciousLocked(name string) bool {
-	until, ok := u.suspicious[name]
-	return ok && time.Now().Before(until)
+	now := time.Now()
+	if until, ok := u.suspicious[name]; ok && now.Before(until) {
+		return true
+	}
+	until, ok := u.cutMarks[name]
+	return ok && now.Before(until)
 }
 
 func (u *URLTestPool) onProxyFailed(proxy C.Proxy, err error) {
@@ -828,7 +845,7 @@ func (u *URLTestPool) onProxyFailed(proxy C.Proxy, err error) {
 // once instead of sitting out the whole interval.
 func (u *URLTestPool) onProxyCut(proxy C.Proxy, err error) {
 	if shouldTrackDialFailure(proxy.Type(), err) {
-		u.markSuspiciousFor(proxy.Name(), urlTestPoolCutGrace)
+		u.markCut(proxy.Name())
 	}
 	u.onDialFailed(proxy.Type(), err, u.healthCheck)
 }
@@ -845,15 +862,31 @@ func (u *URLTestPool) markSuspicious(name string) {
 	u.markSuspiciousFor(name, u.suspiciousTTL)
 }
 
-// markSuspiciousFor keeps a member out of the next choices for the given time.
-// A failure of a check or of a dial earns the full interval, a cut by our own
-// attempt-timeout only the grace.
+// markSuspiciousFor keeps a member that failed a dial out of the next choices
+// for the full interval.
 func (u *URLTestPool) markSuspiciousFor(name string, ttl time.Duration) {
+	u.markFor(&u.suspicious, name, ttl)
+}
+
+// markCut keeps a member our own attempt-timeout cut out of the next choices
+// for the grace. A cut says nothing about the node, so it never touches the
+// failure marks a host reports as suspicious.
+func (u *URLTestPool) markCut(name string) {
+	u.markFor(&u.cutMarks, name, urlTestPoolCutGrace)
+}
+
+// markFor keeps a member out of the next choices until the given ttl ends. A
+// later expiry always wins: a cut must not shorten the interval a failed dial
+// earned, and neither may a repeated mark shorten itself.
+func (u *URLTestPool) markFor(marks *map[string]time.Time, name string, ttl time.Duration) {
 	u.mu.Lock()
-	if u.suspicious == nil {
-		u.suspicious = make(map[string]time.Time)
+	if *marks == nil {
+		*marks = make(map[string]time.Time)
 	}
-	u.suspicious[name] = time.Now().Add(ttl)
+	next := time.Now().Add(ttl)
+	if until, ok := (*marks)[name]; !ok || until.Before(next) {
+		(*marks)[name] = next
+	}
 	if u.fastNode != nil && u.fastNode.Name() == name {
 		u.fastNode = nil
 	}
@@ -1166,6 +1199,7 @@ func (u *URLTestPool) quickCheck() {
 	u.mu.Lock()
 	for name := range results {
 		delete(u.suspicious, name)
+		delete(u.cutMarks, name)
 	}
 	u.mu.Unlock()
 
@@ -1584,6 +1618,7 @@ func (u *URLTestPool) publishPool(results map[string]uint16, tested map[string]s
 	}
 	for name := range results {
 		delete(u.suspicious, name)
+		delete(u.cutMarks, name)
 	}
 	if measure := u.measuring; measure != nil && !measure.aliveHit && len(results) > 0 {
 		// A dial of the exhausted pool waits for a member it can leave on, and
@@ -1857,5 +1892,6 @@ func NewURLTestPool(option GroupCommonOption, poolOption URLTestPoolOption, empt
 		// could have re-measured it
 		suspiciousTTL: interval,
 		suspicious:    make(map[string]time.Time),
+		cutMarks:      make(map[string]time.Time),
 	}, nil
 }
