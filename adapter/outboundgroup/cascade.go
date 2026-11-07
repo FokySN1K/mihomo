@@ -54,6 +54,17 @@ const (
 	// one connection. It is small on purpose: the tunnel retries the whole dial
 	// as well, and that retry enters the group again with the same priority.
 	cascadeGraceRetries = 2
+	// cascadeCandidateReserve is the least budget kept for every candidate that
+	// still follows the current one, so a single hanging dial cannot spend the
+	// whole caller budget and leave the rest of the order untried. It only
+	// applies to a candidate that cannot switch between its own members: such a
+	// candidate has nothing to fall back to, so its dial is a plain dial.
+	cascadeCandidateReserve = 1500 * time.Millisecond
+	// cascadeMaxFailedCooldown caps the backoff of a candidate that keeps
+	// failing dials: a node that answers a probe but cannot carry traffic must
+	// stop returning every failed-cooldown and costing a broken connection per
+	// cycle.
+	cascadeMaxFailedCooldown = 5 * time.Minute
 )
 
 // errNoAliveMember reports a group candidate whose own check found nothing.
@@ -72,13 +83,13 @@ type poolChecker interface {
 	PoolCheck(ctx context.Context) (map[string]uint16, error)
 }
 
-// aliveMemberSource is a candidate that owns the failover between its own
-// members and can say whether anything is left to switch to.
-type aliveMemberSource interface {
-	// AliveMember reports whether the candidate can still carry traffic, and
-	// whether that is known at all: a candidate that has not measured itself
-	// yet must not be cut on its first failure.
-	AliveMember() (alive, known bool)
+// usableMemberSource is a candidate that owns the failover between its own
+// members and can say how many of them are left to switch to.
+type usableMemberSource interface {
+	// UsableMembers is how many members the candidate can still switch to. A
+	// candidate with a single one has no failover of its own, so keeping its
+	// place after a failed dial would only repeat the same dial.
+	UsableMembers() int
 }
 
 // The dial order is rebuilt from these ranks: the pinned/active head first,
@@ -134,6 +145,10 @@ type cascadeState struct {
 	// node that is always too slow escalates to the full cooldown.
 	timeoutAt    time.Time
 	timeoutCount int
+	// dialFaults counts consecutive failed dials, so a candidate that keeps
+	// answering probes but cannot carry traffic backs off instead of returning
+	// to the rotation every failed-cooldown. A successful dial resets it.
+	dialFaults int
 	// recheckedAt and rechecking throttle and single-flight the background probe
 	// that decides whether a cut candidate is alive.
 	recheckedAt time.Time
@@ -193,7 +208,7 @@ func (c *Cascade) DialContext(ctx context.Context, metadata *C.Metadata) (conn C
 		lastProxy = proxy
 		retries := c.graceRetries(proxy)
 		for {
-			dialCtx, cancel := c.attemptContext(ctx, proxy)
+			dialCtx, cancel := c.attemptContext(ctx, proxy, attempts-i)
 			conn, err = proxy.DialContext(dialCtx, metadata)
 			// our own attempt-timeout fired, the caller still has time left
 			cut := ctx.Err() == nil && dialCtx.Err() != nil
@@ -214,6 +229,11 @@ func (c *Cascade) DialContext(ctx context.Context, metadata *C.Metadata) (conn C
 			}
 
 			lastErr = err
+			// The caller gave up: the dial was cut by its budget, so it says
+			// nothing about the candidate and nothing must be demoted.
+			if ctx.Err() != nil {
+				break
+			}
 			if cut {
 				c.onAttemptTimedOut(proxy)
 				break
@@ -224,7 +244,7 @@ func (c *Cascade) DialContext(ctx context.Context, metadata *C.Metadata) (conn C
 			// The candidate owns its failover and still has a working member:
 			// it has already moved to another one, so the connection stays on
 			// the priority path instead of switching to the next group.
-			if retries <= 0 || ctx.Err() != nil {
+			if retries <= 0 {
 				break
 			}
 			retries--
@@ -236,18 +256,62 @@ func (c *Cascade) DialContext(ctx context.Context, metadata *C.Metadata) (conn C
 		}
 	}
 
-	c.onDialFailed(lastProxy.Type(), lastErr, c.healthCheck)
+	if ctx.Err() == nil && lastErr != nil {
+		c.onDialFailed(lastProxy.Type(), lastErr, c.healthCheck)
+	}
 	return nil, lastErr
 }
 
-// attemptContext bounds one candidate dial when attempt-timeout is set. A
-// candidate that runs its own attempts (a nested pool or cascade) is not cut:
-// its own budget already covers the retries it wants to make.
-func (c *Cascade) attemptContext(ctx context.Context, proxy C.Proxy) (context.Context, context.CancelFunc) {
-	if c.attemptTimeout <= 0 || runsOwnAttempts(proxy) {
+// attemptContext bounds one candidate dial. A candidate that switches between
+// its own members (a pool or a nested cascade with more than one usable member)
+// is left alone: its own budget already covers the retries it wants to make.
+// Every other candidate is a plain dial that may take only its share of the
+// caller's budget, so one hanging dial cannot spend the whole of it and leave
+// the rest of the order untried.
+func (c *Cascade) attemptContext(ctx context.Context, proxy C.Proxy, left int) (context.Context, context.CancelFunc) {
+	budget := c.candidateBudget(ctx, proxy, left)
+	if budget <= 0 {
 		return ctx, func() {}
 	}
-	return context.WithTimeout(ctx, c.attemptTimeout)
+	return context.WithTimeout(ctx, budget)
+}
+
+// candidateBudget is how long one candidate dial may take. A candidate with
+// more than one usable member switches between them by itself, so its own
+// attempt-timeout stays in charge and the group does not bound it at all. Every
+// other candidate is a plain dial that must leave the candidates after it a
+// reserve of their own inside the caller's budget.
+func (c *Cascade) candidateBudget(ctx context.Context, proxy C.Proxy, left int) time.Duration {
+	if verdict, ok := usableMemberOf(proxy); ok && verdict.UsableMembers() > 1 {
+		return 0
+	}
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return c.attemptTimeout
+	}
+	if left < 1 {
+		left = 1
+	}
+	if left == 1 && c.attemptTimeout <= 0 {
+		// the last candidate may spend whatever the caller has left
+		return 0
+	}
+
+	remaining := time.Until(deadline)
+	share := remaining - time.Duration(left-1)*cascadeCandidateReserve
+	if share <= 0 {
+		// the caller's budget is shorter than the reserve of the rest: split
+		// what is left instead of letting this candidate take all of it
+		share = remaining / time.Duration(left)
+	}
+	if share <= 0 {
+		return c.attemptTimeout
+	}
+	if c.attemptTimeout > 0 && share > c.attemptTimeout {
+		return c.attemptTimeout
+	}
+	return share
 }
 
 // runsOwnAttempts reports whether the candidate retries its members itself:
@@ -267,9 +331,9 @@ func runsOwnAttempts(proxy C.Proxy) bool {
 	return false
 }
 
-// aliveMemberOf returns the verdict of a candidate that owns its failover,
+// usableMemberOf returns the verdict of a candidate that owns its failover,
 // following selectors the same way runsOwnAttempts does.
-func aliveMemberOf(proxy C.Proxy) (aliveMemberSource, bool) {
+func usableMemberOf(proxy C.Proxy) (usableMemberSource, bool) {
 	for depth := 0; depth <= cascadeNestedDepthLimit; depth++ {
 		switch adapter := proxy.Adapter().(type) {
 		case *URLTestPool:
@@ -305,7 +369,7 @@ func (c *Cascade) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
 		lastProxy = proxy
 		retries := c.graceRetries(proxy)
 		for {
-			dialCtx, cancel := c.attemptContext(ctx, proxy)
+			dialCtx, cancel := c.attemptContext(ctx, proxy, attempts-i)
 			pc, err = proxy.ListenPacketContext(dialCtx, metadata)
 			// our own attempt-timeout fired, the caller still has time left
 			cut := ctx.Err() == nil && dialCtx.Err() != nil
@@ -317,6 +381,11 @@ func (c *Cascade) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
 			}
 
 			lastErr = err
+			// the caller gave up: the attempt was cut by its budget, so it says
+			// nothing about the candidate
+			if ctx.Err() != nil {
+				break
+			}
 			if cut {
 				c.onAttemptTimedOut(proxy)
 				break
@@ -324,7 +393,7 @@ func (c *Cascade) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
 			if !c.onAttemptFailed(proxy, err) {
 				break
 			}
-			if retries <= 0 || ctx.Err() != nil {
+			if retries <= 0 {
 				break
 			}
 			retries--
@@ -334,7 +403,9 @@ func (c *Cascade) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
 		}
 	}
 
-	c.onDialFailed(lastProxy.Type(), lastErr, c.healthCheck)
+	if ctx.Err() == nil && lastErr != nil {
+		c.onDialFailed(lastProxy.Type(), lastErr, c.healthCheck)
+	}
 	return nil, lastErr
 }
 
@@ -481,6 +552,33 @@ func (c *Cascade) AliveMember() (alive, known bool) {
 		}
 	}
 	return false, true
+}
+
+// UsableMembers counts the candidates a parent could switch to right now: the
+// ones that are not inside their failed cooldown. A cascade with a single one
+// has no failover of its own, so its parent must not keep its place after a
+// failed dial.
+func (c *Cascade) UsableMembers() int {
+	proxies := c.GetProxies(false)
+	now := time.Now()
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	usable := 0
+	seen := make(map[string]struct{}, len(proxies))
+	for _, proxy := range proxies {
+		name := proxy.Name()
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		if state, ok := c.states[name]; ok && state.failedUntil.After(now) {
+			continue
+		}
+		usable++
+	}
+	return usable
 }
 
 // candidateOrder returns the dialing priority: the pinned candidate, the last
@@ -857,6 +955,7 @@ func (c *Cascade) onAttemptSucceeded(name string) {
 	state.alive = true
 	state.failedUntil = time.Time{}
 	state.softUntil = time.Time{}
+	state.dialFaults = 0
 	state.checkedAt = time.Now()
 	c.active = name
 	c.lastActive = name
@@ -875,23 +974,23 @@ func (c *Cascade) onAttemptFailed(proxy C.Proxy, err error) bool {
 	if c.softFailure(proxy) {
 		return true
 	}
-	c.markUnavailableFor(proxy.Name(), c.failedCooldown)
+	c.markDialUnavailable(proxy.Name())
 	return false
 }
 
 // softFailure reports whether a failed dial must not demote the candidate. The
 // first failure opens the switch-grace window; the failures inside it keep the
 // candidate, and the first one after it demotes it so the group finally moves
-// on. A candidate that reports no working member is cut at once: there is
-// nothing left to switch to, which is the "no nodes available" case.
+// on. A candidate with nothing left to switch to is cut at once: the window
+// would only repeat the dial that just failed.
 func (c *Cascade) softFailure(proxy C.Proxy) bool {
 	if c.switchGrace <= 0 || !runsOwnAttempts(proxy) {
 		return false
 	}
 
-	if verdict, ok := aliveMemberOf(proxy); ok {
-		if alive, known := verdict.AliveMember(); known && !alive {
-			log.Debugln("ProxyGroup: %s candidate %s ran out of alive members", c.Name(), proxy.Name())
+	if verdict, ok := usableMemberOf(proxy); ok {
+		if verdict.UsableMembers() <= 1 {
+			log.Debugln("ProxyGroup: %s candidate %s has no other member to switch to", c.Name(), proxy.Name())
 			return false
 		}
 	}
@@ -916,9 +1015,14 @@ func (c *Cascade) softFailure(proxy C.Proxy) bool {
 
 // graceRetries is how many extra dials a candidate that owns its failover gets
 // inside one connection: every failed dial through it replaces the member that
-// failed, so an immediate retry stays on the priority path.
+// failed, so an immediate retry stays on the priority path. A candidate with a
+// single member has nothing to replace, so the retry would only repeat the same
+// dial and the group moves on instead.
 func (c *Cascade) graceRetries(proxy C.Proxy) int {
 	if c.switchGrace <= 0 || !runsOwnAttempts(proxy) {
+		return 0
+	}
+	if verdict, ok := usableMemberOf(proxy); ok && verdict.UsableMembers() <= 1 {
 		return 0
 	}
 	return cascadeGraceRetries
@@ -1006,6 +1110,28 @@ func (c *Cascade) markUnavailable(name string) {
 	c.markUnavailableFor(name, c.failedCooldown)
 }
 
+// markDialUnavailable demotes a candidate a dial failed through. Consecutive
+// failures double the cooldown up to cascadeMaxFailedCooldown: a candidate that
+// answers a probe but cannot carry traffic must stop returning every
+// failed-cooldown and costing a broken connection per cycle. A successful dial
+// resets the count.
+func (c *Cascade) markDialUnavailable(name string) {
+	cooldown := c.failedCooldown
+
+	c.mu.Lock()
+	state := c.ensureStateLocked(name)
+	state.dialFaults++
+	for faults := state.dialFaults; faults > 1 && cooldown > 0 && cooldown < cascadeMaxFailedCooldown; faults-- {
+		cooldown *= 2
+	}
+	c.mu.Unlock()
+
+	if cooldown > cascadeMaxFailedCooldown {
+		cooldown = cascadeMaxFailedCooldown
+	}
+	c.markUnavailableFor(name, cooldown)
+}
+
 func (c *Cascade) markUnavailableFor(name string, cooldown time.Duration) {
 	c.mu.Lock()
 	state := c.ensureStateLocked(name)
@@ -1029,7 +1155,12 @@ func (c *Cascade) markAlive(name string, delay uint16) {
 	state := c.ensureStateLocked(name)
 	state.alive = true
 	state.delay = delay
-	state.failedUntil = time.Time{}
+	// A probe reaches the test URL, not the traffic the connection carries: it
+	// clears a demotion the check itself earned, but a candidate with failed
+	// dials keeps the backoff it earned until a dial proves it again.
+	if state.dialFaults == 0 || !state.failedUntil.After(time.Now()) {
+		state.failedUntil = time.Time{}
+	}
 	state.softUntil = time.Time{}
 	state.checkedAt = time.Now()
 	c.mu.Unlock()
