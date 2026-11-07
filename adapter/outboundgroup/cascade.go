@@ -647,6 +647,13 @@ func (c *Cascade) runCheck(ctx context.Context, force bool) map[string]uint16 {
 
 	target := c.lookahead + 1
 	budget := target * cascadeProbeBudgetFactor
+	if budget > len(order) {
+		budget = len(order)
+	}
+	// The walk stops after target candidates answered, so only the members it
+	// can reach are queued: a later candidate is not scheduled for this check.
+	endCheck := beginCheckScope(c.Name(), c.testUrl, order[:budget])
+	defer endCheck()
 	results := make(map[string]uint16, budget+1)
 	tested := make(map[string]struct{}, budget+1)
 	alive := 0

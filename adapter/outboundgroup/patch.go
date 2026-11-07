@@ -48,3 +48,31 @@ func (gb *GroupBase) joinProviderProxies(parts [][]C.Proxy) []C.Proxy {
 	}
 	return proxies
 }
+
+// A check picks its own candidates, so the per-probe start messages alone
+// cannot tell a host which members are queued for it: a pool checks its own
+// rotation, an ordered group checks every member. These hooks report the whole
+// set when a check begins and when it is over, whatever it measured.
+//
+// They live here rather than in the adapter package that owns the delay hooks,
+// because the groups are built from adapter and cannot import it back.
+var (
+	// CheckStartHook reports the members a check is about to measure.
+	CheckStartHook func(name string, url string, proxies []C.Proxy)
+	// CheckEndHook reports that the check has ended.
+	CheckEndHook func(name string, url string)
+)
+
+// beginCheckScope reports a check over proxies and returns the function that
+// closes it. A check that has nothing to measure opens no scope, so its end
+// must not be reported either.
+func beginCheckScope(name, url string, proxies []C.Proxy) func() {
+	if CheckStartHook == nil || len(proxies) == 0 {
+		return func() {}
+	}
+	CheckStartHook(name, url, proxies)
+	if CheckEndHook == nil {
+		return func() {}
+	}
+	return func() { CheckEndHook(name, url) }
+}

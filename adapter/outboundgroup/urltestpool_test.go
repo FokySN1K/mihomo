@@ -461,6 +461,132 @@ func TestURLTestPoolRecoveryMarksOnlyFullSweeps(t *testing.T) {
 		"a test that reached every candidate and found nothing tells a parent the pool is empty")
 }
 
+// poolOrderedProxy reports an aliveness and a delay of its own, so a test can
+// decide which members a sweep probes first without running health checks.
+type poolOrderedProxy struct {
+	*cascadeFakeProxy
+	alive bool
+	delay uint16
+}
+
+func (p *poolOrderedProxy) AliveForTestUrl(string) bool { return p.alive }
+
+func (p *poolOrderedProxy) LastDelayForTestUrl(string) uint16 {
+	if !p.alive {
+		return 0xffff
+	}
+	return p.delay
+}
+
+func newPoolOrderedProxy(name string, alive bool, delay uint16) *poolOrderedProxy {
+	return &poolOrderedProxy{cascadeFakeProxy: newCascadeTestProxy(name), alive: alive, delay: delay}
+}
+
+// A sweep probes the members that answered last time first, so the first wave
+// of an outage refills the pool instead of walking a whole provider.
+func TestURLTestPoolCheckOrdersMeasuredFirst(t *testing.T) {
+	pool := &URLTestPool{testUrl: poolTestUrl}
+
+	dead := newPoolOrderedProxy("dead", false, 0)
+	slow := newPoolOrderedProxy("slow", true, 400)
+	fast := newPoolOrderedProxy("fast", true, 20)
+	proxies := []C.Proxy{dead, slow, fast}
+
+	require.Equal(t, []string{"fast", "slow", "dead"}, cascadeProxyNames(pool.orderForCheck(proxies)))
+	require.Equal(t, []string{"dead", "slow", "fast"}, cascadeProxyNames(proxies),
+		"ordering the sweep must not reorder the provider list")
+}
+
+// The emergency test replays the last pool while it answers, and moves on to
+// the likeliest candidates of the whole list once that pool has missed: a
+// network that changed leaves every member of the old pool dead.
+func TestURLTestPoolRecoveryScansAfterMiss(t *testing.T) {
+	proxies := make([]C.Proxy, 0, urlTestPoolRecoveryScanLimit+5)
+	for i := 0; i < urlTestPoolRecoveryScanLimit+5; i++ {
+		proxies = append(proxies, newPoolOrderedProxy(fmt.Sprintf("p%02d", i), true, uint16(i)))
+	}
+
+	pool := &URLTestPool{testUrl: poolTestUrl, lastPool: []string{"p23", "p24"}}
+	require.Equal(t, []string{"p23", "p24"}, cascadeProxyNames(pool.recoveryCandidates(proxies)),
+		"a pool that has not missed yet replays its own members")
+
+	pool.recoveryMisses = 1
+	scan := pool.recoveryCandidates(proxies)
+	require.Len(t, scan, urlTestPoolRecoveryScanLimit, "the scan must stay bounded")
+	require.Equal(t, "p00", scan[0].Name())
+	require.Equal(t, fmt.Sprintf("p%02d", urlTestPoolRecoveryScanLimit-1), scan[len(scan)-1].Name())
+}
+
+// A dial with nothing measured alive waits for the running sweep to publish its
+// first alive member instead of spending the budget on a dial the pool already
+// knows is dead.
+func TestURLTestPoolExhaustedDialWaitsForTheSweep(t *testing.T) {
+	pool := newPoolForTest(t, URLTestPoolOption{}, newPoolOrderedProxy("dead", false, 0), newPoolOrderedProxy("found", true, 10))
+	pool.mu.Lock()
+	pool.pool = []string{"dead"}
+	pool.mu.Unlock()
+	pool.firstResultWait = 5 * time.Second
+	pool.beginWarmup()
+
+	measured := make(chan C.Proxy, 1)
+	go func() {
+		measured <- pool.awaitCheck(context.Background())
+	}()
+
+	select {
+	case <-measured:
+		t.Fatal("a dial must wait for the sweep while nothing is measured alive")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	// the sweep publishes its first alive member
+	pool.mu.Lock()
+	pool.pool = []string{"found"}
+	pool.mu.Unlock()
+	pool.markWarm()
+
+	select {
+	case proxy := <-measured:
+		require.NotNil(t, proxy)
+		require.Equal(t, "found", proxy.Name())
+	case <-time.After(time.Second):
+		t.Fatal("the dial must leave on the first alive member of the sweep")
+	}
+}
+
+// Without a running sweep there is no result to wait for.
+func TestURLTestPoolExhaustedDialDoesNotWaitWithoutSweep(t *testing.T) {
+	pool := newPoolForTest(t, URLTestPoolOption{}, newPoolOrderedProxy("dead", false, 0))
+	pool.firstResultWait = 5 * time.Second
+
+	start := time.Now()
+	require.Nil(t, pool.awaitCheck(context.Background()))
+	require.Less(t, time.Since(start), 100*time.Millisecond)
+}
+
+// A member cut by our own attempt-timeout is not proof of death: it leaves the
+// next choices only for the grace instead of the whole interval a failed check
+// earns.
+func TestURLTestPoolAttemptTimeoutCutKeepsTheMemberForTheGrace(t *testing.T) {
+	hanging := newCascadeFakeProxy("hanging", C.Shadowsocks, func(ctx context.Context, _ *C.Metadata) (C.Conn, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}, nil, 0)
+	log := &dialLog{}
+	pool := newPoolForTest(t, URLTestPoolOption{AttemptTimeout: intPtr(60)}, hanging, newPoolSucceedingProxy("b", log))
+
+	_, err := pool.DialContext(context.Background(), &C.Metadata{})
+	require.NoError(t, err)
+	require.Equal(t, []string{"b"}, log.list())
+
+	pool.mu.RLock()
+	until, marked := pool.suspicious["hanging"]
+	pool.mu.RUnlock()
+	require.True(t, marked, "a cut member leaves the next choices")
+	require.LessOrEqual(t, time.Until(until), urlTestPoolCutGrace+time.Second,
+		"a cut member must come back after the grace, not sit out the whole interval")
+}
+
 func TestURLTestPoolTracksOnlyDialFailures(t *testing.T) {
 	errDial := errors.New("dial failed")
 
@@ -683,14 +809,14 @@ func TestURLTestPoolAttemptTimeoutCutsHangingMember(t *testing.T) {
 
 func TestURLTestPoolKeepsSingleDialWithoutAttemptTimeout(t *testing.T) {
 	log := &dialLog{}
-	pool := newPoolForTest(t, URLTestPoolOption{},
+	pool := newPoolForTest(t, URLTestPoolOption{AttemptTimeout: intPtr(0)},
 		newPoolFailingProxy("a", log),
 		newPoolSucceedingProxy("b", log),
 	)
 
 	_, err := pool.DialContext(context.Background(), &C.Metadata{})
 	require.Error(t, err)
-	require.Equal(t, []string{"a"}, log.list(), "without attempt-timeout the pool keeps one dial per call")
+	require.Equal(t, []string{"a"}, log.list(), "attempt-timeout 0 keeps one dial per call")
 }
 
 func TestURLTestPoolAttemptTimeoutRunsFullCheckOnExhaustion(t *testing.T) {
@@ -737,9 +863,15 @@ func TestURLTestPoolAttemptTimeoutOption(t *testing.T) {
 	require.Zero(t, pool.attemptTimeout, "a negative attempt-timeout disables the bound")
 
 	pool, err = NewURLTestPool(GroupCommonOption{Name: "pool"},
+		URLTestPoolOption{AttemptTimeout: intPtr(0)}, newPoolEmptyFallback(), nil)
+	require.NoError(t, err)
+	require.Zero(t, pool.attemptTimeout, "an explicit 0 opts out of the bound")
+
+	pool, err = NewURLTestPool(GroupCommonOption{Name: "pool"},
 		URLTestPoolOption{}, newPoolEmptyFallback(), nil)
 	require.NoError(t, err)
-	require.Zero(t, pool.attemptTimeout)
+	require.Equal(t, defaultURLTestPoolAttemptTimeout, pool.attemptTimeout,
+		"without the option one hanging member costs the whole dial budget")
 }
 
 func TestURLTestPoolToleranceOption(t *testing.T) {
@@ -1026,7 +1158,9 @@ func TestURLTestPoolWarmUpFillsThePoolBeforeADial(t *testing.T) {
 
 	require.Eventually(t, func() bool { return len(poolNames(pool)) == 1 }, 2*time.Second, 5*time.Millisecond,
 		"the warm-up must fill the pool without waiting for a dial")
-	require.True(t, pool.hasFullCheck.Load())
+	// The pool is published as the first result arrives, the marker of a
+	// finished check a few steps later, so it is waited for as well.
+	require.Eventually(t, pool.hasFullCheck.Load, 2*time.Second, 5*time.Millisecond)
 	require.Equal(t, []string{"fast"}, poolLastNames(pool))
 }
 

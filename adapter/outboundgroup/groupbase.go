@@ -250,6 +250,8 @@ func (gb *GroupBase) URLTest(ctx context.Context, url string, expectedStatus uti
 	var lock sync.Mutex
 	mp := map[string]uint16{}
 	proxies := gb.GetProxies(false)
+	endCheck := beginCheckScope(gb.Name(), url, proxies)
+	defer endCheck()
 	limit := make(chan struct{}, defaultGroupURLCheckLimit)
 	for _, proxy := range proxies {
 		proxy := proxy
