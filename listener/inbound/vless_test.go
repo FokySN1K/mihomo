@@ -371,9 +371,10 @@ func TestInboundVless_Reality(t *testing.T) {
 		outboundOptions.Flow = "xtls-rprx-vision"
 		testInboundVless(t, inboundOptions, outboundOptions)
 	})
-	t.Run("X25519MLKEM768", func(t *testing.T) {
+	t.Run("classical-hello", func(t *testing.T) {
 		outboundOptions := outboundOptions
-		outboundOptions.RealityOpts.SupportX25519MLKEM768 = true
+		enabled := false
+		outboundOptions.RealityOpts.SupportX25519MLKEM768 = &enabled
 		testInboundVless(t, inboundOptions, outboundOptions)
 		t.Run("xtls-rprx-vision", func(t *testing.T) {
 			outboundOptions := outboundOptions
@@ -405,9 +406,10 @@ func TestInboundVless_Reality_Grpc(t *testing.T) {
 		GrpcOpts:          outbound.GrpcOptions{GrpcServiceName: "GunService"},
 	}
 	testInboundVless(t, inboundOptions, outboundOptions)
-	t.Run("X25519MLKEM768", func(t *testing.T) {
+	t.Run("classical-hello", func(t *testing.T) {
 		outboundOptions := outboundOptions
-		outboundOptions.RealityOpts.SupportX25519MLKEM768 = true
+		enabled := false
+		outboundOptions.RealityOpts.SupportX25519MLKEM768 = &enabled
 		testInboundVless(t, inboundOptions, outboundOptions)
 	})
 }

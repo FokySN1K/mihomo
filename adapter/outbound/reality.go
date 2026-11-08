@@ -14,13 +14,18 @@ type RealityOptions struct {
 	PublicKey string `proxy:"public-key"`
 	ShortID   string `proxy:"short-id,omitempty"`
 
-	SupportX25519MLKEM768 bool `proxy:"support-x25519mlkem768,omitempty"`
+	// SupportX25519MLKEM768 keeps the post-quantum key share in the
+	// ClientHello. It is on unless the subscription asks for false: xray
+	// clients and every browser the presets imitate send it, so a hello
+	// without it looks nothing like the traffic it is supposed to blend in
+	// with and is half the size.
+	SupportX25519MLKEM768 *bool `proxy:"support-x25519mlkem768,omitempty"`
 }
 
 func (o RealityOptions) Parse() (*tlsC.RealityConfig, error) {
 	if o.PublicKey != "" {
 		config := new(tlsC.RealityConfig)
-		config.SupportX25519MLKEM768 = o.SupportX25519MLKEM768
+		config.SupportX25519MLKEM768 = o.SupportX25519MLKEM768 == nil || *o.SupportX25519MLKEM768
 
 		const x25519ScalarSize = 32
 		publicKey, err := base64.RawURLEncoding.DecodeString(o.PublicKey)
