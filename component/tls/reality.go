@@ -15,6 +15,7 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/log"
@@ -59,7 +60,7 @@ func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHello
 			VerifyConnection:       verifier.VerifyConnection,
 		}
 
-		uConn := utls.UClient(conn, uConfig, fingerprint)
+		uConn := realityHello(conn, uConfig, fingerprint, realityConfig.SupportX25519MLKEM768)
 		verifier.UConn = uConn
 		err := uConn.BuildHandshakeState()
 		if err != nil {
@@ -140,6 +141,65 @@ func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHello
 
 		return uConn, nil
 	}
+}
+
+// DefaultHelloFallbackNotify reports that the X25519MLKEM768 upgrade of a
+// preset could not be built and the connection left with the hello as
+// recorded. The core calls it at most once per fingerprint: the upgrade is
+// deterministic, so a repeat would only repeat the same report. FlClash
+// turns it into a notification, other clients see the log alone.
+var DefaultHelloFallbackNotify func(fingerprint string, reason string)
+
+// specWithX25519MLKEM768 is swapped by tests that need the upgrade to fail.
+var specWithX25519MLKEM768 = SpecWithX25519MLKEM768
+
+var helloFallbackReported sync.Map
+
+// realityHello builds the client hello, adding the post-quantum key share to
+// a preset that predates the browsers' ML-KEM support. Presets recorded before
+// that carry no share, and their hello of 500-600 bytes is what the DPI on a
+// mobile network drops first. An upgrade that cannot be built is not fatal:
+// the preset as recorded is still a valid hello, so the dial keeps it and the
+// failure is reported.
+func realityHello(conn net.Conn, uConfig *utls.Config, fingerprint UClientHelloID, supportX25519MLKEM768 bool) *UConn {
+	uConn := utls.UClient(conn, uConfig, fingerprint)
+	if !supportX25519MLKEM768 {
+		return uConn
+	}
+	spec, err := specWithX25519MLKEM768(fingerprint)
+	if err != nil {
+		reportHelloFallback(fingerprint, err)
+		return uConn
+	}
+	if spec == nil {
+		return uConn
+	}
+	custom := utls.UClient(conn, uConfig, utls.HelloCustom)
+	if err := custom.ApplyPreset(spec); err != nil {
+		reportHelloFallback(fingerprint, err)
+		return uConn
+	}
+	return custom
+}
+
+func reportHelloFallback(fingerprint UClientHelloID, err error) {
+	name := fingerprintName(fingerprint)
+	// Every dial of a node with this preset repeats the failure, so only
+	// the first one is worth a warning and a report.
+	log.Debugln("TLS: cannot add X25519MLKEM768 to the hello of %s: %v", name, err)
+	if _, reported := helloFallbackReported.LoadOrStore(name, struct{}{}); reported {
+		return
+	}
+	log.Warnln("TLS: cannot add X25519MLKEM768 to the hello of %s, the original fingerprint is used: %v", name, err)
+	if notify := DefaultHelloFallbackNotify; notify != nil {
+		notify(name, err.Error())
+	}
+}
+
+// fingerprintName spells a preset the way a profile does: chrome, chrome120.
+// The Client field alone cannot tell the presets apart.
+func fingerprintName(fingerprint UClientHelloID) string {
+	return strings.ToLower(fingerprint.Client) + fingerprint.Version
 }
 
 func realityClientFallback(uConn net.Conn, serverName string, fingerprint utls.ClientHelloID) {
