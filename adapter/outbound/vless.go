@@ -562,14 +562,6 @@ func NewVless(option VlessOption) (*Vless, error) {
 		return nil, fmt.Errorf("%s requires TLS", securityMode)
 	}
 
-	// A REALITY node published with a bare IP as the server name is unfragmented
-	// here but split by xray's `fm` in the client it was tested in; without the
-	// same split the DPI drops the handshake. The profile option, when present,
-	// stays in charge.
-	if option.Fragment == nil {
-		option.Fragment = autoFragmentForReality(option.Name, v.realityConfig != nil, option.ServerName, option.Server)
-	}
-
 	switch option.Network {
 	case "h2":
 		if len(option.HTTP2Opts.Host) == 0 {

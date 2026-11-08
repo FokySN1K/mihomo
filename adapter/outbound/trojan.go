@@ -348,14 +348,6 @@ func NewTrojan(option TrojanOption) (*Trojan, error) {
 		return nil, errors.New("security modes are mutually exclusive: " + strings.Join(securityModes, ", "))
 	}
 
-	// A REALITY node published with a bare IP as the server name is unfragmented
-	// here but split by xray's `fm` in the client it was tested in; without the
-	// same split the DPI drops the handshake. The profile option, when present,
-	// stays in charge.
-	if option.Fragment == nil {
-		option.Fragment = autoFragmentForReality(option.Name, t.realityConfig != nil, option.SNI, option.Server)
-	}
-
 	if option.SSOpts.Enabled {
 		if option.SSOpts.Password == "" {
 			return nil, errors.New("empty password")

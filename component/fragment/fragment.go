@@ -8,8 +8,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/metacubex/mihomo/log"
 )
 
 const (
@@ -39,18 +37,6 @@ type Config struct {
 	Length  string `proxy:"length,omitempty"`  // "10-20", a range in bytes
 	Delay   string `proxy:"delay,omitempty"`   // "0", a range in milliseconds between pieces
 	Packets string `proxy:"packets,omitempty"` // only "tlshello" is implemented
-}
-
-// DefaultConfig is the xray FinalMask preset that subscriptions publish for a
-// REALITY node whose server name is a bare IP: the ClientHello is split into
-// 10-20 byte pieces with no delay, so a DPI never reads the name in it.
-func DefaultConfig() *Config {
-	return &Config{
-		Enabled: true,
-		Length:  "10-20",
-		Delay:   "0",
-		Packets: "tlshello",
-	}
 }
 
 // Conn rewrites the first TLS record into a run of small records of its own.
@@ -161,7 +147,6 @@ func (c *Conn) writeRecords(n int) (int, error) {
 
 	record := make([]byte, recordHeaderLen+c.maxLength)
 	record[0], record[1], record[2] = tlsHandshake, versionHigh, versionLow
-	pieces := 0
 	for sent := 0; sent < len(payload); {
 		size := c.pieceSize(len(payload) - sent)
 		record[3], record[4] = byte(size>>8), byte(size)
@@ -170,7 +155,6 @@ func (c *Conn) writeRecords(n int) (int, error) {
 			return 0, err
 		}
 		sent += size
-		pieces++
 		if sent < len(payload) && c.maxDelay > 0 {
 			time.Sleep(c.pieceDelay())
 		}
@@ -180,7 +164,6 @@ func (c *Conn) writeRecords(n int) (int, error) {
 			return 0, err
 		}
 	}
-	log.Debugln("fragment: %d bytes of the handshake left in %d records", len(payload), pieces)
 	return n, nil
 }
 
