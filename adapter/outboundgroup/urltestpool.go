@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/adapter/outboundgroup/probequeue"
 	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/callback"
 	N "github.com/metacubex/mihomo/common/net"
@@ -16,8 +17,6 @@ import (
 	C "github.com/metacubex/mihomo/constant"
 	P "github.com/metacubex/mihomo/constant/provider"
 	"github.com/metacubex/mihomo/log"
-
-	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -25,10 +24,6 @@ const (
 	defaultURLTestPoolInterval       = 300 * time.Second
 	defaultURLTestPoolFullInterval   = 1800 * time.Second
 	defaultURLTestPoolDegradedChecks = 3
-	// urlTestPoolCheckLimit bounds how many probes of one sweep run at once.
-	// A sweep is the slowest way the pool refills after an outage, so the limit
-	// is high enough to walk a provider of dozens of candidates in a few waves.
-	urlTestPoolCheckLimit = 20
 	// urlTestPoolRecoveryScanLimit bounds how many candidates the emergency
 	// test probes once the last pool has already missed: a test that only
 	// replayed dead members would repeat the same verdict forever.
@@ -543,12 +538,12 @@ func (u *URLTestPool) PoolCheck(ctx context.Context) (map[string]uint16, error) 
 		return u.parentCheck(ctx)
 	}
 
-	results, tested := u.testProxies(ctx, members)
 	// A member that failed leaves the pool now instead of holding a slot: the
-	// parent asked precisely whether the pool can still carry traffic. A probe
-	// the caller cut is not in the verdicts at all, so an interrupted check
-	// cannot empty the pool.
-	u.publishPartial(results, tested)
+	// parent asked precisely whether the pool can still carry traffic. The
+	// caller's budget bounds only the answer: a member still being probed
+	// reports into the pool when it finishes, and a probe that ran out of its
+	// own timeout is a dead member like any other.
+	results, _ := u.probeProxies(ctx, members, time.Duration(u.testTimeout)*time.Millisecond, true, false)
 	if len(results) == 0 {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -1356,7 +1351,7 @@ func (u *URLTestPool) ensureRecovery(ctx context.Context) bool {
 		// The probe timeout is the recovery one, never what the starting dial
 		// has left: every later dial joins this test, and a short budget of one
 		// caller must not turn a slow member into a dead one.
-		results, tested := u.probeProxies(context.Background(), candidates, urlTestPoolRecoveryTestTimeout, true)
+		results, tested := u.probeProxies(context.Background(), candidates, urlTestPoolRecoveryTestTimeout, true, true)
 		u.applyRecovery(results, tested, len(candidates))
 		u.finishMeasurement(measure)
 	}()
@@ -1651,21 +1646,24 @@ func (u *URLTestPool) publishPool(results map[string]uint16, tested map[string]s
 	u.mu.Unlock()
 }
 
-// testProxies tests proxies concurrently and returns delay (ms) of alive proxies
-// together with every proxy that was actually measured, alive or not, so the
-// pool can tell a failed member from one the check did not reach.
-func (u *URLTestPool) testProxies(ctx context.Context, proxies []C.Proxy) (map[string]uint16, map[string]struct{}) {
-	return u.probeProxies(ctx, proxies, time.Duration(u.testTimeout)*time.Millisecond, false)
+// testProxiesStreaming sweeps proxies with the member timeout and publishes
+// every measured member as soon as its probe returns.
+func (u *URLTestPool) testProxiesStreaming(ctx context.Context, proxies []C.Proxy) (map[string]uint16, map[string]struct{}) {
+	return u.probeProxies(ctx, proxies, time.Duration(u.testTimeout)*time.Millisecond, true, false)
 }
 
-// testProxiesStreaming is testProxies that publishes every measured member as
+// probeProxies tests proxies through the shared probe queue and returns the
+// delay (ms) of the alive proxies together with every proxy that was actually
+// measured, alive or not, so the pool can tell a failed member from one the
+// check did not reach. A streaming check publishes every measured member as
 // soon as its probe returns, so the pool is usable before the whole list has
 // been probed and a cold start routes by the first real result.
-func (u *URLTestPool) testProxiesStreaming(ctx context.Context, proxies []C.Proxy) (map[string]uint16, map[string]struct{}) {
-	return u.probeProxies(ctx, proxies, time.Duration(u.testTimeout)*time.Millisecond, true)
-}
-
-func (u *URLTestPool) probeProxies(ctx context.Context, proxies []C.Proxy, timeout time.Duration, publish bool) (map[string]uint16, map[string]struct{}) {
+//
+// A check has no budget of its own: the queue runs every probe to the member
+// timeout, and the caller's context bounds only how long the caller waits for
+// the answer. A check a parent left behind keeps probing and keeps publishing,
+// because the members it measures are what the next connections need.
+func (u *URLTestPool) probeProxies(ctx context.Context, proxies []C.Proxy, timeout time.Duration, publish bool, priority bool) (map[string]uint16, map[string]struct{}) {
 	// Every pool check, from the scheduled quick sweep to the recovery
 	// measurement, funnels its probes through here, so this is the one place
 	// that knows the whole set before the first probe answers.
@@ -1676,48 +1674,64 @@ func (u *URLTestPool) probeProxies(ctx context.Context, proxies []C.Proxy, timeo
 	tested := make(map[string]struct{}, len(proxies))
 	var mu sync.Mutex
 
-	group := new(errgroup.Group)
-	group.SetLimit(urlTestPoolCheckLimit)
+	probes := make([]probequeue.Probe, 0, len(proxies))
 	for _, proxy := range proxies {
-		proxy := proxy
-		group.Go(func() error {
-			// a caller that gives up (a parent's probe budget, a cascade that
-			// moved on) ends its probes too instead of keeping them running
-			probeCtx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
-
-			delay, err := proxy.URLTest(probeCtx, u.testUrl, u.expectedRanges)
-
-			mu.Lock()
-			defer mu.Unlock()
-			if err != nil {
-				if ctx.Err() != nil {
-					// the caller gave up, so the probe was cut instead of
-					// failing: that is not a verdict about the member
-					return nil
-				}
-				tested[proxy.Name()] = struct{}{}
-				if publish {
-					// the failed member leaves the pool now instead of
-					// holding a slot until the check ends
-					u.publishPartial(results, tested)
-				}
-				return nil
-			}
-
-			tested[proxy.Name()] = struct{}{}
-			results[proxy.Name()] = delay
-			if publish {
-				// published under the results lock: a later publish always
-				// carries every earlier result, so the pool cannot shrink back
-				u.publishPartial(results, tested)
-			}
-			return nil
+		probes = append(probes, probequeue.Probe{
+			Proxy:    proxy,
+			URL:      u.testUrl,
+			Expected: u.expectedRanges,
+			Timeout:  timeout,
+			Priority: priority,
 		})
 	}
-	_ = group.Wait()
 
-	return results, tested
+	// The queue decides when the probe runs; the pool's only limit is the
+	// timeout of the member itself.
+	check := probequeue.Submit(u.Name(), probes, func(result probequeue.Result) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		tested[result.Name] = struct{}{}
+		if result.Err != nil {
+			if publish {
+				// the failed member leaves the pool now instead of
+				// holding a slot until the check ends
+				u.publishPartial(results, tested)
+			}
+			return
+		}
+
+		results[result.Name] = result.Delay
+		if publish {
+			// published under the results lock: a later publish always
+			// carries every earlier result, so the pool cannot shrink back
+			u.publishPartial(results, tested)
+		}
+	})
+	check.Wait(ctx)
+
+	// The answer is a snapshot: a check the caller left behind keeps probing
+	// and keeps publishing through the callback above, but it must not write
+	// the maps this caller reads.
+	mu.Lock()
+	defer mu.Unlock()
+	return copyDelayResults(results), copyTestedNames(tested)
+}
+
+func copyDelayResults(results map[string]uint16) map[string]uint16 {
+	copied := make(map[string]uint16, len(results))
+	for name, delay := range results {
+		copied[name] = delay
+	}
+	return copied
+}
+
+func copyTestedNames(tested map[string]struct{}) map[string]struct{} {
+	copied := make(map[string]struct{}, len(tested))
+	for name := range tested {
+		copied[name] = struct{}{}
+	}
+	return copied
 }
 
 // proxiesReady reports whether the providers already loaded their proxies,

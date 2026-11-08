@@ -14,6 +14,7 @@ import (
 	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/adapter/inbound"
 	"github.com/metacubex/mihomo/adapter/outboundgroup"
+	"github.com/metacubex/mihomo/adapter/outboundgroup/probequeue"
 	"github.com/metacubex/mihomo/component/auth"
 	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/dialer"
@@ -171,6 +172,7 @@ func GetGeneral() *config.General {
 		GeodataLoader:     geodata.LoaderName(),
 		GeositeMatcher:    geodata.SiteMatcherName(),
 		TCPConcurrent:     dialer.GetTcpConcurrent(),
+		ProbeConcurrency:  probequeue.GetConcurrency(),
 		FindProcessMode:   tunnel.FindProcessMode(),
 		Sniffing:          tunnel.IsSniffing(),
 		GlobalUA:          mihomoHttp.UA(),
@@ -433,6 +435,11 @@ func updateGeneral(general *config.General, logging bool) {
 	if logging && general.TCPConcurrent {
 		log.Infoln("Use tcp concurrent")
 	}
+
+	// One probe queue for the whole process: every group, from a scheduled
+	// sweep to an explicit test, shares this limit instead of holding a
+	// per-group one.
+	probequeue.SetConcurrency(general.ProbeConcurrency)
 
 	inbound.SetTfo(general.InboundTfo)
 	inbound.SetMPTCP(general.InboundMPTCP)

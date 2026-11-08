@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/adapter/outbound"
+	"github.com/metacubex/mihomo/adapter/outboundgroup/probequeue"
 	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/utils"
 	C "github.com/metacubex/mihomo/constant"
@@ -18,6 +19,10 @@ import (
 	"github.com/dlclark/regexp2"
 	"golang.org/x/exp/slices"
 )
+
+// defaultGroupTestTimeout is the member budget of a group test, in
+// milliseconds, when the profile does not set `timeout`.
+const defaultGroupTestTimeout = 5000
 
 type GroupBase struct {
 	*outbound.Base
@@ -95,7 +100,7 @@ func NewGroupBase(opt GroupBaseOption) *GroupBase {
 	}
 
 	if gb.testTimeout == 0 {
-		gb.testTimeout = 5000
+		gb.testTimeout = defaultGroupTestTimeout
 	}
 	if gb.maxFailedTimes == 0 {
 		gb.maxFailedTimes = 5
@@ -238,42 +243,51 @@ func (gb *GroupBase) GetProxies(touch bool) []C.Proxy {
 	return proxies
 }
 
-// defaultGroupURLCheckLimit caps how many members of a group are probed at the
-// same time. Every probe opens its own connection to the same test URL, so an
-// unbounded fan-out over a large provider is a burst of hundreds of handshakes
-// that only competes with itself; the cap keeps the test within a sane socket
-// count without serializing it.
-const defaultGroupURLCheckLimit = 50
-
+// URLTest measures every member of the group. The probes go through the shared
+// probe queue, so a group test no longer adds its own fan-out on top of the
+// checks of every other group; the member timeout is the only budget of a
+// probe, and the caller's context bounds only how long the caller waits for the
+// answer.
 func (gb *GroupBase) URLTest(ctx context.Context, url string, expectedStatus utils.IntRanges[uint16]) (map[string]uint16, error) {
-	var wg sync.WaitGroup
-	var lock sync.Mutex
-	mp := map[string]uint16{}
 	proxies := gb.GetProxies(false)
 	endCheck := beginCheckScope(gb.Name(), url, proxies)
 	defer endCheck()
-	limit := make(chan struct{}, defaultGroupURLCheckLimit)
-	for _, proxy := range proxies {
-		proxy := proxy
-		wg.Add(1)
-		limit <- struct{}{}
-		go func() {
-			defer func() { <-limit; wg.Done() }()
-			delay, err := proxy.URLTest(ctx, url, expectedStatus)
-			if err == nil {
-				lock.Lock()
-				mp[proxy.Name()] = delay
-				lock.Unlock()
-			}
-		}()
-	}
-	wg.Wait()
 
-	if len(mp) == 0 {
-		return mp, fmt.Errorf("get delay: all proxies timeout")
-	} else {
-		return mp, nil
+	probes := make([]probequeue.Probe, 0, len(proxies))
+	for _, proxy := range proxies {
+		probes = append(probes, probequeue.Probe{
+			Proxy:    proxy,
+			URL:      url,
+			Expected: expectedStatus,
+			Timeout:  time.Duration(gb.testTimeout) * time.Millisecond,
+		})
 	}
+
+	var lock sync.Mutex
+	mp := map[string]uint16{}
+	check := probequeue.Submit(gb.Name(), probes, func(result probequeue.Result) {
+		if result.Err != nil {
+			return
+		}
+		lock.Lock()
+		mp[result.Name] = result.Delay
+		lock.Unlock()
+	})
+	check.Wait(ctx)
+
+	// Copy the measured members: a check the caller left behind keeps probing
+	// and must not write the map the caller returns.
+	lock.Lock()
+	measured := make(map[string]uint16, len(mp))
+	for name, delay := range mp {
+		measured[name] = delay
+	}
+	lock.Unlock()
+
+	if len(measured) == 0 {
+		return measured, fmt.Errorf("get delay: all proxies timeout")
+	}
+	return measured, nil
 }
 
 func (gb *GroupBase) onDialFailed(adapterType C.AdapterType, err error, fn func()) {

@@ -12,6 +12,7 @@ import (
 
 	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/adapter/outbound"
+	"github.com/metacubex/mihomo/adapter/outboundgroup/probequeue"
 	"github.com/metacubex/mihomo/adapter/provider"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
@@ -313,8 +314,9 @@ func newExhaustedPoolForTest(t *testing.T, proxies ...C.Proxy) *URLTestPool {
 	return pool
 }
 
-// A probe the caller cut says nothing about the member: PoolCheck must report
-// the cancellation instead of wiping the pool the parent dials through.
+// A probe the caller left is not a verdict yet: PoolCheck must report the
+// cancellation instead of wiping the pool the parent dials through, while the
+// probe itself keeps running to its own timeout.
 func TestURLTestPoolPoolCheckRespectsCallerDeadline(t *testing.T) {
 	held := newPoolRelease()
 	t.Cleanup(held.close)
@@ -330,10 +332,10 @@ func TestURLTestPoolPoolCheckRespectsCallerDeadline(t *testing.T) {
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	require.Nil(t, results)
 	require.Equal(t, []string{"blocked"}, poolNames(pool),
-		"a probe the caller cut must not be taken as a dead member")
+		"a probe the caller did not wait for must not be taken as a dead member")
 }
 
-// PoolCheck publishes what it measured even when the caller cuts the rest, and
+// PoolCheck publishes what it measured even when the caller stops waiting, and
 // keeps the members it did not reach instead of dropping them.
 func TestURLTestPoolPoolCheckPublishesWhatItMeasured(t *testing.T) {
 	held := newPoolRelease()
@@ -351,6 +353,38 @@ func TestURLTestPoolPoolCheckPublishesWhatItMeasured(t *testing.T) {
 	require.Equal(t, map[string]uint16{"fast": 10}, results)
 	require.Equal(t, []string{"fast", "slow"}, poolNames(pool),
 		"the measured member goes first and the member the check did not reach stays in the pool")
+}
+
+// Every sweep of every pool shares one probe queue: the process never exceeds
+// the configured number of probes, however many groups start at once.
+func TestURLTestPoolSweepSharesTheQueue(t *testing.T) {
+	const memberCount = 30
+
+	var inFlight atomic.Int32
+	var maxInFlight atomic.Int32
+
+	members := make([]C.Proxy, 0, memberCount)
+	for i := 0; i < memberCount; i++ {
+		members = append(members, newPoolControlledProxy(fmt.Sprintf("p%02d", i), nil, func(context.Context) (uint16, error) {
+			running := inFlight.Add(1)
+			for {
+				seen := maxInFlight.Load()
+				if running <= seen || maxInFlight.CompareAndSwap(seen, running) {
+					break
+				}
+			}
+			time.Sleep(5 * time.Millisecond)
+			inFlight.Add(-1)
+			return 10, nil
+		}))
+	}
+
+	pool := newPoolForTest(t, URLTestPoolOption{}, members...)
+	_, err := pool.URLTest(context.Background(), pool.testUrl, pool.expectedRanges)
+	require.NoError(t, err)
+	require.LessOrEqual(t, maxInFlight.Load(), int32(probequeue.GetConcurrency()),
+		"a sweep must not exceed the shared probe concurrency")
+	require.Greater(t, maxInFlight.Load(), int32(1), "a sweep must still probe in parallel")
 }
 
 // Every dial of one outage joins the same emergency test instead of starting a

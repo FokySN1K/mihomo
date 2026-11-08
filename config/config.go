@@ -14,6 +14,7 @@ import (
 	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/adapter/outbound"
 	"github.com/metacubex/mihomo/adapter/outboundgroup"
+	"github.com/metacubex/mihomo/adapter/outboundgroup/probequeue"
 	"github.com/metacubex/mihomo/adapter/provider"
 	"github.com/metacubex/mihomo/common/orderedmap"
 	"github.com/metacubex/mihomo/common/utils"
@@ -47,19 +48,23 @@ import (
 // General config
 type General struct {
 	Inbound
-	Mode              T.TunnelMode            `json:"mode"`
-	UnifiedDelay      bool                    `json:"unified-delay"`
-	LogLevel          log.LogLevel            `json:"log-level"`
-	IPv6              bool                    `json:"ipv6"`
-	Interface         string                  `json:"interface-name"`
-	RoutingMark       int                     `json:"routing-mark"`
-	GeoXUrl           GeoXUrl                 `json:"geox-url"`
-	GeoAutoUpdate     bool                    `json:"geo-auto-update"`
-	GeoUpdateInterval int                     `json:"geo-update-interval"`
-	GeodataMode       bool                    `json:"geodata-mode"`
-	GeodataLoader     string                  `json:"geodata-loader"`
-	GeositeMatcher    string                  `json:"geosite-matcher"`
-	TCPConcurrent     bool                    `json:"tcp-concurrent"`
+	Mode              T.TunnelMode `json:"mode"`
+	UnifiedDelay      bool         `json:"unified-delay"`
+	LogLevel          log.LogLevel `json:"log-level"`
+	IPv6              bool         `json:"ipv6"`
+	Interface         string       `json:"interface-name"`
+	RoutingMark       int          `json:"routing-mark"`
+	GeoXUrl           GeoXUrl      `json:"geox-url"`
+	GeoAutoUpdate     bool         `json:"geo-auto-update"`
+	GeoUpdateInterval int          `json:"geo-update-interval"`
+	GeodataMode       bool         `json:"geodata-mode"`
+	GeodataLoader     string       `json:"geodata-loader"`
+	GeositeMatcher    string       `json:"geosite-matcher"`
+	TCPConcurrent     bool         `json:"tcp-concurrent"`
+	// ProbeConcurrency is how many health probes the whole process runs at
+	// once. Every group shares this limit instead of holding one of its own,
+	// so the load on the network does not depend on the number of groups.
+	ProbeConcurrency  int                     `json:"probe-concurrency"`
 	FindProcessMode   process.FindProcessMode `json:"find-process-mode"`
 	Sniffing          bool                    `json:"sniffing"`
 	GlobalUA          string                  `json:"global-ua"`
@@ -441,6 +446,7 @@ type RawConfig struct {
 	GeodataLoader                 string                  `yaml:"geodata-loader" json:"geodata-loader"`
 	GeositeMatcher                string                  `yaml:"geosite-matcher" json:"geosite-matcher"`
 	TCPConcurrent                 bool                    `yaml:"tcp-concurrent" json:"tcp-concurrent"`
+	ProbeConcurrency              int                     `yaml:"probe-concurrency" json:"probe-concurrency"`
 	FindProcessMode               process.FindProcessMode `yaml:"find-process-mode" json:"find-process-mode"`
 	GlobalClientFingerprint       string                  `yaml:"global-client-fingerprint" json:"global-client-fingerprint"`
 	GlobalUA                      string                  `yaml:"global-ua" json:"global-ua"`
@@ -500,6 +506,7 @@ func DefaultRawConfig() *RawConfig {
 		Proxy:             []map[string]any{},
 		ProxyGroup:        []map[string]any{},
 		TCPConcurrent:     false,
+		ProbeConcurrency:  probequeue.DefaultConcurrency,
 		FindProcessMode:   process.FindProcessStrict,
 		GlobalUA:          "clash.meta/" + C.Version,
 		ETagSupport:       true,
@@ -797,6 +804,7 @@ func parseGeneral(cfg *RawConfig) (*General, error) {
 		GeodataLoader:     cfg.GeodataLoader,
 		GeositeMatcher:    cfg.GeositeMatcher,
 		TCPConcurrent:     cfg.TCPConcurrent,
+		ProbeConcurrency:  cfg.ProbeConcurrency,
 		FindProcessMode:   cfg.FindProcessMode,
 		GlobalUA:          cfg.GlobalUA,
 		ETagSupport:       cfg.ETagSupport,
