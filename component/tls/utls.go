@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"reflect"
+	"strings"
 	"unsafe"
 
 	"github.com/metacubex/mihomo/common/once"
@@ -53,10 +54,19 @@ func GetFingerprint(clientFingerprint string) (UClientHelloID, bool) {
 	if fingerprint, ok := fingerprints[clientFingerprint]; ok {
 		log.Debugln("use specified fingerprint:%s", fingerprint.Client)
 		return fingerprint, true
-	} else {
-		log.Warnln("wrong clientFingerprint:%s", clientFingerprint)
-		return UClientHelloID{}, false
 	}
+
+	// Subscriptions served for Happ name uTLS client ids after their Go
+	// identifiers, e.g. "hellochrome_120"; accept them as well.
+	if name, ok := strings.CutPrefix(clientFingerprint, "hello"); ok {
+		if fingerprint, found := fingerprints[name]; found {
+			log.Debugln("use specified fingerprint:%s", fingerprint.Client)
+			return fingerprint, true
+		}
+	}
+
+	log.Warnln("wrong clientFingerprint:%s", clientFingerprint)
+	return UClientHelloID{}, false
 }
 
 var randomFingerprint = once.OnceValue(func() UClientHelloID {
@@ -90,6 +100,12 @@ var fingerprints = map[string]UClientHelloID{
 	"chrome120":  utls.HelloChrome_120,
 	"firefox120": utls.HelloFirefox_120,
 	"safari16":   utls.HelloSafari_16_0,
+
+	// uTLS identifiers as used by Happ-style subscriptions
+	"chrome_120":        utls.HelloChrome_120,
+	"firefox_120":       utls.HelloFirefox_120,
+	"safari_16_0":       utls.HelloSafari_16_0,
+	"android_11_okhttp": utls.HelloAndroid_11_OkHttp,
 
 	// deprecated fingerprints should not be used
 	"chrome_psk":                 utls.HelloChrome_100_PSK,
