@@ -111,7 +111,7 @@ func TestQueueLimitsInFlight(t *testing.T) {
 		})
 	}
 
-	check := q.submit("sweep", probes, func(Result) { delivered.Add(1) })
+	check := q.submit("sweep", false, probes, func(Result) { delivered.Add(1) })
 	require.True(t, check.Wait(context.Background()))
 	require.Equal(t, int32(12), delivered.Load())
 	require.LessOrEqual(t, maxInFlight.Load(), int32(3), "the queue must not exceed its limit")
@@ -125,9 +125,9 @@ func TestPopLockedRoundRobinBetweenChecks(t *testing.T) {
 	q := &queue{limit: 1}
 
 	newBatch := func(q *queue, prefix string, count int) *batch {
-		probes := make([]Probe, 0, count)
+		probes := make([]*probeEntry, 0, count)
 		for i := 0; i < count; i++ {
-			probes = append(probes, Probe{Proxy: newTestProxy(fmt.Sprintf("%s%d", prefix, i), okProbe(1))})
+			probes = append(probes, &probeEntry{probe: Probe{Proxy: newTestProxy(fmt.Sprintf("%s%d", prefix, i), okProbe(1))}})
 		}
 		return &batch{q: q, probes: probes}
 	}
@@ -136,21 +136,44 @@ func TestPopLockedRoundRobinBetweenChecks(t *testing.T) {
 
 	var order []string
 	for q.hasWorkLocked() {
-		order = append(order, q.popLocked().probe.Proxy.Name())
+		order = append(order, q.popLocked().entry.probe.Proxy.Name())
 	}
 	require.Equal(t, []string{"a0", "b0", "a1", "b1", "a2", "b2"}, order)
+}
+
+// The foreground ring serves the checks of the groups that do not wait for
+// traffic before the background sweeps, and keeps its own round-robin.
+func TestPopLockedForegroundBeforeBackground(t *testing.T) {
+	q := &queue{limit: 1}
+
+	newBatch := func(prefix string, count int) *batch {
+		probes := make([]*probeEntry, 0, count)
+		for i := 0; i < count; i++ {
+			probes = append(probes, &probeEntry{probe: Probe{Proxy: newTestProxy(fmt.Sprintf("%s%d", prefix, i), okProbe(1))}})
+		}
+		return &batch{q: q, probes: probes}
+	}
+
+	q.foreground = []*batch{newBatch("fa", 2), newBatch("fb", 2)}
+	q.ring = []*batch{newBatch("bg", 2)}
+
+	var order []string
+	for q.hasWorkLocked() {
+		order = append(order, q.popLocked().entry.probe.Proxy.Name())
+	}
+	require.Equal(t, []string{"fa0", "fb0", "fa1", "fb1", "bg0", "bg1"}, order)
 }
 
 // A probe a dial is waiting on overtakes the scheduled work.
 func TestPopLockedPriorityFirst(t *testing.T) {
 	q := &queue{limit: 1}
-	normal := &batch{q: q, probes: []Probe{{Proxy: newTestProxy("n0", okProbe(1))}}}
+	normal := &batch{q: q, probes: []*probeEntry{{probe: Probe{Proxy: newTestProxy("n0", okProbe(1))}}}}
 	urgent := &batch{q: q}
 	q.ring = []*batch{normal}
-	q.priority = []probeItem{{batch: urgent, probe: Probe{Proxy: newTestProxy("p0", okProbe(1))}}}
+	q.priority = []probeItem{{batch: urgent, entry: &probeEntry{probe: Probe{Proxy: newTestProxy("p0", okProbe(1))}}}}
 
-	require.Equal(t, "p0", q.popLocked().probe.Proxy.Name())
-	require.Equal(t, "n0", q.popLocked().probe.Proxy.Name())
+	require.Equal(t, "p0", q.popLocked().entry.probe.Proxy.Name())
+	require.Equal(t, "n0", q.popLocked().entry.probe.Proxy.Name())
 	require.False(t, q.hasWorkLocked())
 }
 
@@ -187,8 +210,8 @@ func TestQueueInterleavesChecks(t *testing.T) {
 		})
 	}
 
-	bigCheck := q.submit("big", big, nil)
-	smallCheck := q.submit("small", small, nil)
+	bigCheck := q.submit("big", false, big, nil)
+	smallCheck := q.submit("small", false, small, nil)
 	close(gate)
 
 	require.True(t, bigCheck.Wait(context.Background()))
@@ -198,6 +221,54 @@ func TestQueueInterleavesChecks(t *testing.T) {
 	require.Len(t, order, 8)
 	require.Less(t, recorder.index("small0"), recorder.index("big5"),
 		"the quick check must not wait for the whole sweep ahead of it")
+}
+
+// A check of a group that does not wait for traffic reaches the slots before
+// the background sweep, even when the sweep was submitted first.
+func TestQueueForegroundOvertakesSweep(t *testing.T) {
+	q := newQueue(1)
+	recorder := &startRecorder{}
+	gate := make(chan struct{})
+
+	big := make([]Probe, 0, 6)
+	for i := 0; i < 6; i++ {
+		name := fmt.Sprintf("big%d", i)
+		big = append(big, Probe{
+			Proxy: newTestProxy(name, func(context.Context) (uint16, error) {
+				recorder.add(name)
+				if name == "big0" {
+					<-gate
+				}
+				return 10, nil
+			}),
+			Timeout: time.Second,
+		})
+	}
+	foreground := make([]Probe, 0, 2)
+	for i := 0; i < 2; i++ {
+		name := fmt.Sprintf("fg%d", i)
+		foreground = append(foreground, Probe{
+			Proxy: newTestProxy(name, func(context.Context) (uint16, error) {
+				recorder.add(name)
+				return 10, nil
+			}),
+			Timeout: time.Second,
+		})
+	}
+
+	bigCheck := q.submit("sweep", false, big, nil)
+	requireEventually(t, func() bool { return recorder.index("big0") == 0 }, "the sweep must own the only slot")
+
+	fgCheck := q.submit("foreground", true, foreground, nil)
+	close(gate)
+
+	require.True(t, bigCheck.Wait(context.Background()))
+	require.True(t, fgCheck.Wait(context.Background()))
+
+	order := recorder.list()
+	require.Len(t, order, 8)
+	require.Less(t, recorder.index("fg0"), recorder.index("big1"),
+		"the foreground check must not wait for the whole sweep")
 }
 
 // A priority batch goes first as soon as a slot frees up.
@@ -221,13 +292,13 @@ func TestQueuePriorityOvertakesRing(t *testing.T) {
 		})
 	}
 
-	normalCheck := q.submit("sweep", normal, nil)
+	normalCheck := q.submit("sweep", false, normal, nil)
 
 	// The sweep must own the slot before the urgent batch arrives, otherwise
 	// the priority probe is simply the first queued probe.
 	requireEventually(t, func() bool { return recorder.index("n0") == 0 }, "the first sweep probe must hold the slot")
 
-	urgentCheck := q.submit("recovery", []Probe{{
+	urgentCheck := q.submit("recovery", false, []Probe{{
 		Proxy: newTestProxy("p0", func(context.Context) (uint16, error) {
 			recorder.add("p0")
 			return 5, nil
@@ -248,7 +319,7 @@ func TestQueueNodeTimeoutIsAVerdict(t *testing.T) {
 	q := newQueue(2)
 
 	var result Result
-	check := q.submit("sweep", []Probe{{
+	check := q.submit("sweep", false, []Probe{{
 		Proxy: newTestProxy("hanging", func(ctx context.Context) (uint16, error) {
 			<-ctx.Done()
 			return 0, ctx.Err()
@@ -269,7 +340,7 @@ func TestQueueWaitDoesNotCutProbes(t *testing.T) {
 	q := newQueue(2)
 	results := make(chan Result, 2)
 
-	check := q.submit("sweep", []Probe{
+	check := q.submit("sweep", false, []Probe{
 		{
 			Proxy:   newTestProxy("fast", okProbe(5)),
 			Timeout: time.Second,
@@ -319,7 +390,7 @@ func TestSetConcurrency(t *testing.T) {
 		})
 	}
 
-	check := q.submit("sweep", probes, nil)
+	check := q.submit("sweep", false, probes, nil)
 	requireEventually(t, func() bool { return inFlight.Load() == 1 }, "the first probe must start")
 
 	time.Sleep(30 * time.Millisecond)
@@ -352,7 +423,7 @@ func TestQueueRunsGroupProbesInline(t *testing.T) {
 		return 10, nil
 	})
 
-	check := q.submit("mixed", []Probe{
+	check := q.submit("mixed", false, []Probe{
 		{Proxy: normalProxy, Timeout: time.Second},
 		{Proxy: groupProxy, Timeout: time.Second},
 	}, nil)
@@ -368,10 +439,123 @@ func TestQueueRunsGroupProbesInline(t *testing.T) {
 
 func TestQueueEmptySubmit(t *testing.T) {
 	q := newQueue(1)
-	check := q.submit("empty", nil, func(Result) {
+	check := q.submit("empty", false, nil, func(Result) {
 		t.Fatal("an empty check must not report")
 	})
 	require.True(t, check.Wait(context.Background()))
+}
+
+// Two checks that ask the same question share one probe: the second check
+// waits on the measurement already in flight instead of loading the path again.
+func TestSubmitSharesInFlightProbe(t *testing.T) {
+	q := newQueue(4)
+	gate := make(chan struct{})
+	var calls atomic.Int32
+
+	proxy := newTestProxy("shared", func(context.Context) (uint16, error) {
+		calls.Add(1)
+		<-gate
+		return 40, nil
+	})
+	probe := Probe{Proxy: proxy, URL: "https://example.com/204", Timeout: time.Second}
+
+	results := make(chan Result, 2)
+	first := q.submit("first", false, []Probe{probe}, func(r Result) { results <- r })
+	requireEventually(t, func() bool { return calls.Load() == 1 }, "the first probe must hold the measurement")
+
+	second := q.submit("second", false, []Probe{probe}, func(r Result) { results <- r })
+	close(gate)
+
+	require.True(t, first.Wait(context.Background()))
+	require.True(t, second.Wait(context.Background()))
+	require.Equal(t, int32(1), calls.Load(), "the second check must join the probe in flight")
+
+	close(results)
+	for result := range results {
+		require.NoError(t, result.Err)
+		require.Equal(t, uint16(40), result.Delay)
+	}
+}
+
+// The same proxy listed twice in one check is still one measurement, and both
+// entries of the check report.
+func TestSubmitSharesDuplicateProbesInBatch(t *testing.T) {
+	q := newQueue(2)
+	var calls atomic.Int32
+	var delivered atomic.Int32
+
+	probe := Probe{
+		Proxy: newTestProxy("dup", func(context.Context) (uint16, error) {
+			calls.Add(1)
+			return 30, nil
+		}),
+		URL:     "https://example.com/204",
+		Timeout: time.Second,
+	}
+
+	check := q.submit("batch", false, []Probe{probe, probe}, func(Result) { delivered.Add(1) })
+	require.True(t, check.Wait(context.Background()))
+	require.Equal(t, int32(1), calls.Load())
+	require.Equal(t, int32(2), delivered.Load())
+}
+
+// Two proxies that share a name are still two different nodes: their probes
+// must not be shared.
+func TestSubmitKeepsEqualNamedProxiesApart(t *testing.T) {
+	q := newQueue(2)
+	var calls atomic.Int32
+
+	newProxy := func() *fakeProxy {
+		return newTestProxy("same-name", func(context.Context) (uint16, error) {
+			calls.Add(1)
+			return 10, nil
+		})
+	}
+
+	check := q.submit("batch", false, []Probe{
+		{Proxy: newProxy(), URL: "https://example.com/204", Timeout: time.Second},
+		{Proxy: newProxy(), URL: "https://example.com/204", Timeout: time.Second},
+	}, nil)
+	require.True(t, check.Wait(context.Background()))
+	require.Equal(t, int32(2), calls.Load(), "only the same proxy may share a probe")
+}
+
+// A priority probe does not join a twin that still waits in the ring: the dial
+// would wait behind the whole sweep, which is what the priority lane exists to
+// prevent.
+func TestPriorityProbeDoesNotJoinQueuedTwin(t *testing.T) {
+	q := newQueue(1)
+	gate := make(chan struct{})
+
+	blocker := newTestProxy("blocker", func(context.Context) (uint16, error) {
+		<-gate
+		return 1, nil
+	})
+	twin := newTestProxy("twin", okProbe(5))
+
+	block := q.submit("block", false, []Probe{{Proxy: blocker, Timeout: time.Second}}, nil)
+	requireEventually(t, func() bool {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		return q.running == 1
+	}, "the blocker must own the only slot")
+
+	twinProbe := Probe{Proxy: twin, URL: "https://example.com/204", Timeout: time.Second}
+	sweep := q.submit("sweep", false, []Probe{twinProbe}, nil)
+
+	urgentProbe := twinProbe
+	urgentProbe.Priority = true
+	recovery := q.submit("recovery", false, []Probe{urgentProbe}, nil)
+
+	q.mu.Lock()
+	priorityQueued := len(q.priority)
+	q.mu.Unlock()
+	require.Equal(t, 1, priorityQueued, "the urgent twin must go to the priority lane, not join the ring")
+
+	close(gate)
+	require.True(t, block.Wait(context.Background()))
+	require.True(t, sweep.Wait(context.Background()))
+	require.True(t, recovery.Wait(context.Background()))
 }
 
 func TestSetConcurrencyClamps(t *testing.T) {

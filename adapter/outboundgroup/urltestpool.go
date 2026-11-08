@@ -1686,8 +1686,15 @@ func (u *URLTestPool) probeProxies(ctx context.Context, proxies []C.Proxy, timeo
 	}
 
 	// The queue decides when the probe runs; the pool's only limit is the
-	// timeout of the member itself.
-	check := probequeue.Submit(u.Name(), probes, func(result probequeue.Result) {
+	// timeout of the member itself. A group that checks without `lazy` routes
+	// the profile's traffic by its own answers, so its check runs in the
+	// foreground lane; a lazy group checks only when traffic wakes it and
+	// takes the background ring.
+	submit := probequeue.Submit
+	if !u.lazy {
+		submit = probequeue.SubmitForeground
+	}
+	check := submit(u.Name(), probes, func(result probequeue.Result) {
 		mu.Lock()
 		defer mu.Unlock()
 
