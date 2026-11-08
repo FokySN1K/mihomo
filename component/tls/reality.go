@@ -28,6 +28,17 @@ import (
 
 const RealityMaxShortIDLen = 8
 
+// The REALITY session id starts with the client version. Xray-core v26.7.11+
+// servers reject clients that report a version below minClientVer (26.3.27 by
+// default) and silently fall back to the mask site, which surfaces here as a
+// certificate verification error. We therefore report a recent Xray-core
+// version instead of the 1.8.2 marker that older servers ignored.
+const (
+	realityClientVersionMajor byte = 26
+	realityClientVersionMinor byte = 10
+	realityClientVersionPatch byte = 31
+)
+
 type RealityConfig struct {
 	PublicKey *ecdh.PublicKey
 	ShortID   [RealityMaxShortIDLen]byte
@@ -71,9 +82,9 @@ func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHello
 		binary.BigEndian.PutUint64(hello.SessionId, uint64(ntp.Now().Unix()))
 
 		copy(hello.SessionId[8:], realityConfig.ShortID[:])
-		hello.SessionId[0] = 1
-		hello.SessionId[1] = 8
-		hello.SessionId[2] = 2
+		hello.SessionId[0] = realityClientVersionMajor
+		hello.SessionId[1] = realityClientVersionMinor
+		hello.SessionId[2] = realityClientVersionPatch
 
 		//log.Debugln("REALITY hello.sessionId[:16]: %v", hello.SessionId[:16])
 
