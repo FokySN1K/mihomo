@@ -33,13 +33,34 @@ func (c *fakeConn) flat() []byte {
 	return out
 }
 
+// recordPayloads walks the stream as tls records and answers their payloads.
+func recordPayloads(t *testing.T, data []byte) [][]byte {
+	t.Helper()
+	var payloads [][]byte
+	for len(data) > 0 {
+		if len(data) < recordHeaderLen {
+			t.Fatalf("%d stray bytes at the end: % x", len(data), data)
+		}
+		if data[0] != tlsHandshake || data[1] != tlsRecordVersion {
+			t.Fatalf("a record starts with % x, want 16 03", data[:2])
+		}
+		size := int(data[3])<<8 | int(data[4])
+		if size < 1 || len(data) < recordHeaderLen+size {
+			t.Fatalf("a record announces %d bytes, %d left", size, len(data)-recordHeaderLen)
+		}
+		payloads = append(payloads, data[recordHeaderLen:recordHeaderLen+size])
+		data = data[recordHeaderLen+size:]
+	}
+	return payloads
+}
+
 // clientHello builds a TLS handshake record of payload bytes.
 func clientHello(payload int) []byte {
 	record := []byte{0x16, 0x03, 0x01, byte(payload >> 8), byte(payload)}
 	return append(record, bytes.Repeat([]byte{0x2a}, payload)...)
 }
 
-func TestClientHelloLeavesInPieces(t *testing.T) {
+func TestClientHelloLeavesInRecords(t *testing.T) {
 	raw := &fakeConn{}
 	conn := NewConn(raw, &Config{Enabled: true, Length: "10-20", Delay: "0", Packets: "tlshello"})
 	hello := clientHello(300)
@@ -51,13 +72,19 @@ func TestClientHelloLeavesInPieces(t *testing.T) {
 	if len(raw.writes) < 2 {
 		t.Fatalf("the handshake left in %d write(s), want it split", len(raw.writes))
 	}
-	for i, write := range raw.writes {
-		if len(write) > 20 {
-			t.Fatalf("piece %d is %d bytes, want at most 20", i, len(write))
-		}
+	payloads := recordPayloads(t, raw.flat())
+	if len(payloads) != len(raw.writes) {
+		t.Fatalf("%d writes carry %d records, want one record per write", len(raw.writes), len(payloads))
 	}
-	if !bytes.Equal(raw.flat(), hello) {
-		t.Fatal("the pieces do not add up to the handshake")
+	var joined []byte
+	for i, payload := range payloads {
+		if len(payload) > 20 {
+			t.Fatalf("record %d carries %d bytes, want at most 20", i, len(payload))
+		}
+		joined = append(joined, payload...)
+	}
+	if !bytes.Equal(joined, hello[recordHeaderLen:]) {
+		t.Fatal("the records do not add up to the handshake")
 	}
 }
 
@@ -78,6 +105,25 @@ func TestTrafficAfterTheHandshakePassesThrough(t *testing.T) {
 	}
 	if !bytes.Equal(raw.writes[len(raw.writes)-1], request) {
 		t.Fatal("the request did not pass through unchanged")
+	}
+}
+
+func TestTrafficAfterTheHandshakeInTheSameWriteLeavesAsIs(t *testing.T) {
+	raw := &fakeConn{}
+	conn := NewConn(raw, &Config{Enabled: true, Length: "10-20"})
+	hello := clientHello(64)
+	tail := []byte("more bytes of the same write")
+	write := append(append([]byte(nil), hello...), tail...)
+
+	if n, err := conn.Write(write); err != nil || n != len(write) {
+		t.Fatalf("Write = %d, %v; want %d, nil", n, err, len(write))
+	}
+	if last := raw.writes[len(raw.writes)-1]; !bytes.Equal(last, tail) {
+		t.Fatalf("the tail left as % x, want % x", last, tail)
+	}
+	joined := bytes.Join(recordPayloads(t, bytes.Join(raw.writes[:len(raw.writes)-1], nil)), nil)
+	if !bytes.Equal(joined, hello[recordHeaderLen:]) {
+		t.Fatal("the records do not add up to the handshake")
 	}
 }
 
@@ -108,13 +154,28 @@ func TestHeaderSplitAcrossWrites(t *testing.T) {
 	if n, err := conn.Write(hello[2:]); err != nil || n != len(hello)-2 {
 		t.Fatalf("second Write = %d, %v; want %d, nil", n, err, len(hello)-2)
 	}
-	if !bytes.Equal(raw.flat(), hello) {
-		t.Fatal("the pieces do not add up to the handshake")
+	joined := bytes.Join(recordPayloads(t, raw.flat()), nil)
+	if !bytes.Equal(joined, hello[recordHeaderLen:]) {
+		t.Fatal("the records do not add up to the handshake")
 	}
 	for i, write := range raw.writes {
-		if len(write) > 20 {
-			t.Fatalf("piece %d is %d bytes, want at most 20", i, len(write))
+		if len(write) > recordHeaderLen+20 {
+			t.Fatalf("record %d is %d bytes, want at most %d", i, len(write), recordHeaderLen+20)
 		}
+	}
+}
+
+func TestRecordThatDoesNotFitIsPassedThrough(t *testing.T) {
+	raw := &fakeConn{}
+	conn := NewConn(raw, &Config{Enabled: true, Length: "10-20"})
+	announced := append([]byte{0x16, 0x03, 0x01, 0xff, 0xff}, bytes.Repeat([]byte{0x2a}, 64)...)
+
+	n, err := conn.Write(announced)
+	if err != nil || n != len(announced) {
+		t.Fatalf("Write = %d, %v; want %d, nil", n, err, len(announced))
+	}
+	if len(raw.writes) != 1 || !bytes.Equal(raw.writes[0], announced) {
+		t.Fatalf("got %d write(s), want the first bytes as they came", len(raw.writes))
 	}
 }
 

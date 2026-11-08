@@ -14,12 +14,21 @@ import (
 
 const (
 	// tlsHandshake is the content type of the ClientHello record.
-	tlsHandshake    = 0x16
-	recordHeaderLen = 5
-	maxRecordLen    = 1 << 14
+	tlsHandshake     = 0x16
+	tlsRecordVersion = 0x03
+	recordHeaderLen  = 5
+	maxRecordLen     = 1 << 14
 
 	defaultMinLength = 10
 	defaultMaxLength = 20
+)
+
+// The zero value is the init state, so the first write always goes through the
+// header check.
+const (
+	stateInit = iota
+	stateHandshake
+	stateBypass
 )
 
 // Config is the `fragment` proxy option. It mirrors the xray FinalMask tcp
@@ -44,10 +53,14 @@ func DefaultConfig() *Config {
 	}
 }
 
-// Conn splits the first TLS record into pieces. A middlebox that parses the
-// handshake out of one segment never sees the whole server name, while the peer
-// reassembles it from the stream. Every write after that record, and every
-// connection whose first write is not a TLS handshake, passes through as is.
+// Conn rewrites the first TLS record into a run of small records of its own.
+// A middlebox that parses one record to find the server name never sees the
+// whole handshake, while the peer reassembles it from the stream: TLS allows a
+// handshake message to span records, so this is what xray does for `fm`.
+// Cutting the same record into tcp segments is not enough, because a DPI that
+// reassembles the stream sees exactly the bytes the client started with.
+// Every write after that record, and every connection whose first write is not
+// a TLS handshake, passes through as is.
 type Conn struct {
 	net.Conn
 
@@ -55,10 +68,10 @@ type Conn struct {
 	minDelay, maxDelay   time.Duration
 	rng                  *rand.Rand
 
-	mu      sync.Mutex
-	started bool
-	header  []byte // the record header when it arrives split across writes
-	left    int    // bytes of the handshake record still to send
+	mu     sync.Mutex
+	state  int
+	held   []byte // the first bytes of the connection until the record is complete
+	needed int    // size of the record, header included, once the header is known
 }
 
 // NewConn wraps c, or answers c itself when fragmentation is off or the option
@@ -96,56 +109,79 @@ func (c *Conn) Write(p []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	held := 0
-	if !c.started {
-		// The header can arrive split across writes; hold it until all five
-		// bytes are here, the record length lives in the last two.
-		if len(c.header)+len(p) < recordHeaderLen {
-			c.header = append(c.header, p...)
+	if c.state == stateBypass {
+		return c.Conn.Write(p)
+	}
+
+	// Every piece becomes a record of its own, so the whole handshake record
+	// has to be here before the first piece leaves.
+	c.held = append(c.held, p...)
+
+	if c.state == stateInit {
+		// The header can arrive split across writes, the record length lives
+		// in the last two bytes.
+		if len(c.held) < recordHeaderLen {
 			return len(p), nil
 		}
-		if len(c.header) > 0 {
-			held = len(c.header)
-			p = append(c.header, p...)
-			c.header = nil
+		length := int(c.held[3])<<8 | int(c.held[4])
+		if c.held[0] != tlsHandshake || c.held[1] != tlsRecordVersion || length <= 0 || length > maxRecordLen {
+			return c.passThrough(len(p))
 		}
-		c.started = true
-		c.left = handshakeLength(p)
+		c.needed = recordHeaderLen + length
+		c.state = stateHandshake
 	}
 
-	written, pieces, err := c.writePieces(p)
-	if pieces > 1 {
-		log.Debugln("fragment: %d bytes of the handshake left in %d pieces", written-held, pieces)
+	if len(c.held) < c.needed {
+		return len(p), nil
 	}
-	if err != nil {
-		return maxInt(written-held, 0), err
-	}
-	return written - held, nil
+	return c.writeRecords(len(p))
 }
 
-// writePieces sends the part of p that still belongs to the handshake record in
-// pieces and everything after it in one write. It answers how many writes it took.
-func (c *Conn) writePieces(p []byte) (int, int, error) {
-	sent := 0
+// passThrough forwards everything held as it came and stops interfering.
+func (c *Conn) passThrough(n int) (int, error) {
+	held := c.held
+	c.held = nil
+	c.state = stateBypass
+	if _, err := c.Conn.Write(held); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// writeRecords sends the handshake as records of at most maxLength bytes in
+// their payload, then whatever followed that record in the same write, and
+// answers n for the write the caller made.
+func (c *Conn) writeRecords(n int) (int, error) {
+	payload := c.held[recordHeaderLen:c.needed]
+	tail := c.held[c.needed:]
+	versionHigh, versionLow := c.held[1], c.held[2]
+
+	c.held = nil
+	c.state = stateBypass
+
+	record := make([]byte, recordHeaderLen+c.maxLength)
+	record[0], record[1], record[2] = tlsHandshake, versionHigh, versionLow
 	pieces := 0
-	for sent < len(p) {
-		if c.left <= 0 {
-			n, err := c.Conn.Write(p[sent:])
-			return sent + n, pieces + 1, err
+	for sent := 0; sent < len(payload); {
+		size := c.pieceSize(len(payload) - sent)
+		record[3], record[4] = byte(size>>8), byte(size)
+		copy(record[recordHeaderLen:recordHeaderLen+size], payload[sent:sent+size])
+		if _, err := c.Conn.Write(record[:recordHeaderLen+size]); err != nil {
+			return 0, err
 		}
-		size := c.pieceSize(minInt(c.left, len(p)-sent))
-		n, err := c.Conn.Write(p[sent : sent+size])
-		sent += n
+		sent += size
 		pieces++
-		c.left -= n
-		if err != nil {
-			return sent, pieces, err
-		}
-		if c.left > 0 && c.maxDelay > 0 {
+		if sent < len(payload) && c.maxDelay > 0 {
 			time.Sleep(c.pieceDelay())
 		}
 	}
-	return sent, pieces, nil
+	if len(tail) > 0 {
+		if _, err := c.Conn.Write(tail); err != nil {
+			return 0, err
+		}
+	}
+	log.Debugln("fragment: %d bytes of the handshake left in %d records", len(payload), pieces)
+	return n, nil
 }
 
 func (c *Conn) pieceSize(limit int) int {
@@ -160,19 +196,6 @@ func (c *Conn) pieceDelay() time.Duration {
 		return c.minDelay
 	}
 	return c.minDelay + time.Duration(c.rng.Int63n(int64(c.maxDelay-c.minDelay+1)))
-}
-
-// handshakeLength answers the size of the first TLS record when p starts with a
-// handshake record, and 0 when p is anything else or the length makes no sense.
-func handshakeLength(p []byte) int {
-	if len(p) < recordHeaderLen || p[0] != tlsHandshake || p[1] != 0x03 {
-		return 0
-	}
-	length := int(p[3])<<8 | int(p[4])
-	if length <= 0 || length > maxRecordLen {
-		return 0
-	}
-	return recordHeaderLen + length
 }
 
 // parseRange reads "10", "10-20" or an empty string, which answers the defaults.
@@ -201,13 +224,6 @@ func parseRange(raw string, defaultMin, defaultMax int) (int, int, error) {
 
 func minInt(a, b int) int {
 	if a < b {
-		return a
-	}
-	return b
-}
-
-func maxInt(a, b int) int {
-	if a > b {
 		return a
 	}
 	return b
