@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/adapter/outboundgroup/probequeue"
 	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/callback"
 	N "github.com/metacubex/mihomo/common/net"
@@ -813,7 +814,7 @@ func (c *Cascade) probeCandidate(ctx context.Context, proxy C.Proxy) (uint16, er
 
 	group, ok := probeGroup(proxy)
 	if !ok {
-		return proxy.URLTest(probeCtx, c.testUrl, c.expectedRanges)
+		return probequeue.TestProxy(probeCtx, proxy, c.testUrl, c.expectedRanges)
 	}
 
 	// A candidate that keeps its own member list is asked for its own view: its

@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/adapter/outboundgroup/probequeue"
 	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/singledo"
 	"github.com/metacubex/mihomo/common/utils"
@@ -129,7 +130,6 @@ func (hc *HealthCheck) check() {
 		id := utils.NewUUIDV4().String()
 		log.Debugln("Start New Health Checking {%s}", id)
 		b := new(errgroup.Group)
-		b.SetLimit(10)
 
 		// execute default health check
 		option := &extraOption{filters: nil, expectedStatus: hc.expectedStatus}
@@ -168,6 +168,7 @@ func (hc *HealthCheck) execute(b *errgroup.Group, url, uid string, option *extra
 		}
 	}
 
+	probes := make([]probequeue.Probe, 0, len(hc.proxies))
 	for _, proxy := range hc.proxies {
 		// skip proxies that do not require health check
 		if filterReg != nil {
@@ -176,16 +177,31 @@ func (hc *HealthCheck) execute(b *errgroup.Group, url, uid string, option *extra
 			}
 		}
 
-		p := proxy
-		b.Go(func() error {
-			ctx, cancel := context.WithTimeout(hc.ctx, hc.timeout)
-			defer cancel()
-			log.Debugln("Health Checking, proxy: %s, url: %s, id: {%s}", p.Name(), url, uid)
-			_, _ = p.URLTest(ctx, url, expectedStatus)
-			log.Debugln("Health Checked, proxy: %s, url: %s, alive: %t, delay: %d ms uid: {%s}", p.Name(), url, p.AliveForTestUrl(url), p.LastDelayForTestUrl(url), uid)
-			return nil
+		probes = append(probes, probequeue.Probe{
+			Proxy:    proxy,
+			URL:      url,
+			Expected: expectedStatus,
+			Timeout:  hc.timeout,
 		})
 	}
+
+	if len(probes) == 0 {
+		return
+	}
+
+	// The whole provider is one check of the shared queue: it is served
+	// round-robin beside the group sweeps instead of running beside them, and
+	// a member another check already measures is not measured twice.
+	b.Go(func() error {
+		for _, probe := range probes {
+			log.Debugln("Health Checking, proxy: %s, url: %s, id: {%s}", probe.Proxy.Name(), url, uid)
+		}
+		check := probequeue.Submit("provider "+uid, probes, func(result probequeue.Result) {
+			log.Debugln("Health Checked, proxy: %s, url: %s, alive: %t, delay: %d ms uid: {%s}", result.Name, url, result.Err == nil, result.Delay, uid)
+		})
+		check.Wait(hc.ctx)
+		return nil
+	})
 }
 
 func (hc *HealthCheck) close() {
