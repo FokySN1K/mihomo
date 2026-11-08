@@ -321,6 +321,42 @@ func BuildRemovedX25519MLKEM768HandshakeState(c *UConn) error {
 	return nil
 }
 
+// SpecWithX25519MLKEM768 answers a client hello of fingerprint with the
+// post-quantum key share added, or nil when there is nothing to add: the
+// preset already offers the group, it carries no key share, or uTLS builds
+// the spec per connection (randomized). The presets recorded before browsers
+// enabled ML-KEM send a hello of 500-600 bytes, and a DPI that expects the
+// traffic of a current browser drops it, while xray sends 1.8 KB for the very
+// same fingerprint.
+func SpecWithX25519MLKEM768(fingerprint UClientHelloID) (*utls.ClientHelloSpec, error) {
+	switch fingerprint.Client {
+	case utls.HelloRandomized.Client, utls.HelloRandomizedALPN.Client, utls.HelloRandomizedNoALPN.Client:
+		return nil, nil
+	}
+	spec, err := utls.UTLSIdToSpec(fingerprint)
+	if err != nil {
+		return nil, err
+	}
+	var curves *utls.SupportedCurvesExtension
+	var shares *utls.KeyShareExtension
+	for _, extension := range spec.Extensions {
+		switch ext := extension.(type) {
+		case *utls.SupportedCurvesExtension:
+			curves = ext
+		case *utls.KeyShareExtension:
+			shares = ext
+		}
+	}
+	if curves == nil || shares == nil || slices.Contains(curves.Curves, utls.X25519MLKEM768) {
+		return nil, nil
+	}
+	// Browsers offer the hybrid group first and share a key for it, so the
+	// hello only grows the way the real one grew when ML-KEM arrived.
+	curves.Curves = append([]utls.CurveID{utls.X25519MLKEM768}, curves.Curves...)
+	shares.KeyShares = append([]utls.KeyShare{{Group: utls.X25519MLKEM768}}, shares.KeyShares...)
+	return &spec, nil
+}
+
 func GetTLSConnectionState(conn net.Conn) (tlsState tls.ConnectionState) {
 	switch tlsConn := conn.(type) {
 	case interface{ ConnectionState() tls.ConnectionState }:
