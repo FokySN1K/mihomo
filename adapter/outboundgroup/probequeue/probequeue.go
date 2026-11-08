@@ -366,7 +366,6 @@ func (q *queue) popRingLocked(ring *[]*batch, cursor *int) (probeItem, bool) {
 func (q *queue) runProbe(item probeItem) {
 	delay, err := measure(item.entry.probe)
 	result := Result{Name: item.entry.probe.Proxy.Name(), Delay: delay, Err: err}
-	logProbe(result)
 
 	// The slot is freed before the result is delivered: the callback may take
 	// a group lock, and the next probe must not wait for it. Every check that
@@ -390,22 +389,7 @@ func (q *queue) runProbe(item probeItem) {
 // it submits can always find a free slot.
 func runInline(b *batch, probe Probe) {
 	delay, err := measure(probe)
-	result := Result{Name: probe.Proxy.Name(), Delay: delay, Err: err}
-	logProbe(result)
-	finish(b, result)
-}
-
-// logProbe records what one measurement answered. A failed probe used to leave
-// nothing behind but a counter, so a profile that showed timeouts in the UI
-// could not be told apart from a wrong node, a blocked address or a dead
-// resolver. The name identifies the member and the error the dial failure that
-// produced it, which is where the address and the reason both come from.
-func logProbe(result Result) {
-	if result.Err != nil {
-		log.Debugln("Probe failed: %s: %v", result.Name, result.Err)
-		return
-	}
-	log.Debugln("Probe ok: %s: %dms", result.Name, result.Delay)
+	finish(b, Result{Name: probe.Proxy.Name(), Delay: delay, Err: err})
 }
 
 func measure(probe Probe) (uint16, error) {
