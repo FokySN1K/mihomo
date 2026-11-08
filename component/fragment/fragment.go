@@ -32,6 +32,18 @@ type Config struct {
 	Packets string `proxy:"packets,omitempty"` // only "tlshello" is implemented
 }
 
+// DefaultConfig is the xray FinalMask preset that subscriptions publish for a
+// REALITY node whose server name is a bare IP: the ClientHello is split into
+// 10-20 byte pieces with no delay, so a DPI never reads the name in it.
+func DefaultConfig() *Config {
+	return &Config{
+		Enabled: true,
+		Length:  "10-20",
+		Delay:   "0",
+		Packets: "tlshello",
+	}
+}
+
 // Conn splits the first TLS record into pieces. A middlebox that parses the
 // handshake out of one segment never sees the whole server name, while the peer
 // reassembles it from the stream. Every write after that record, and every
