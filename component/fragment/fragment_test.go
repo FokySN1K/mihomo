@@ -60,7 +60,7 @@ func clientHello(payload int) []byte {
 	return append(record, bytes.Repeat([]byte{0x2a}, payload)...)
 }
 
-func TestClientHelloLeavesInRecords(t *testing.T) {
+func TestClientHelloLeavesInOneWrite(t *testing.T) {
 	raw := &fakeConn{}
 	conn := NewConn(raw, &Config{Enabled: true, Length: "10-20", Delay: "0", Packets: "tlshello"})
 	hello := clientHello(300)
@@ -69,12 +69,12 @@ func TestClientHelloLeavesInRecords(t *testing.T) {
 	if err != nil || n != len(hello) {
 		t.Fatalf("Write = %d, %v; want %d, nil", n, err, len(hello))
 	}
-	if len(raw.writes) < 2 {
-		t.Fatalf("the handshake left in %d write(s), want it split", len(raw.writes))
+	if len(raw.writes) != 1 {
+		t.Fatalf("the handshake left in %d write(s), want 1", len(raw.writes))
 	}
-	payloads := recordPayloads(t, raw.flat())
-	if len(payloads) != len(raw.writes) {
-		t.Fatalf("%d writes carry %d records, want one record per write", len(raw.writes), len(payloads))
+	payloads := recordPayloads(t, raw.writes[0])
+	if len(payloads) < 2 {
+		t.Fatalf("the handshake left in %d record(s), want it split", len(payloads))
 	}
 	var joined []byte
 	for i, payload := range payloads {
@@ -83,6 +83,28 @@ func TestClientHelloLeavesInRecords(t *testing.T) {
 		}
 		joined = append(joined, payload...)
 	}
+	if !bytes.Equal(joined, hello[recordHeaderLen:]) {
+		t.Fatal("the records do not add up to the handshake")
+	}
+}
+
+func TestDelayKeepsRecordsInSeparateWrites(t *testing.T) {
+	raw := &fakeConn{}
+	conn := NewConn(raw, &Config{Enabled: true, Length: "10-20", Delay: "1-2", Packets: "tlshello"})
+	hello := clientHello(100)
+
+	if _, err := conn.Write(hello); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw.writes) < 2 {
+		t.Fatalf("the handshake left in %d write(s), want it split", len(raw.writes))
+	}
+	for i, write := range raw.writes {
+		if len(write) > recordHeaderLen+20 {
+			t.Fatalf("record %d is %d bytes, want at most %d", i, len(write), recordHeaderLen+20)
+		}
+	}
+	joined := bytes.Join(recordPayloads(t, raw.flat()), nil)
 	if !bytes.Equal(joined, hello[recordHeaderLen:]) {
 		t.Fatal("the records do not add up to the handshake")
 	}
@@ -118,10 +140,14 @@ func TestTrafficAfterTheHandshakeInTheSameWriteLeavesAsIs(t *testing.T) {
 	if n, err := conn.Write(write); err != nil || n != len(write) {
 		t.Fatalf("Write = %d, %v; want %d, nil", n, err, len(write))
 	}
-	if last := raw.writes[len(raw.writes)-1]; !bytes.Equal(last, tail) {
-		t.Fatalf("the tail left as % x, want % x", last, tail)
+	if len(raw.writes) != 1 {
+		t.Fatalf("the write left in %d write(s), want 1", len(raw.writes))
 	}
-	joined := bytes.Join(recordPayloads(t, bytes.Join(raw.writes[:len(raw.writes)-1], nil)), nil)
+	stream := raw.writes[0]
+	if !bytes.HasSuffix(stream, tail) {
+		t.Fatalf("the stream does not end with % x", tail)
+	}
+	joined := bytes.Join(recordPayloads(t, stream[:len(stream)-len(tail)]), nil)
 	if !bytes.Equal(joined, hello[recordHeaderLen:]) {
 		t.Fatal("the records do not add up to the handshake")
 	}
@@ -154,14 +180,12 @@ func TestHeaderSplitAcrossWrites(t *testing.T) {
 	if n, err := conn.Write(hello[2:]); err != nil || n != len(hello)-2 {
 		t.Fatalf("second Write = %d, %v; want %d, nil", n, err, len(hello)-2)
 	}
+	if len(raw.writes) != 1 {
+		t.Fatalf("the handshake left in %d write(s), want 1", len(raw.writes))
+	}
 	joined := bytes.Join(recordPayloads(t, raw.flat()), nil)
 	if !bytes.Equal(joined, hello[recordHeaderLen:]) {
 		t.Fatal("the records do not add up to the handshake")
-	}
-	for i, write := range raw.writes {
-		if len(write) > recordHeaderLen+20 {
-			t.Fatalf("record %d is %d bytes, want at most %d", i, len(write), recordHeaderLen+20)
-		}
 	}
 }
 

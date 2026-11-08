@@ -43,8 +43,10 @@ type Config struct {
 // A middlebox that parses one record to find the server name never sees the
 // whole handshake, while the peer reassembles it from the stream: TLS allows a
 // handshake message to span records, so this is what xray does for `fm`.
-// Cutting the same record into tcp segments is not enough, because a DPI that
-// reassembles the stream sees exactly the bytes the client started with.
+// The run leaves in a single write, the way FinalMask sends it: the DPI on
+// this path drops a hello spread over many small TCP segments even when every
+// record is small. A configured delay needs the writes apart and is honoured
+// one record at a time.
 // Every write after that record, and every connection whose first write is not
 // a TLS handshake, passes through as is.
 type Conn struct {
@@ -147,6 +149,27 @@ func (c *Conn) writeRecords(n int) (int, error) {
 
 	record := make([]byte, recordHeaderLen+c.maxLength)
 	record[0], record[1], record[2] = tlsHandshake, versionHigh, versionLow
+
+	// Without a delay the whole run goes in one write. A middlebox on this
+	// path drops the hello when the records trickle out as separate
+	// segments, and only the split into small records matters to TLS, not
+	// the number of writes.
+	if c.maxDelay == 0 {
+		out := make([]byte, 0, len(payload)+len(tail)+recordHeaderLen*(len(payload)/c.minLength+1))
+		for sent := 0; sent < len(payload); {
+			size := c.pieceSize(len(payload) - sent)
+			record[3], record[4] = byte(size>>8), byte(size)
+			copy(record[recordHeaderLen:recordHeaderLen+size], payload[sent:sent+size])
+			out = append(out, record[:recordHeaderLen+size]...)
+			sent += size
+		}
+		out = append(out, tail...)
+		if _, err := c.Conn.Write(out); err != nil {
+			return 0, err
+		}
+		return n, nil
+	}
+
 	for sent := 0; sent < len(payload); {
 		size := c.pieceSize(len(payload) - sent)
 		record[3], record[4] = byte(size>>8), byte(size)
@@ -155,7 +178,7 @@ func (c *Conn) writeRecords(n int) (int, error) {
 			return 0, err
 		}
 		sent += size
-		if sent < len(payload) && c.maxDelay > 0 {
+		if sent < len(payload) {
 			time.Sleep(c.pieceDelay())
 		}
 	}
