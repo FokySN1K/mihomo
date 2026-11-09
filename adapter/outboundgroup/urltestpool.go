@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"sort"
 	"sync"
 	"time"
@@ -14,6 +15,8 @@ import (
 	"github.com/metacubex/mihomo/common/callback"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
+	"github.com/metacubex/mihomo/component/iface"
+	"github.com/metacubex/mihomo/component/reputation"
 	C "github.com/metacubex/mihomo/constant"
 	P "github.com/metacubex/mihomo/constant/provider"
 	"github.com/metacubex/mihomo/log"
@@ -59,6 +62,36 @@ const (
 	// urlTestPoolPreWarmWait bounds that wait. A provider that takes longer
 	// leaves the group on the old path, where the first dial starts the check.
 	urlTestPoolPreWarmWait = 30 * time.Second
+	// urlTestPoolMaxQuickBackoff caps how far the quick checks stretch while
+	// the pool keeps measuring nothing alive: an outage must not cost a sweep
+	// of the pool every interval when every member is already known dead.
+	urlTestPoolMaxQuickBackoff = 30 * time.Minute
+	// urlTestPoolMaxFullBackoff caps the pause between two full sweeps of a
+	// pool that has nothing alive. A full sweep probes every candidate of the
+	// providers, so a device without a route must not repeat it every full
+	// interval.
+	urlTestPoolMaxFullBackoff = 6 * time.Hour
+	// urlTestPoolCanaryProbes is how many members the canary probe measures
+	// before a postponed full sweep is released.
+	urlTestPoolCanaryProbes = 3
+	// urlTestPoolCanaryTimeout bounds one canary probe: the canary exists to
+	// tell a comeback from an outage cheaply, so a slow answer is no answer.
+	urlTestPoolCanaryTimeout = 1500 * time.Millisecond
+	// urlTestPoolPruneAfterEmptySweeps is how many consecutive empty full
+	// sweeps make the sweep skip the nodes below the suspect band of the
+	// reputation.
+	urlTestPoolPruneAfterEmptySweeps = 2
+)
+
+// poolCheckKind selects what a scheduled check measures: the pool members only
+// (quick), every candidate of the providers (full), or the few members worth
+// one cheap probe while the outage backoff postpones a full sweep (canary).
+type poolCheckKind int
+
+const (
+	poolQuickCheck poolCheckKind = iota
+	poolFullCheck
+	poolCanaryCheck
 )
 
 type URLTestPoolOption struct {
@@ -119,6 +152,10 @@ type URLTestPool struct {
 	attemptTimeout  time.Duration
 	recoveryWait    time.Duration
 	lazy            bool
+	// reputation remembers how the nodes served real traffic: the store is
+	// shared by every group, so a node that failed in one group sinks in the
+	// recovery scan of the others as well.
+	reputation *reputation.Store
 
 	mu       sync.RWMutex
 	selected string
@@ -147,6 +184,17 @@ type URLTestPool struct {
 	// change, so the next test moves on to the best candidates of the whole
 	// list instead of replaying the same dead members.
 	recoveryMisses int
+	// emptyStreak counts consecutive full sweeps that measured nothing alive.
+	// It stretches the quick checks and the pause between full sweeps, and
+	// after urlTestPoolPruneAfterEmptySweeps it narrows the sweep to the nodes
+	// that have not sunk below the suspect band of the reputation.
+	emptyStreak int
+	// nextFullAt is when the next full sweep may run while the pool is in an
+	// outage. A zero value means no backoff: only the schedule decides.
+	nextFullAt time.Time
+	// networkGen is the network generation the pool last saw. A new generation
+	// drops the backoff, so the first check on the new network runs at once.
+	networkGen uint64
 	// warmCh is open while a full check is running and is closed once the first
 	// measured member is published; checkStart anchors the first-result wait, so
 	// the whole check cycle never delays dials longer than the cap.
@@ -160,6 +208,9 @@ type URLTestPool struct {
 	// a provider that finished loading before the group subscribed; a test
 	// stretches it to isolate the wake-up a provider change gives.
 	preWarmRecheck time.Duration
+	// backoffJitter spreads the retried sweeps of the pools that woke up
+	// together; a test substitutes a deterministic one.
+	backoffJitter func(time.Duration) time.Duration
 
 	testing      atomic.Bool
 	lastQuick    atomic.TypedValue[time.Time]
@@ -511,7 +562,7 @@ func (u *URLTestPool) URLTest(ctx context.Context, url string, expectedStatus ut
 		return u.GroupBase.URLTest(ctx, url, expectedStatus)
 	}
 
-	done, _ := u.beginCheck(true)
+	done, _ := u.beginCheck(poolFullCheck)
 	u.waitCheck(ctx, done)
 	return u.lastResultsCopy(), nil
 }
@@ -561,12 +612,28 @@ func (u *URLTestPool) PoolCheck(ctx context.Context) (map[string]uint16, error) 
 	return results, nil
 }
 
-// parentCheck sweeps every candidate on the caller's budget and rebuilds the
-// pool from what it measured. It is the answer for a pool that holds no member
-// to measure: the parent asks whether the pool can carry traffic at all, and it
-// cannot outlive its own probe budget.
+// parentCheck answers a parent that asked whether the pool can carry traffic at
+// all. While the outage backoff holds, a few canary probes stand in for the
+// sweep of every candidate: the parent's budget is short, and a failure signal
+// alone is not worth sweeping the whole provider again before the schedule says
+// so. A sweep the caller cut is not a verdict about the pool, so it is neither
+// published nor recorded as a full check: taking the cut for a measurement
+// would rebuild the pool from the members one short budget reached and push the
+// next sweep further out.
 func (u *URLTestPool) parentCheck(ctx context.Context) (map[string]uint16, error) {
+	if !u.fullCheckAllowed(time.Now()) {
+		return u.canaryProbe(ctx, true)
+	}
+
 	results, err := u.GroupBase.URLTest(ctx, u.testUrl, u.expectedRanges)
+	if ctx.Err() != nil {
+		// the caller gave up: the probes it left behind keep running, but
+		// what the sweep reached so far is not the pool's measurement
+		if len(results) == 0 {
+			return nil, ctx.Err()
+		}
+		return results, nil
+	}
 	if err != nil {
 		return results, err
 	}
@@ -714,9 +781,10 @@ func udpProxies(proxies []C.Proxy) []C.Proxy {
 }
 
 func (u *URLTestPool) fastForTraffic(touch bool, usable func([]C.Proxy) []C.Proxy) (C.Proxy, bool) {
-	// with lazy enabled the checks are driven only by real traffic,
-	// but the very first observation always starts the initial full check
-	if touch || !u.lazy || !u.hasFullCheck.Load() {
+	// with lazy enabled the checks are driven only by real traffic: reading the
+	// group state (Now/MarshalJSON) must never start a test, not even the very
+	// first one after a start, so a launch without traffic stays silent.
+	if touch || !u.lazy {
 		u.maybeScheduleCheck()
 	}
 
@@ -739,7 +807,11 @@ func (u *URLTestPool) fastForTraffic(touch bool, usable func([]C.Proxy) []C.Prox
 		return last, true
 	}
 
-	u.requestFullCheckOnExhaustion()
+	// the emergency test belongs to traffic as well: a read of an empty lazy
+	// pool reports the state and leaves the checks to the dial
+	if touch || !u.lazy {
+		u.requestFullCheckOnExhaustion()
+	}
 	return proxy, true
 }
 
@@ -792,7 +864,7 @@ func (u *URLTestPool) pickFast(proxies []C.Proxy) (C.Proxy, bool) {
 	}
 	if best == nil {
 		u.fastNode = nil
-		return proxies[0], exhausted
+		return u.bestGuessLocked(proxies), exhausted
 	}
 
 	if u.fastNode != nil && u.fastNode.AliveForTestUrl(u.testUrl) &&
@@ -824,6 +896,30 @@ func (u *URLTestPool) bestAliveLocked(candidates []C.Proxy, skipSuspicious bool)
 		if best == nil || delay < bestDelay {
 			best = proxy
 			bestDelay = delay
+			continue
+		}
+		// Nothing measured yet: every candidate reports the max delay, so the
+		// reputation decides which one a cold dial leaves on. Once a check has
+		// run, the max delay of an alive member means something else and the
+		// measured order must not be overridden.
+		if delay == bestDelay && delay == 0xffff && !u.hasFullCheck.Load() &&
+			u.reputation.Score(proxy.Name()) > u.reputation.Score(best.Name()) {
+			best = proxy
+		}
+	}
+	return best
+}
+
+// bestGuessLocked returns the member to dial when nothing is measured alive:
+// the one with the best reputation, so a cold start of a lazy group does not
+// blindly dial the first proxy of the list.
+func (u *URLTestPool) bestGuessLocked(proxies []C.Proxy) C.Proxy {
+	best := proxies[0]
+	bestScore := u.reputation.Score(best.Name())
+	for _, proxy := range proxies[1:] {
+		if score := u.reputation.Score(proxy.Name()); score > bestScore {
+			best = proxy
+			bestScore = score
 		}
 	}
 	return best
@@ -841,6 +937,9 @@ func (u *URLTestPool) isSuspiciousLocked(name string) bool {
 func (u *URLTestPool) onProxyFailed(proxy C.Proxy, err error) {
 	if shouldTrackDialFailure(proxy.Type(), err) {
 		u.markSuspicious(proxy.Name())
+		if tracksNodeReputation(proxy.Type()) {
+			u.reputation.DialFailed(proxy.Name())
+		}
 	}
 	u.onDialFailed(proxy.Type(), err, u.healthCheck)
 }
@@ -861,7 +960,7 @@ func (u *URLTestPool) healthCheck() {
 	if last, ok := u.lastFull.LoadOk(); ok && time.Since(last) < u.interval {
 		return
 	}
-	u.scheduleCheck(true)
+	u.scheduleCheck(u.allowedCheckKind(poolFullCheck))
 }
 
 func (u *URLTestPool) markSuspicious(name string) {
@@ -912,19 +1011,105 @@ func (u *URLTestPool) markFor(marks *map[string]time.Time, name string, ttl time
 }
 
 func (u *URLTestPool) maybeScheduleCheck() {
+	u.dropBackoffOnNetworkChange()
+	u.dropBackoffOnProviderUpdate()
+
 	if !u.hasFullCheck.Load() {
-		u.scheduleCheck(true)
+		// a cold pool has nothing measured yet: its first full check is the
+		// very thing the backoff cannot postpone
+		u.scheduleCheck(poolFullCheck)
 		return
 	}
 
 	now := time.Now()
 	if last, ok := u.lastFull.LoadOk(); !ok || now.Sub(last) >= u.fullInterval {
-		u.scheduleCheck(true)
+		if u.fullCheckAllowed(now) {
+			u.scheduleCheck(poolFullCheck)
+			return
+		}
+	}
+	if last, ok := u.lastQuick.LoadOk(); !ok || now.Sub(last) >= u.quickInterval() {
+		u.scheduleCheck(poolQuickCheck)
+	}
+}
+
+// fullCheckAllowed reports whether the outage backoff lets a full sweep run
+// now. Outside the backoff only the schedule decides.
+func (u *URLTestPool) fullCheckAllowed(now time.Time) bool {
+	u.mu.RLock()
+	next := u.nextFullAt
+	u.mu.RUnlock()
+	return next.IsZero() || !now.Before(next)
+}
+
+// allowedCheckKind downgrades a full sweep to the canary probe while the
+// outage backoff holds: a failure signal alone is not worth probing every
+// candidate of the providers again before the schedule says so.
+func (u *URLTestPool) allowedCheckKind(kind poolCheckKind) poolCheckKind {
+	if kind == poolFullCheck && !u.fullCheckAllowed(time.Now()) {
+		return poolCanaryCheck
+	}
+	return kind
+}
+
+// quickInterval is the delay between two quick checks. While the pool keeps
+// measuring nothing alive every empty sweep doubles it, up to
+// urlTestPoolMaxQuickBackoff: re-measuring a dead pool only burns battery, and
+// the first alive result (or any traffic) ends the streak anyway.
+func (u *URLTestPool) quickInterval() time.Duration {
+	streak := u.emptySweepStreak()
+	if streak <= 0 {
+		return u.interval
+	}
+
+	wait := u.interval
+	for i := 0; i < streak && wait < urlTestPoolMaxQuickBackoff; i++ {
+		wait *= 2
+	}
+	if wait > urlTestPoolMaxQuickBackoff {
+		wait = urlTestPoolMaxQuickBackoff
+	}
+	if wait < u.interval {
+		return u.interval
+	}
+	return wait
+}
+
+func (u *URLTestPool) emptySweepStreak() int {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	return u.emptyStreak
+}
+
+// dropBackoffOnNetworkChange ends the outage backoff when the device moved to
+// another network: a member measured dead on the old network is not a verdict
+// on the new one.
+func (u *URLTestPool) dropBackoffOnNetworkChange() {
+	generation := iface.NetworkGeneration()
+	u.mu.RLock()
+	seen := u.networkGen
+	u.mu.RUnlock()
+	if generation == seen {
 		return
 	}
-	if last, ok := u.lastQuick.LoadOk(); !ok || now.Sub(last) >= u.interval {
-		u.scheduleCheck(false)
+
+	u.mu.Lock()
+	u.networkGen = generation
+	u.mu.Unlock()
+	u.exitBackoff("the network changed")
+}
+
+// dropBackoffOnProviderUpdate ends the outage backoff when a provider
+// published a new proxy list: a subscription that rotated its servers must not
+// wait out a backoff the old nodes earned.
+func (u *URLTestPool) dropBackoffOnProviderUpdate() {
+	if u.emptySweepStreak() == 0 {
+		return
 	}
+	if !u.ProxiesChanged() {
+		return
+	}
+	u.exitBackoff("a provider published a new proxy list")
 }
 
 // requestFullCheckOnExhaustion runs a full check when there is no usable proxy left.
@@ -933,10 +1118,11 @@ func (u *URLTestPool) maybeScheduleCheck() {
 // failed. The latter prevents a failed health check from probing the whole
 // provider on every connection.
 func (u *URLTestPool) requestFullCheckOnExhaustion() {
+	u.dropBackoffOnNetworkChange()
 	if !u.shouldRequestFullCheckOnExhaustion(time.Now()) {
 		return
 	}
-	u.scheduleCheck(true)
+	u.scheduleCheck(u.allowedCheckKind(poolFullCheck))
 }
 
 func (u *URLTestPool) shouldRequestFullCheckOnExhaustion(now time.Time) bool {
@@ -956,15 +1142,15 @@ func (u *URLTestPool) shouldRequestFullCheckOnExhaustion(now time.Time) bool {
 	return true
 }
 
-func (u *URLTestPool) scheduleCheck(full bool) {
-	u.beginCheck(full)
+func (u *URLTestPool) scheduleCheck(kind poolCheckKind) {
+	u.beginCheck(kind)
 }
 
 // beginCheck marks the pool as checking and returns the channel that is closed
 // when the check ends. started reports whether this call runs it; a check that
 // already holds the pool hands its own channel over, so an explicit test joins
 // it instead of probing the same candidates again.
-func (u *URLTestPool) beginCheck(full bool) (done <-chan struct{}, started bool) {
+func (u *URLTestPool) beginCheck(kind poolCheckKind) (done <-chan struct{}, started bool) {
 	if !u.testing.CompareAndSwap(false, true) {
 		u.mu.RLock()
 		done = u.checkDone
@@ -978,7 +1164,7 @@ func (u *URLTestPool) beginCheck(full bool) (done <-chan struct{}, started bool)
 	u.checkResults = nil
 	u.mu.Unlock()
 
-	if full {
+	if kind == poolFullCheck {
 		u.beginWarmup()
 	}
 	go func() {
@@ -992,9 +1178,12 @@ func (u *URLTestPool) beginCheck(full bool) (done <-chan struct{}, started bool)
 			close(channel)
 		}()
 		defer u.markWarm()
-		if full {
+		switch kind {
+		case poolFullCheck:
 			u.fullCheck()
-		} else {
+		case poolCanaryCheck:
+			u.canaryCheck()
+		default:
 			u.quickCheck()
 		}
 	}()
@@ -1176,7 +1365,7 @@ func (u *URLTestPool) quickCheck() {
 	u.mu.RUnlock()
 
 	if len(names) == 0 {
-		u.fullCheck()
+		u.checkWithCanary("the pool holds no member")
 		return
 	}
 
@@ -1184,7 +1373,7 @@ func (u *URLTestPool) quickCheck() {
 	poolProxies, complete := proxiesByNames(proxies, names)
 	if !complete {
 		// the proxy list has been changed, rebuild the pool
-		u.fullCheck()
+		u.checkWithCanary("the proxy list changed")
 		return
 	}
 
@@ -1197,8 +1386,8 @@ func (u *URLTestPool) quickCheck() {
 	u.lastQuick.Store(time.Now())
 
 	if len(results) == 0 {
-		log.Debugln("ProxyGroup: %s all pool proxies are unavailable, start full health check", u.Name())
-		u.fullCheck()
+		log.Debugln("ProxyGroup: %s all pool proxies are unavailable, probe the canary before the next full check", u.Name())
+		u.checkWithCanary("the quick check measured nothing")
 		return
 	}
 
@@ -1208,11 +1397,89 @@ func (u *URLTestPool) quickCheck() {
 		delete(u.cutMarks, name)
 	}
 	u.mu.Unlock()
+	u.exitBackoff("a quick check measured a member")
 
 	if u.shouldRunFullCheck(len(results), u.poolTarget(len(proxies))) {
 		log.Debugln("ProxyGroup: %s pool is underfilled for %d quick checks, start full health check", u.Name(), u.degradedChecks)
-		u.fullCheck()
+		u.checkWithCanary("the pool is underfilled")
 	}
+}
+
+// checkWithCanary is what every escalation toward a full sweep goes through:
+// the sweep runs only while the schedule allows it, and during the outage
+// backoff a cheap canary probe stands in for it. That keeps a lazy group from
+// sweeping the whole provider on every wake-up of a pool that has nothing
+// alive, which is what drained the battery of an offline device.
+func (u *URLTestPool) checkWithCanary(reason string) {
+	if u.fullCheckAllowed(time.Now()) {
+		u.fullCheck()
+		return
+	}
+	log.Debugln("ProxyGroup: %s: %s, but the outage backoff postpones the full health check: probing %d canary members", u.Name(), reason, urlTestPoolCanaryProbes)
+	u.canaryCheck()
+}
+
+// canaryCheck probes the few most promising members instead of every
+// candidate. It is the retry of an outage: one short probe per canary costs
+// almost nothing, and an answer means the network is back, which releases the
+// full sweep the backoff postponed. A canary that finds nothing leaves the
+// schedule alone, so its own retries cannot push the next sweep further out.
+func (u *URLTestPool) canaryCheck() {
+	results, _ := u.canaryProbe(context.Background(), false)
+	if len(results) == 0 {
+		return
+	}
+	u.fullCheck()
+}
+
+// canaryProbe measures the few members worth one cheap probe and publishes what
+// answered. It is the cheap stand-in for a full sweep while the outage backoff
+// holds. With release set, an answer ends the backoff and lets the postponed
+// sweep run in the background, because the caller that asked is a parent with a
+// budget of its own and cannot wait for it.
+func (u *URLTestPool) canaryProbe(ctx context.Context, release bool) (map[string]uint16, error) {
+	candidates := u.canaryCandidates()
+	if len(candidates) == 0 {
+		return nil, errNoAliveMember
+	}
+
+	timeout := time.Duration(u.testTimeout) * time.Millisecond
+	if timeout > urlTestPoolCanaryTimeout {
+		timeout = urlTestPoolCanaryTimeout
+	}
+	log.Debugln("ProxyGroup: %s probing %d canary members with a %s timeout", u.Name(), len(candidates), timeout)
+	// the canary runs in the foreground lane: a member that answers is what
+	// the very next connection leaves on
+	results, _ := u.probeProxies(ctx, candidates, timeout, true, true)
+	u.storeResults(results)
+	u.lastQuick.Store(time.Now())
+
+	if len(results) == 0 {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, errNoAliveMember
+	}
+
+	u.exitBackoff("a canary member answered")
+	if release {
+		u.scheduleCheck(poolFullCheck)
+	}
+	return results, nil
+}
+
+// canaryCandidates picks the members worth one cheap probe: the ones the next
+// full sweep would probe first, since they are the likeliest to answer.
+func (u *URLTestPool) canaryCandidates() []C.Proxy {
+	proxies := u.GetProxies(true)
+	if !u.proxiesReady(proxies) {
+		return nil
+	}
+	scan := u.orderForCheck(proxies)
+	if len(scan) > urlTestPoolCanaryProbes {
+		scan = scan[:urlTestPoolCanaryProbes]
+	}
+	return scan
 }
 
 // poolTarget is how many alive members the pool should hold: its configured
@@ -1255,6 +1522,13 @@ func (u *URLTestPool) shouldRunFullCheck(alive, target int) bool {
 // an empty pool (for example after a full outage). The check runs in
 // background and is throttled, so dials never wait for it.
 func (u *URLTestPool) noteDialSucceeded(proxy C.Proxy) {
+	if tracksNodeReputation(proxy.Type()) {
+		u.reputation.DialSucceeded(proxy.Name())
+	}
+	// the member carried traffic, so the outage is over: the next full sweep
+	// follows the usual schedule again instead of the empty-streak backoff
+	u.exitBackoff("a dial succeeded")
+
 	u.mu.Lock()
 	u.lastGood = proxy.Name()
 	empty := len(u.pool) == 0
@@ -1266,7 +1540,7 @@ func (u *URLTestPool) noteDialSucceeded(proxy C.Proxy) {
 	if last, ok := u.lastFull.LoadOk(); ok && time.Since(last) < urlTestPoolRecoveryCooldown {
 		return
 	}
-	u.scheduleCheck(true)
+	u.scheduleCheck(poolFullCheck)
 }
 
 // recoverAfterFailure joins the emergency test of the last non-empty pool and
@@ -1519,6 +1793,11 @@ func (u *URLTestPool) applyRecovery(results map[string]uint16, tested map[string
 		u.recoveryMisses++
 	}
 	u.mu.Unlock()
+	if len(results) > 0 {
+		// the emergency test found a member: the outage is over, and the
+		// postponed full sweep is due again
+		u.exitBackoff("an emergency test measured a member")
+	}
 	// Only a sweep that reached every candidate is a verdict about the pool: a
 	// test that walked all of them and found nothing may tell a parent it has
 	// nothing left, a partial one must not.
@@ -1549,15 +1828,53 @@ func (u *URLTestPool) fullCheck() {
 // probed, which is what made an outage look like a long search for a node.
 func (u *URLTestPool) orderForCheck(proxies []C.Proxy) []C.Proxy {
 	ordered := append([]C.Proxy(nil), proxies...)
+	if u.shouldPruneSuspects() {
+		// after several empty sweeps the suspect band of the reputation is no
+		// longer a hint: those nodes failed every sweep, so skipping them cuts
+		// the sweep of a large provider down to the nodes worth a probe. Every
+		// other sweep still measures all of them, so the pruning cannot starve
+		// a node that is waiting for its network to come back.
+		kept := make([]C.Proxy, 0, len(ordered))
+		for _, proxy := range ordered {
+			if u.reputation.Score(proxy.Name()) >= reputation.Suspect {
+				kept = append(kept, proxy)
+			}
+		}
+		if len(kept) > 0 {
+			ordered = kept
+		}
+	}
+	// The scores are read once instead of inside the comparator: a sweep of a
+	// large provider must not take the store lock for every comparison.
+	scores := make(map[string]int, len(ordered))
+	for _, proxy := range ordered {
+		scores[proxy.Name()] = u.reputation.Score(proxy.Name())
+	}
 	sort.SliceStable(ordered, func(i, j int) bool {
 		left := ordered[i].LastDelayForTestUrl(u.testUrl)
 		right := ordered[j].LastDelayForTestUrl(u.testUrl)
 		if left != right {
 			return left < right
 		}
+		// Every member that is not measured alive right now shares the max
+		// delay, so the reputation decides which of them is worth probing
+		// first: a node that carried traffic before is likelier to come back
+		// than one that has been failing for days.
+		if scores[ordered[i].Name()] != scores[ordered[j].Name()] {
+			return scores[ordered[i].Name()] > scores[ordered[j].Name()]
+		}
 		return ordered[i].Name() < ordered[j].Name()
 	})
 	return ordered
+}
+
+// shouldPruneSuspects reports whether a full sweep should skip the nodes below
+// the suspect band. It prunes on every other empty sweep, so their probes come
+// back periodically instead of staying skipped for the whole outage.
+func (u *URLTestPool) shouldPruneSuspects() bool {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	return u.emptyStreak >= urlTestPoolPruneAfterEmptySweeps && u.emptyStreak%2 == 0
 }
 
 func (u *URLTestPool) applyResults(results map[string]uint16) {
@@ -1567,7 +1884,69 @@ func (u *URLTestPool) applyResults(results map[string]uint16) {
 	u.lastFull.Store(now)
 	u.lastQuick.Store(now)
 	u.hasFullCheck.Store(true)
+	if len(results) == 0 {
+		u.enterEmptyBackoff(now)
+	} else {
+		u.exitBackoff("a full check measured a member")
+	}
 	u.markWarm()
+}
+
+// enterEmptyBackoff postpones the next full sweep after one that measured
+// nothing alive. Every consecutive empty sweep doubles the wait, up to
+// urlTestPoolMaxFullBackoff, and a small jitter keeps the pools of one process
+// from waking up together. A sweep that finds a member, a successful dial, a
+// provider update or a network change ends the backoff.
+func (u *URLTestPool) enterEmptyBackoff(now time.Time) {
+	u.mu.Lock()
+	u.emptyStreak++
+	wait := u.fullBackoffLocked()
+	u.nextFullAt = now.Add(wait)
+	streak := u.emptyStreak
+	u.mu.Unlock()
+
+	if streak == 1 {
+		log.Infoln("ProxyGroup: %s measured nothing alive, the next full health check is postponed by %s", u.Name(), wait)
+	} else {
+		log.Debugln("ProxyGroup: %s measured nothing alive for %d full checks in a row, the next one is postponed by %s", u.Name(), streak, wait)
+	}
+}
+
+// fullBackoffLocked is the wait of the current empty streak: the full interval
+// doubled per empty sweep, capped, with jitter.
+func (u *URLTestPool) fullBackoffLocked() time.Duration {
+	wait := u.fullInterval
+	for streak := 1; streak < u.emptyStreak; streak++ {
+		if wait >= urlTestPoolMaxFullBackoff {
+			break
+		}
+		wait *= 2
+	}
+	if wait > urlTestPoolMaxFullBackoff {
+		wait = urlTestPoolMaxFullBackoff
+	}
+	if u.backoffJitter != nil {
+		wait += u.backoffJitter(wait)
+	}
+	return wait
+}
+
+// exitBackoff drops the outage backoff. It is safe to call on a pool that is
+// not in one, and it is cheap enough for the dial path.
+func (u *URLTestPool) exitBackoff(reason string) {
+	u.mu.Lock()
+	streak := u.emptyStreak
+	if streak == 0 && u.nextFullAt.IsZero() {
+		u.mu.Unlock()
+		return
+	}
+	u.emptyStreak = 0
+	u.nextFullAt = time.Time{}
+	u.lastEmptyFull = time.Time{}
+	u.recoveryMisses = 0
+	u.mu.Unlock()
+
+	log.Infoln("ProxyGroup: %s left the outage backoff (empty full checks: %d): %s", u.Name(), streak, reason)
 }
 
 // publishPartial rebuilds the pool from the results collected so far, so a dial
@@ -1705,6 +2084,9 @@ func (u *URLTestPool) probeProxies(ctx context.Context, proxies []C.Proxy, timeo
 				// holding a slot until the check ends
 				u.publishPartial(results, tested)
 			}
+			if !errors.Is(result.Err, context.Canceled) {
+				u.reputation.ProbeFailed(result.Name)
+			}
 			return
 		}
 
@@ -1815,6 +2197,26 @@ func shouldTrackDialFailure(adapterType C.AdapterType, err error) bool {
 	return !errors.Is(err, C.ErrNotSupport)
 }
 
+// tracksNodeReputation reports whether a failure or a success of this adapter
+// says anything about a node: the built-in outbounds are not nodes of a
+// subscription and must not take space in the store.
+func tracksNodeReputation(adapterType C.AdapterType) bool {
+	switch adapterType {
+	case C.Direct, C.Compatible, C.Reject, C.Pass, C.RejectDrop:
+		return false
+	}
+	return true
+}
+
+// randomBackoffJitter spreads the retried sweeps by up to a tenth of the wait,
+// so the pools of one process do not wake up at the same moment.
+func randomBackoffJitter(wait time.Duration) time.Duration {
+	if wait <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int63n(int64(wait/10) + 1))
+}
+
 func NewURLTestPool(option GroupCommonOption, poolOption URLTestPoolOption, emptyFallback C.Proxy, providers []P.ProxyProvider) (*URLTestPool, error) {
 	if emptyFallback == nil {
 		return nil, errors.New("empty fallback proxy not exist")
@@ -1919,7 +2321,10 @@ func NewURLTestPool(option GroupCommonOption, poolOption URLTestPoolOption, empt
 		attemptTimeout:  attemptTimeout,
 		recoveryWait:    urlTestPoolRecoveryWait,
 		lazy:            option.Lazy,
+		reputation:      reputation.Default(),
 		preWarmRecheck:  urlTestPoolPreWarmRecheck,
+		backoffJitter:   randomBackoffJitter,
+		networkGen:      iface.NetworkGeneration(),
 		// a member that failed a dial is skipped until the next quick check
 		// could have re-measured it
 		suspiciousTTL: interval,

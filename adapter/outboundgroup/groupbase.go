@@ -243,6 +243,24 @@ func (gb *GroupBase) GetProxies(touch bool) []C.Proxy {
 	return proxies
 }
 
+// ProxiesChanged reports whether a provider of the group published a new proxy
+// list since the last GetProxies call. It compares the versions only, so a
+// caller that asks on every schedule pays no rebuild.
+func (gb *GroupBase) ProxiesChanged() bool {
+	gb.getProxiesMutex.Lock()
+	defer gb.getProxiesMutex.Unlock()
+
+	if len(gb.providerVersions) != len(gb.providers) {
+		return true
+	}
+	for i, pd := range gb.providers {
+		if gb.providerVersions[i] != pd.Version() {
+			return true
+		}
+	}
+	return false
+}
+
 // URLTest measures every member of the group. The probes go through the shared
 // probe queue, so a group test no longer adds its own fan-out on top of the
 // checks of every other group; the member timeout is the only budget of a

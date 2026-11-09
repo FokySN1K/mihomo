@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"time"
 
+	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/singledo"
 	"github.com/metacubex/mihomo/component/iface/anet"
 
@@ -148,6 +149,22 @@ func IsLocalIp(addr netip.Addr) (bool, error) {
 
 func FlushCache() {
 	caches.Reset()
+}
+
+// networkGeneration advances on every notified network change.
+var networkGeneration atomic.Uint64
+
+// NotifyNetworkChanged tells the rest of the process that the device moved to
+// another network or that its default interface changed. The consumers do not
+// subscribe to the change: each one compares NetworkGeneration with the value
+// it last saw on its own schedule, which costs one atomic load per check.
+func NotifyNetworkChanged() {
+	networkGeneration.Add(1)
+}
+
+// NetworkGeneration returns the counter NotifyNetworkChanged advances.
+func NetworkGeneration() uint64 {
+	return networkGeneration.Load()
 }
 
 func (iface *Interface) PickIPv4Addr(destination netip.Addr) (netip.Prefix, error) {

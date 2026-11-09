@@ -130,6 +130,9 @@ profile: # 存储 select 选择记录
   # 持久化 fake-ip
   store-fake-ip: true
 
+  # 持久化节点信誉，重启后仍优先尝试此前稳定可用的节点
+  store-reputation: false
+
 # Tun 配置
 tun:
   enable: false

@@ -16,6 +16,8 @@ import (
 	"github.com/metacubex/mihomo/adapter/provider"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
+	"github.com/metacubex/mihomo/component/iface"
+	"github.com/metacubex/mihomo/component/reputation"
 	C "github.com/metacubex/mihomo/constant"
 	P "github.com/metacubex/mihomo/constant/provider"
 
@@ -353,6 +355,114 @@ func TestURLTestPoolPoolCheckPublishesWhatItMeasured(t *testing.T) {
 	require.Equal(t, map[string]uint16{"fast": 10}, results)
 	require.Equal(t, []string{"fast", "slow"}, poolNames(pool),
 		"the measured member goes first and the member the check did not reach stays in the pool")
+}
+
+// A parent that asks an exhausted pool during the outage backoff must not buy
+// a sweep of every candidate again: the canary answers it, and a canary that
+// found nothing leaves the schedule exactly as it was.
+func TestURLTestPoolParentCheckHonorsOutageBackoff(t *testing.T) {
+	var probes atomic.Int32
+
+	members := make([]C.Proxy, 0, 5)
+	for i := 0; i < 5; i++ {
+		members = append(members, newPoolControlledProxy(fmt.Sprintf("dead%02d", i), nil, func(context.Context) (uint16, error) {
+			probes.Add(1)
+			return 0, errors.New("probe failed")
+		}))
+	}
+
+	pool := newExhaustedPoolForTest(t, members...)
+	swept := time.Now().Add(-time.Hour)
+	release := time.Now().Add(time.Hour)
+	pool.lastFull.Store(swept)
+	pool.mu.Lock()
+	pool.emptyStreak = 1
+	pool.nextFullAt = release
+	pool.mu.Unlock()
+
+	results, err := pool.PoolCheck(context.Background())
+	require.ErrorIs(t, err, errNoAliveMember)
+	require.Nil(t, results)
+	require.Equal(t, int32(urlTestPoolCanaryProbes), probes.Load(),
+		"a parent check during the backoff must probe the canary, not every candidate")
+
+	lastFull, ok := pool.lastFull.LoadOk()
+	require.True(t, ok)
+	require.Equal(t, swept, lastFull, "a canary probe is not a full sweep and must not consume the schedule")
+
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+	require.Equal(t, 1, pool.emptyStreak, "a canary that found nothing must not deepen the backoff")
+	require.Equal(t, release, pool.nextFullAt)
+}
+
+// A sweep the parent cut is not a verdict about the pool: the members the short
+// budget reached must not rebuild the pool, and the cut must not count as the
+// full check the schedule waits for.
+func TestURLTestPoolParentCheckCutSweepIsNotAVerdict(t *testing.T) {
+	held := newPoolRelease()
+	t.Cleanup(held.close)
+
+	fast := newPoolControlledProxy("fast", nil, poolProbeOk(10))
+	slow := newPoolControlledProxy("slow", nil, poolProbeHeld(held))
+	pool := newExhaustedPoolForTest(t, fast, slow)
+
+	swept := time.Now().Add(-time.Hour)
+	pool.lastFull.Store(swept)
+	pool.lastQuick.Store(swept)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	results, err := pool.PoolCheck(ctx)
+	require.NoError(t, err)
+	require.Equal(t, map[string]uint16{"fast": 10}, results)
+	require.Equal(t, []string{"gone"}, poolNames(pool),
+		"a cut sweep must not rebuild the pool from the members one short budget reached")
+
+	lastFull, ok := pool.lastFull.LoadOk()
+	require.True(t, ok)
+	require.Equal(t, swept, lastFull, "a cut sweep must not count as the scheduled full check")
+
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+	require.Zero(t, pool.emptyStreak, "a cut sweep must not start the outage backoff")
+	require.True(t, pool.nextFullAt.IsZero())
+}
+
+// A canary that answers ends the outage backoff and releases the sweep the
+// backoff postponed, so a parent that caught the network coming back does not
+// leave the pool waiting out the rest of the backoff.
+func TestURLTestPoolParentCheckCanaryAnswerReleasesTheSweep(t *testing.T) {
+	members := make([]C.Proxy, 0, 4)
+	for i := 0; i < 4; i++ {
+		members = append(members, newPoolControlledProxy(fmt.Sprintf("alive%02d", i), nil, poolProbeOk(uint16(10+i))))
+	}
+
+	pool := newExhaustedPoolForTest(t, members...)
+	swept := time.Now().Add(-2 * time.Hour)
+	pool.lastFull.Store(swept)
+	pool.mu.Lock()
+	pool.emptyStreak = 2
+	pool.nextFullAt = time.Now().Add(time.Hour)
+	pool.mu.Unlock()
+
+	results, err := pool.PoolCheck(context.Background())
+	require.NoError(t, err)
+	require.Len(t, results, urlTestPoolCanaryProbes)
+
+	pool.mu.RLock()
+	streak := pool.emptyStreak
+	next := pool.nextFullAt
+	pool.mu.RUnlock()
+	require.Zero(t, streak, "a canary member that answered ends the outage backoff")
+	require.True(t, next.IsZero())
+
+	require.Eventually(t, func() bool {
+		last, ok := pool.lastFull.LoadOk()
+		return ok && last.After(swept)
+	}, 2*time.Second, 10*time.Millisecond, "the answer must release the full sweep the backoff postponed")
+	require.Len(t, poolNames(pool), 4, "the released sweep must rebuild the pool from every candidate")
 }
 
 // Every sweep of every pool shares one probe queue: the process never exceeds
@@ -783,6 +893,9 @@ func newPoolForTest(t *testing.T, opt URLTestPoolOption, proxies ...C.Proxy) *UR
 	pool, err := NewURLTestPool(GroupCommonOption{Name: "pool", Interval: 300},
 		opt, newPoolEmptyFallback(), []P.ProxyProvider{pd})
 	require.NoError(t, err)
+	// every test gets its own history, so the order of the tests cannot leak
+	// into the reputation of a member of another pool
+	pool.reputation = reputation.NewStore()
 	pool.testUrl = "http://127.0.0.1:1/"
 	pool.pool = cascadeProxyNames(proxies)
 	pool.lastPool = append([]string(nil), pool.pool...)
@@ -1383,6 +1496,120 @@ func TestURLTestPoolWarmUpSkipsLazy(t *testing.T) {
 	require.False(t, pool.hasFullCheck.Load())
 }
 
+// TestURLTestPoolLazyReadStartsNoCheck guards the read path: a lazy pool stays
+// silent until real traffic asks for a check, even on the very first read of
+// its state after a start. A host polls the group list right away, and that
+// read must not wake a pool nothing dials through yet.
+func TestURLTestPoolLazyReadStartsNoCheck(t *testing.T) {
+	var probes atomic.Int32
+	member := newPoolControlledProxy("member", nil, func(context.Context) (uint16, error) {
+		probes.Add(1)
+		return 10, nil
+	})
+
+	pd, err := provider.NewCompatibleProvider("pool", []C.Proxy{member},
+		provider.NewHealthCheck(nil, "", 0, 0, false, nil))
+	require.NoError(t, err)
+
+	pool, err := NewURLTestPool(GroupCommonOption{Name: "pool", Lazy: true, Interval: 300},
+		URLTestPoolOption{}, newPoolEmptyFallback(), []P.ProxyProvider{pd})
+	require.NoError(t, err)
+	pool.testUrl = "http://127.0.0.1:1/"
+
+	// the members are listed but nothing has been measured yet
+	pool.pool = []string{"member"}
+	require.Equal(t, "member", pool.Now())
+	_, err = pool.MarshalJSON()
+	require.NoError(t, err)
+
+	// the empty pool a lazy start begins with: the read must not reach for the
+	// emergency full check either
+	pool.pool = nil
+	require.Equal(t, "member", pool.Now())
+	_, err = pool.MarshalJSON()
+	require.NoError(t, err)
+
+	time.Sleep(50 * time.Millisecond)
+	require.False(t, pool.testing.Load(), "reading a lazy pool must not start a check")
+	require.False(t, pool.hasFullCheck.Load())
+	require.Zero(t, probes.Load())
+}
+
+// TestURLTestPoolLazyDialStartsCheck keeps the other half of the contract: a
+// lazy pool still checks as soon as real traffic asks for it.
+func TestURLTestPoolLazyDialStartsCheck(t *testing.T) {
+	var probes atomic.Int32
+	held := newPoolRelease()
+	t.Cleanup(held.close)
+
+	member := newPoolControlledProxy("member", nil, func(ctx context.Context) (uint16, error) {
+		probes.Add(1)
+		return poolProbeHeld(held)(ctx)
+	})
+
+	pd, err := provider.NewCompatibleProvider("pool", []C.Proxy{member},
+		provider.NewHealthCheck(nil, "", 0, 0, false, nil))
+	require.NoError(t, err)
+
+	pool, err := NewURLTestPool(GroupCommonOption{Name: "pool", Lazy: true, Interval: 300},
+		URLTestPoolOption{}, newPoolEmptyFallback(), []P.ProxyProvider{pd})
+	require.NoError(t, err)
+	pool.testUrl = "http://127.0.0.1:1/"
+
+	pool.fastForDial(true)
+
+	require.Eventually(t, func() bool { return probes.Load() > 0 }, time.Second, 5*time.Millisecond,
+		"a lazy pool must check when real traffic asks for it")
+	require.True(t, pool.testing.Load())
+}
+
+// The emergency scan must probe the nodes that carried traffic before the ones
+// that have been failing, so an outage is resolved by the first wave instead of
+// after a sweep of the whole provider.
+func TestURLTestPoolOrderForCheckPrefersTrusted(t *testing.T) {
+	trusted := newPoolControlledProxy("rep-trusted", nil, poolProbeOk(10))
+	dead := newPoolControlledProxy("rep-dead", nil, poolProbeOk(10))
+	pool := newPoolForTest(t, URLTestPoolOption{}, trusted, dead)
+
+	for i := 0; i < 3; i++ {
+		pool.reputation.DialSucceeded("rep-trusted")
+	}
+	pool.reputation.DialFailed("rep-dead")
+
+	ordered := pool.orderForCheck(pool.GetProxies(false))
+	require.Equal(t, "rep-trusted", ordered[0].Name())
+	require.Equal(t, "rep-dead", ordered[len(ordered)-1].Name())
+}
+
+// A pool with nothing measured must dial the node with the best reputation
+// instead of the first one of the list.
+func TestURLTestPoolColdPickUsesReputation(t *testing.T) {
+	first := newPoolControlledProxy("rep-first", nil, poolProbeOk(10))
+	trusted := newPoolControlledProxy("rep-best", nil, poolProbeOk(10))
+	pool := newPoolForTest(t, URLTestPoolOption{}, first, trusted)
+	pool.hasFullCheck.Store(false) // the members have never been measured
+
+	for i := 0; i < 4; i++ {
+		pool.reputation.DialSucceeded("rep-best")
+	}
+
+	proxy, _ := pool.fastForDial(false)
+	require.Equal(t, "rep-best", proxy.Name())
+}
+
+// A failed probe is evidence too: a node that does not answer a health check
+// sinks in the store without waiting for a real dial to fail.
+func TestURLTestPoolProbeFailureLowersReputation(t *testing.T) {
+	broken := newPoolControlledProxy("rep-broken", nil, func(context.Context) (uint16, error) {
+		return 0, errors.New("probe failed")
+	})
+	pool := newPoolForTest(t, URLTestPoolOption{}, broken)
+
+	_, err := pool.PoolCheck(context.Background())
+	require.Error(t, err, "a check that found nothing alive reports it")
+	require.Equal(t, -10, pool.reputation.Score("rep-broken"))
+}
+
 // The emergency test is shared with every dial that joins it, so its probes get
 // the recovery timeout and not the leftover budget of the dial that started it.
 func TestURLTestPoolRecoveryProbeKeepsItsTimeout(t *testing.T) {
@@ -1592,7 +1819,7 @@ func TestURLTestPoolManualTestJoinsRunningCheck(t *testing.T) {
 	})
 
 	pool := newPoolForTest(t, URLTestPoolOption{}, member)
-	pool.scheduleCheck(true)
+	pool.scheduleCheck(poolFullCheck)
 	select {
 	case <-started:
 	case <-time.After(time.Second):
@@ -1661,4 +1888,211 @@ func TestURLTestPoolManualTestOutlivesCaller(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return pool.lastResultsCopy()["member"] == 42 && len(poolNames(pool)) == 1
 	}, 5*time.Second, 10*time.Millisecond, "the sweep must publish its result after the caller is gone")
+}
+
+// poolOutageFixture builds a pool of members that count their probes, so a
+// test can tell a full sweep of every candidate from a canary probe of a few.
+func poolOutageFixture(t *testing.T, members int, alive ...string) (*URLTestPool, *atomic.Int32) {
+	t.Helper()
+
+	answering := make(map[string]struct{}, len(alive))
+	for _, name := range alive {
+		answering[name] = struct{}{}
+	}
+
+	var probes atomic.Int32
+	proxies := make([]C.Proxy, 0, members)
+	for i := 0; i < members; i++ {
+		name := fmt.Sprintf("n%d", i)
+		_, ok := answering[name]
+		proxies = append(proxies, newPoolControlledProxy(name, nil, func(context.Context) (uint16, error) {
+			probes.Add(1)
+			if ok {
+				return 20, nil
+			}
+			return 0, errors.New("dead")
+		}))
+	}
+
+	pool := newPoolForTest(t, URLTestPoolOption{FullInterval: 600}, proxies...)
+	pool.backoffJitter = func(time.Duration) time.Duration { return 0 }
+	return pool, &probes
+}
+
+// emptyPoolForOutage puts the pool into the state an empty full sweep leaves:
+// no member, the backoff set, and both schedules due.
+func emptyPoolForOutage(pool *URLTestPool, streak int) {
+	// a sweep has read the proxy list before it runs, so the provider versions
+	// are cached and the backoff is not dropped as "a new list arrived"
+	pool.GetProxies(false)
+	pool.mu.Lock()
+	pool.pool = nil
+	pool.emptyStreak = streak
+	pool.nextFullAt = time.Now().Add(10 * time.Minute)
+	pool.mu.Unlock()
+	pool.lastFull.Store(time.Now().Add(-pool.fullInterval - time.Second))
+	pool.lastQuick.Store(time.Now().Add(-time.Hour))
+}
+
+// An empty full sweep must postpone the next one, every empty sweep must
+// double the wait up to the cap, and a sweep that finds a member must end the
+// backoff.
+func TestURLTestPoolEmptySweepEntersBackoff(t *testing.T) {
+	pool, _ := poolOutageFixture(t, 2)
+
+	pool.fullCheck()
+	require.Equal(t, 1, pool.emptySweepStreak())
+	require.InDelta(t, pool.fullInterval.Seconds(), time.Until(pool.nextFullTime()).Seconds(), 2,
+		"the first empty sweep must postpone the next full check by the full interval")
+
+	pool.fullCheck()
+	require.Equal(t, 2, pool.emptySweepStreak())
+	require.InDelta(t, (2 * pool.fullInterval).Seconds(), time.Until(pool.nextFullTime()).Seconds(), 2,
+		"every empty sweep must double the wait")
+
+	pool.mu.Lock()
+	for streak := 1; streak <= 8; streak++ {
+		pool.emptyStreak = streak
+		wait := pool.fullBackoffLocked()
+		expected := pool.fullInterval << (streak - 1)
+		if expected > urlTestPoolMaxFullBackoff {
+			expected = urlTestPoolMaxFullBackoff
+		}
+		require.Equal(t, expected, wait)
+	}
+	pool.mu.Unlock()
+}
+
+func (u *URLTestPool) nextFullTime() time.Time {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	return u.nextFullAt
+}
+
+func TestURLTestPoolAliveSweepLeavesBackoff(t *testing.T) {
+	var alive atomic.Bool
+	member := newPoolControlledProxy("member", nil, func(context.Context) (uint16, error) {
+		if alive.Load() {
+			return 20, nil
+		}
+		return 0, errors.New("dead")
+	})
+	pool := newPoolForTest(t, URLTestPoolOption{FullInterval: 600}, member)
+	pool.backoffJitter = func(time.Duration) time.Duration { return 0 }
+
+	pool.fullCheck()
+	require.Equal(t, 1, pool.emptySweepStreak())
+
+	alive.Store(true)
+	pool.fullCheck()
+	require.Zero(t, pool.emptySweepStreak(), "a member that answers must end the backoff")
+	require.True(t, pool.nextFullTime().IsZero())
+	require.Equal(t, []string{"member"}, poolNames(pool))
+}
+
+// While the backoff holds, a due full sweep must not probe every candidate:
+// the canary measures a few of them and leaves the schedule alone.
+func TestURLTestPoolBackoffPostponesFullSweepToCanary(t *testing.T) {
+	pool, probes := poolOutageFixture(t, 6)
+	emptyPoolForOutage(pool, 1)
+
+	pool.maybeScheduleCheck()
+
+	require.Eventually(t, func() bool {
+		return !pool.testing.Load() && probes.Load() > 0
+	}, 2*time.Second, 5*time.Millisecond, "the postponed sweep must still run its canary")
+
+	require.EqualValues(t, urlTestPoolCanaryProbes, probes.Load(),
+		"a postponed full sweep must probe the canary only, not every candidate")
+	require.Equal(t, 1, pool.emptySweepStreak(), "a canary that finds nothing must not push the next sweep out")
+	require.False(t, pool.nextFullTime().IsZero(), "the postponed sweep must keep its time")
+}
+
+// A canary that answers means the network is back: the full sweep the backoff
+// postponed must run and rebuild the pool.
+func TestURLTestPoolCanaryReleasesFullSweep(t *testing.T) {
+	pool, probes := poolOutageFixture(t, 6, "n0", "n1", "n2")
+	emptyPoolForOutage(pool, 1)
+
+	pool.maybeScheduleCheck()
+
+	require.Eventually(t, func() bool {
+		return pool.emptySweepStreak() == 0 && len(poolNames(pool)) == 3
+	}, 5*time.Second, 10*time.Millisecond,
+		"a canary answer must release the full sweep and rebuild the pool")
+	require.GreaterOrEqual(t, probes.Load(), int32(6), "the released sweep must measure every candidate")
+	require.True(t, pool.nextFullTime().IsZero())
+}
+
+func TestURLTestPoolQuickIntervalStretchesWhileNothingAlive(t *testing.T) {
+	pool, err := NewURLTestPool(GroupCommonOption{Name: "pool", Interval: 300}, URLTestPoolOption{}, newPoolEmptyFallback(), nil)
+	require.NoError(t, err)
+
+	require.Equal(t, 300*time.Second, pool.quickInterval())
+	pool.emptyStreak = 1
+	require.Equal(t, 600*time.Second, pool.quickInterval())
+	pool.emptyStreak = 2
+	require.Equal(t, 1200*time.Second, pool.quickInterval())
+	pool.emptyStreak = 3
+	require.Equal(t, urlTestPoolMaxQuickBackoff, pool.quickInterval(), "the stretch is capped")
+	pool.emptyStreak = 10
+	require.Equal(t, urlTestPoolMaxQuickBackoff, pool.quickInterval())
+}
+
+func TestURLTestPoolNetworkChangeDropsBackoff(t *testing.T) {
+	pool, _ := poolOutageFixture(t, 2)
+	pool.fullCheck()
+	require.Equal(t, 1, pool.emptySweepStreak())
+
+	iface.NotifyNetworkChanged()
+	pool.dropBackoffOnNetworkChange()
+	require.Zero(t, pool.emptySweepStreak())
+	require.True(t, pool.nextFullTime().IsZero(), "a network change must let the next full sweep run at once")
+
+	// a second call without a new generation must keep the state as it is
+	pool.mu.Lock()
+	pool.emptyStreak = 2
+	pool.mu.Unlock()
+	pool.dropBackoffOnNetworkChange()
+	require.Equal(t, 2, pool.emptySweepStreak())
+}
+
+func TestURLTestPoolProviderUpdateDropsBackoff(t *testing.T) {
+	pd := &mutableProvider{name: "pd"}
+	pd.set(newPoolDeadProxy("a"))
+	pool, err := NewURLTestPool(GroupCommonOption{Name: "pool", Interval: 300},
+		URLTestPoolOption{FullInterval: 600}, newPoolEmptyFallback(), []P.ProxyProvider{pd})
+	require.NoError(t, err)
+	require.Len(t, pool.GetProxies(false), 1) // cache the provider version
+
+	pool.mu.Lock()
+	pool.emptyStreak = 2
+	pool.nextFullAt = time.Now().Add(time.Hour)
+	pool.mu.Unlock()
+	pool.dropBackoffOnProviderUpdate()
+	require.Equal(t, 2, pool.emptySweepStreak(), "an unchanged provider must keep the backoff")
+
+	pd.set(newPoolDeadProxy("b"))
+	pool.dropBackoffOnProviderUpdate()
+	require.Zero(t, pool.emptySweepStreak(), "a new proxy list must drop the backoff the old nodes earned")
+	require.True(t, pool.nextFullTime().IsZero())
+}
+
+// The suspect band of the reputation becomes a skip of the sweep after two
+// empty sweeps, but every other sweep must measure those nodes again.
+func TestURLTestPoolPrunesSuspectsAfterEmptySweeps(t *testing.T) {
+	pool := newPoolForTest(t, URLTestPoolOption{},
+		newPoolDeadProxy("good"), newPoolDeadProxy("suspect"), newPoolDeadProxy("other"))
+	pool.reputation.DialFailed("suspect")
+	pool.reputation.DialFailed("suspect")
+	require.Less(t, pool.reputation.Score("suspect"), reputation.Suspect)
+
+	pool.emptyStreak = 1
+	require.Len(t, pool.orderForCheck(pool.Proxies()), 3, "one empty sweep is not enough to skip a node")
+
+	pool.emptyStreak = 2
+	require.Equal(t, []string{"good", "other"}, cascadeProxyNames(pool.orderForCheck(pool.Proxies())))
+
+	pool.emptyStreak = 3
+	require.Len(t, pool.orderForCheck(pool.Proxies()), 3, "every other sweep measures the suspect band again")
 }

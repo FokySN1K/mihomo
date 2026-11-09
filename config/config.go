@@ -182,8 +182,9 @@ type DNS struct {
 
 // Profile config
 type Profile struct {
-	StoreSelected bool
-	StoreFakeIP   bool
+	StoreSelected   bool
+	StoreFakeIP     bool
+	StoreReputation bool
 }
 
 // TLS config
@@ -366,8 +367,9 @@ type RawExperimental struct {
 }
 
 type RawProfile struct {
-	StoreSelected bool `yaml:"store-selected" json:"store-selected"`
-	StoreFakeIP   bool `yaml:"store-fake-ip" json:"store-fake-ip"`
+	StoreSelected   bool `yaml:"store-selected" json:"store-selected"`
+	StoreFakeIP     bool `yaml:"store-fake-ip" json:"store-fake-ip"`
+	StoreReputation bool `yaml:"store-reputation" json:"store-reputation"`
 }
 
 type RawGeoXUrl struct {
@@ -869,8 +871,9 @@ func parseNTP(cfg *RawConfig) (*NTP, error) {
 
 func parseProfile(cfg *RawConfig) (*Profile, error) {
 	return &Profile{
-		StoreSelected: cfg.Profile.StoreSelected,
-		StoreFakeIP:   cfg.Profile.StoreFakeIP,
+		StoreSelected:   cfg.Profile.StoreSelected,
+		StoreFakeIP:     cfg.Profile.StoreFakeIP,
+		StoreReputation: cfg.Profile.StoreReputation,
 	}, nil
 }
 

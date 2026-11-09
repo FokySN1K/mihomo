@@ -481,6 +481,7 @@ func updateProfile(cfg *config.Config) {
 	profileCfg := cfg.Profile
 
 	profile.StoreSelected.Store(profileCfg.StoreSelected)
+	profile.StoreReputation.Store(profileCfg.StoreReputation)
 	if profileCfg.StoreSelected {
 		patchSelectGroup(cfg.Proxies)
 	}

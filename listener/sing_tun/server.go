@@ -370,7 +370,8 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 				log.Errorln("[TUN] default interface lost by monitor")
 			}
 			iface.FlushCache()
-			resolver.ResetConnection() // reset resolver's connection after default interface changed
+			iface.NotifyNetworkChanged() // the groups drop the outage backoff of their pools
+			resolver.ResetConnection()   // reset resolver's connection after default interface changed
 		})
 		err = defaultInterfaceMonitor.Start()
 		if err != nil {
