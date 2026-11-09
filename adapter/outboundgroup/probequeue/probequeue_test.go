@@ -616,3 +616,43 @@ func TestSetConcurrencyClamps(t *testing.T) {
 	SetConcurrency(maxConcurrency + 10)
 	require.Equal(t, maxConcurrency, GetConcurrency())
 }
+
+// Two priority probes of the same measurement are one question: the second
+// caller waits on the entry already queued in the priority lane instead of
+// loading the member a second time.
+func TestPriorityProbeJoinsQueuedPriorityTwin(t *testing.T) {
+	q := newQueue(1)
+	gate := make(chan struct{})
+
+	blocker := newTestProxy("blocker", func(context.Context) (uint16, error) {
+		<-gate
+		return 1, nil
+	})
+	var calls atomic.Int32
+	twin := newTestProxy("twin", func(context.Context) (uint16, error) {
+		calls.Add(1)
+		return 5, nil
+	})
+
+	block := q.submit("block", false, []Probe{{Proxy: blocker, Timeout: time.Second}}, nil)
+	requireEventually(t, func() bool {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		return q.running == 1
+	}, "the blocker must own the only slot")
+
+	twinProbe := Probe{Proxy: twin, URL: "https://example.com/204", Timeout: time.Second, Priority: true}
+	first := q.submit("recovery", false, []Probe{twinProbe}, nil)
+	second := q.submit("recovery", false, []Probe{twinProbe}, nil)
+
+	q.mu.Lock()
+	priorityQueued := len(q.priority)
+	q.mu.Unlock()
+	require.Equal(t, 1, priorityQueued, "the second dial must join the queued priority probe")
+
+	close(gate)
+	require.True(t, block.Wait(context.Background()))
+	require.True(t, first.Wait(context.Background()))
+	require.True(t, second.Wait(context.Background()))
+	require.Equal(t, int32(1), calls.Load(), "the member must be probed once")
+}

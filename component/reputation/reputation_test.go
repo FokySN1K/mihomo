@@ -8,6 +8,7 @@ import (
 	"github.com/metacubex/mihomo/component/profile"
 
 	"github.com/stretchr/testify/require"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 type fakeBackend struct {
@@ -121,6 +122,69 @@ func TestFlushWithoutPersistenceWritesNothing(t *testing.T) {
 	store.Flush()
 
 	require.Zero(t, backend.saves)
+}
+
+func TestFlushTrimsWithoutPersistence(t *testing.T) {
+	backend := newFakeBackend()
+	store := newStore(backend)
+	now := time.Now()
+	for i := 0; i < maxEntries+2; i++ {
+		store.entries[fmt.Sprintf("node-%d", i)] = &entry{LastSeen: now}
+	}
+	store.entries["dead"] = &entry{Score: -90, LastSeen: now}
+
+	store.Flush()
+
+	require.Len(t, store.entries, maxEntries, "a store without persistence must stay bounded too")
+	require.NotContains(t, store.entries, "dead")
+	require.Zero(t, backend.saves)
+}
+
+func TestStoreArmsTheTrimWithoutPersistence(t *testing.T) {
+	store := newStore(newFakeBackend())
+	now := time.Now()
+	for i := 0; i < maxEntries-1; i++ {
+		store.entries[fmt.Sprintf("node-%d", i)] = &entry{LastSeen: now}
+	}
+
+	store.DialSucceeded("under")
+	require.Nil(t, store.timer, "a store under the cap has nothing to trim")
+	require.Empty(t, store.dirty)
+
+	store.DialSucceeded("over")
+	require.NotNil(t, store.timer, "a store over the cap must schedule the trim")
+	store.timer.Stop()
+}
+
+func TestLoadKeepsTheScoreMeasuredInThisProcess(t *testing.T) {
+	enablePersistence(t)
+	backend := newFakeBackend()
+	data, err := msgpack.Marshal(entry{Score: 50, LastSeen: time.Now()})
+	require.NoError(t, err)
+	backend.entries["node"] = data
+
+	store := newStore(backend)
+	store.entries["node"] = &entry{Score: -25, LastSeen: time.Now()}
+
+	require.Equal(t, -25, store.Score("node"), "a score measured in this process must not be replaced by the stored one")
+}
+
+func TestFlushDeletesTheRowsOverTheCap(t *testing.T) {
+	enablePersistence(t)
+	backend := newFakeBackend()
+	data, err := msgpack.Marshal(entry{Score: 50, LastSeen: time.Now()})
+	require.NoError(t, err)
+	for i := 0; i < maxEntries+10; i++ {
+		backend.entries[fmt.Sprintf("stored-%d", i)] = data
+	}
+
+	store := newStore(backend)
+	require.Equal(t, 50, store.Score(fmt.Sprintf("stored-%d", maxEntries+9)))
+	require.Len(t, store.entries, maxEntries)
+
+	store.Flush()
+
+	require.LessOrEqual(t, len(backend.entries), maxEntries, "the rows over the cap must leave the cache with the store")
 }
 
 func TestEvictionKeepsTheBestNodes(t *testing.T) {

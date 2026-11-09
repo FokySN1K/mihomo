@@ -104,11 +104,14 @@ func (cacheBackend) Save(entries map[string][]byte, deletes []string) {
 // store is shared by all groups: a node that carried traffic in one group is
 // known to the others as well.
 type Store struct {
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	backend backend
 	loaded  bool
 	entries map[string]*entry
 	dirty   map[string]struct{}
+	// deletes holds the names that left the store since the last flush, so
+	// the rows of an evicted node do not stay in the cache forever.
+	deletes map[string]struct{}
 	timer   *time.Timer
 }
 
@@ -130,6 +133,7 @@ func newStore(backend backend) *Store {
 		backend: backend,
 		entries: make(map[string]*entry),
 		dirty:   make(map[string]struct{}),
+		deletes: make(map[string]struct{}),
 	}
 }
 
@@ -139,15 +143,28 @@ func (s *Store) Score(name string) int {
 		return 0
 	}
 
+	// The dial path asks for the score of every candidate at once, so the
+	// steady state reads under the shared lock; only the first call that has
+	// to restore the stored scores takes the exclusive one.
+	s.mu.RLock()
+	if s.loaded || s.backend == nil || !profile.StoreReputation.Load() {
+		score := 0
+		if e := s.entries[name]; e != nil {
+			score = e.decayed(time.Now())
+		}
+		s.mu.RUnlock()
+		return score
+	}
+	s.mu.RUnlock()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.loadLocked()
-	e := s.entries[name]
-	if e == nil {
-		return 0
+	if e := s.entries[name]; e != nil {
+		return e.decayed(time.Now())
 	}
-	return e.decayed(time.Now())
+	return 0
 }
 
 // DialSucceeded records a dial that carried real traffic.
@@ -226,8 +243,10 @@ func (s *Store) ProbeFailed(name string) {
 	s.markDirtyLocked(name)
 }
 
-// Flush writes what changed since the last flush in one transaction. The store
-// calls it on its own after a short delay; tests call it directly.
+// Flush writes what changed since the last flush in one transaction and bounds
+// the store at the same time. The store calls it on its own after a short
+// delay; tests call it directly. A store without persistence still runs the
+// trim, so a profile that keeps no scores does not grow the map past the cap.
 func (s *Store) Flush() {
 	if s == nil {
 		return
@@ -235,28 +254,49 @@ func (s *Store) Flush() {
 
 	s.mu.Lock()
 	s.timer = nil
-	if s.backend == nil || len(s.dirty) == 0 || !profile.StoreReputation.Load() {
+	s.loadLocked()
+	s.addDeletesLocked(s.evictLocked())
+
+	if s.backend == nil || !profile.StoreReputation.Load() {
+		// nothing of this store may reach cache.db
 		s.dirty = make(map[string]struct{})
+		s.deletes = make(map[string]struct{})
+		s.mu.Unlock()
+		return
+	}
+	if len(s.dirty) == 0 && len(s.deletes) == 0 {
 		s.mu.Unlock()
 		return
 	}
 
-	s.loadLocked()
-	deletes := s.evictLocked()
-	entries := make(map[string][]byte, len(s.dirty))
+	type snapshot struct {
+		name  string
+		entry entry
+	}
+	pending := make([]snapshot, 0, len(s.dirty))
 	for name := range s.dirty {
-		e := s.entries[name]
-		if e == nil {
-			continue
+		if e := s.entries[name]; e != nil {
+			pending = append(pending, snapshot{name: name, entry: *e})
 		}
-		data, err := msgpack.Marshal(*e)
+	}
+	deletes := make([]string, 0, len(s.deletes))
+	for name := range s.deletes {
+		deletes = append(deletes, name)
+	}
+	s.dirty = make(map[string]struct{})
+	s.deletes = make(map[string]struct{})
+	s.mu.Unlock()
+
+	// The encoding runs outside the lock: a dial must not wait for a
+	// transaction of thousands of entries to finish.
+	entries := make(map[string][]byte, len(pending))
+	for _, item := range pending {
+		data, err := msgpack.Marshal(item.entry)
 		if err != nil {
 			continue
 		}
-		entries[name] = data
+		entries[item.name] = data
 	}
-	s.dirty = make(map[string]struct{})
-	s.mu.Unlock()
 
 	s.backend.Save(entries, deletes)
 }
@@ -271,18 +311,37 @@ func (s *Store) entryLocked(name string) *entry {
 }
 
 func (s *Store) markDirtyLocked(name string) {
-	if s.backend == nil || !profile.StoreReputation.Load() {
+	// Only a persisting store records what it has to write; the bound of the
+	// map must hold either way, so a store that grows past the cap arms the
+	// timer even when there is nothing to save.
+	if s.backend != nil && profile.StoreReputation.Load() {
+		s.dirty[name] = struct{}{}
+	}
+	if s.timer == nil && (len(s.dirty) > 0 || len(s.entries) > maxEntries) {
+		s.timer = time.AfterFunc(flushDelay, s.Flush)
+	}
+}
+
+// addDeletesLocked records names that left the store so the next flush deletes
+// their rows from the cache as well.
+func (s *Store) addDeletesLocked(names []string) {
+	if len(names) == 0 {
 		return
 	}
-	s.dirty[name] = struct{}{}
-	if s.timer == nil {
+	for _, name := range names {
+		delete(s.dirty, name)
+		s.deletes[name] = struct{}{}
+	}
+	if s.backend != nil && s.timer == nil {
 		s.timer = time.AfterFunc(flushDelay, s.Flush)
 	}
 }
 
 // loadLocked restores the persisted scores once, and only while persistence is
 // enabled: a store that was never asked to keep its scores must not open the
-// cache file.
+// cache file. A score measured in this process is newer than the stored one
+// and keeps its place, and the rows that do not fit the cap leave the store
+// and the cache together instead of being dropped at random.
 func (s *Store) loadLocked() {
 	if s.loaded || s.backend == nil || !profile.StoreReputation.Load() {
 		return
@@ -291,8 +350,8 @@ func (s *Store) loadLocked() {
 
 	restored := 0
 	for name, data := range s.backend.Load() {
-		if len(s.entries) >= maxEntries {
-			break
+		if _, ok := s.entries[name]; ok {
+			continue
 		}
 		var e entry
 		if err := msgpack.Unmarshal(data, &e); err != nil {
@@ -301,6 +360,7 @@ func (s *Store) loadLocked() {
 		s.entries[name] = &e
 		restored++
 	}
+	s.addDeletesLocked(s.evictLocked())
 	if restored > 0 {
 		log.Debugln("[Reputation] restored %d nodes from cache", restored)
 	}

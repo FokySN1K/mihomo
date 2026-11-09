@@ -24,6 +24,7 @@ import (
 	"github.com/metacubex/mihomo/component/keepalive"
 	"github.com/metacubex/mihomo/component/profile"
 	"github.com/metacubex/mihomo/component/profile/cachefile"
+	"github.com/metacubex/mihomo/component/reputation"
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/component/resource"
 	"github.com/metacubex/mihomo/component/sniffer"
@@ -480,6 +481,11 @@ func updateUsers(users []auth.AuthUser) {
 func updateProfile(cfg *config.Config) {
 	profileCfg := cfg.Profile
 
+	if !profileCfg.StoreReputation && profile.StoreReputation.Load() {
+		// The scores measured while persistence was on are still in memory:
+		// write them before the flag stops every further flush.
+		reputation.Default().Flush()
+	}
 	profile.StoreSelected.Store(profileCfg.StoreSelected)
 	profile.StoreReputation.Store(profileCfg.StoreReputation)
 	if profileCfg.StoreSelected {
@@ -572,6 +578,10 @@ func updateIPTables(cfg *config.Config) {
 }
 
 func Shutdown() {
+	// The scores of the nodes that carried traffic since the last timer tick
+	// are still only in memory: a restart must not lose them.
+	reputation.Default().Flush()
+
 	listener.Cleanup()
 	tproxy.CleanupTProxyIPTables()
 	resolver.StoreFakePoolState()

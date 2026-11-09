@@ -88,6 +88,9 @@ external-controller-routing-mark: 0
 
 # tcp-concurrent: true # TCP 并发连接所有 IP, 将使用最快握手的 TCP
 
+# 全局健康检查并发数，所有代理组共用这一条队列，默认 40，超过 64 按 64 处理
+# probe-concurrency: 40
+
 # 配置 WEB UI 目录，使用 http://{{external-controller}}/ui 访问
 external-ui: /path/to/ui/folder/
 external-ui-name: xd

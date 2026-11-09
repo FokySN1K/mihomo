@@ -104,14 +104,18 @@ type probeEntry struct {
 	probe   Probe
 	waiters []*batch
 	running bool
+	// priority marks an entry that waits in the priority lane: joining it is
+	// as good as running it, because the lane is served before the rings.
+	priority bool
 }
 
 // joinable reports whether a check that submitted the same probe can wait on
-// this entry. A priority probe only joins a measurement that already runs:
-// joining one that still waits in the ring would make the dial wait behind the
-// ring, which is exactly what the priority lane exists to prevent.
+// this entry. A priority probe only joins a measurement that already runs or
+// one that waits in the priority lane itself: joining an entry of the ring
+// would make the dial wait behind the ring, which is exactly what the priority
+// lane exists to prevent.
 func (e *probeEntry) joinable(probe Probe) bool {
-	return !probe.Priority || e.running
+	return !probe.Priority || e.running || e.priority
 }
 
 type batch struct {
@@ -236,7 +240,7 @@ func (q *queue) submit(source string, foreground bool, probes []Probe, onResult 
 			}
 		}
 
-		entry := &probeEntry{key: key, probe: probe, waiters: []*batch{b}}
+		entry := &probeEntry{key: key, probe: probe, waiters: []*batch{b}, priority: probe.Priority}
 		if probe.Priority {
 			b.priority = append(b.priority, entry)
 		} else {

@@ -205,6 +205,11 @@ type URLTestPool struct {
 	// probes once, because a member that timed out while the network was
 	// settling is not dead.
 	lastCheckGen uint64
+	// checkGen is the generation the check that holds `testing` began under. A
+	// sweep asked for while a check already runs compares against it: a check
+	// of the old route has to be followed by a fresh one, and one that already
+	// measures the new route answers the question itself.
+	checkGen uint64
 	// warmCh is open while a full check is running and is closed once the first
 	// measured member is published; checkStart anchors the first-result wait, so
 	// the whole check cycle never delays dials longer than the cap.
@@ -232,6 +237,10 @@ type URLTestPool struct {
 	// second time, and checkResults is what that check measured alive.
 	checkDone    chan struct{}
 	checkResults map[string]uint16
+	// pendingFull is set when a full sweep is asked for while a check of
+	// another network generation holds the pool; the check re-arms it as it
+	// ends, so the request is not lost with the old route.
+	pendingFull atomic.Bool
 }
 
 // poolMeasurement is one emergency test of the last non-empty pool. A dial of
@@ -298,17 +307,22 @@ func (u *URLTestPool) DialContext(ctx context.Context, metadata *C.Metadata) (c 
 
 	if err == nil {
 		c.AppendToChains(u)
-		u.noteDialSucceeded(proxy)
-	}
-
-	if N.NeedHandshake(c) {
-		c = callback.NewFirstWriteCallBackConn(c, func(err error) {
-			if err == nil {
-				u.noteDialSucceeded(proxy)
-			} else {
-				u.onProxyFailed(proxy, err)
-			}
-		})
+		if N.NeedHandshake(c) {
+			// The dial only accepted the connection: the first write is what
+			// proves the member carries traffic, so the reputation is
+			// credited there and not twice. The route itself works already,
+			// so the outage bookkeeping runs now.
+			u.noteDialAccepted(proxy)
+			c = callback.NewFirstWriteCallBackConn(c, func(err error) {
+				if err == nil {
+					u.noteDialSucceeded(proxy)
+				} else {
+					u.onProxyFailed(proxy, err)
+				}
+			})
+		} else {
+			u.noteDialSucceeded(proxy)
+		}
 	}
 
 	return c, err
@@ -957,12 +971,12 @@ func (u *URLTestPool) onProxyFailed(proxy C.Proxy, err error) {
 // onProxyCut records a member our own attempt-timeout cut. The node did not
 // prove itself dead — a slow handshake still means it works — so it leaves the
 // next choices only for the grace, and a member that answers again is back at
-// once instead of sitting out the whole interval.
+// once instead of sitting out the whole interval. A cut is not a failure of the
+// node, so it does not count toward the group health check either.
 func (u *URLTestPool) onProxyCut(proxy C.Proxy, err error) {
 	if shouldTrackDialFailure(proxy.Type(), err) {
 		u.markCut(proxy.Name())
 	}
-	u.onDialFailed(proxy.Type(), err, u.healthCheck)
 }
 
 // healthCheck is called by GroupBase when the same proxy failed several times in a row
@@ -1021,7 +1035,13 @@ func (u *URLTestPool) markFor(marks *map[string]time.Time, name string, ttl time
 }
 
 func (u *URLTestPool) maybeScheduleCheck() {
-	u.dropBackoffOnNetworkChange()
+	if u.dropBackoffOnNetworkChange() {
+		// Every member measured on the old route says nothing about the new
+		// one, so the first traffic after the device moved starts a fresh
+		// sweep at once instead of waiting out the schedule.
+		u.scheduleCheck(poolFullCheck)
+		return
+	}
 	u.dropBackoffOnProviderUpdate()
 
 	if !u.hasFullCheck.Load() {
@@ -1093,14 +1113,17 @@ func (u *URLTestPool) emptySweepStreak() int {
 
 // dropBackoffOnNetworkChange ends the outage backoff and drops the marks when
 // the device moved to another network: a member measured dead, or cut by an
-// attempt-timeout, on the old network is not a verdict on the new one.
-func (u *URLTestPool) dropBackoffOnNetworkChange() {
+// attempt-timeout, on the old network is not a verdict on the new one. It
+// reports the change, because the pool itself has nothing measured for the new
+// route and its caller has to start a check instead of waiting for the
+// schedule of the old one.
+func (u *URLTestPool) dropBackoffOnNetworkChange() bool {
 	generation := iface.NetworkGeneration()
 	u.mu.RLock()
 	seen := u.networkGen
 	u.mu.RUnlock()
 	if generation == seen {
-		return
+		return false
 	}
 
 	u.mu.Lock()
@@ -1109,6 +1132,7 @@ func (u *URLTestPool) dropBackoffOnNetworkChange() {
 	u.cutMarks = nil
 	u.mu.Unlock()
 	u.exitBackoff("the network changed")
+	return true
 }
 
 // scheduledCheckGeneration captures the network generation a scheduled check
@@ -1152,7 +1176,12 @@ func (u *URLTestPool) dropBackoffOnProviderUpdate() {
 // failed. The latter prevents a failed health check from probing the whole
 // provider on every connection.
 func (u *URLTestPool) requestFullCheckOnExhaustion() {
-	u.dropBackoffOnNetworkChange()
+	if u.dropBackoffOnNetworkChange() {
+		// The throttle measures the old route: a pool that just lost its
+		// network has to be measured again, not waited for.
+		u.scheduleCheck(poolFullCheck)
+		return
+	}
 	if !u.shouldRequestFullCheckOnExhaustion(time.Now()) {
 		return
 	}
@@ -1188,7 +1217,14 @@ func (u *URLTestPool) beginCheck(kind poolCheckKind) (done <-chan struct{}, star
 	if !u.testing.CompareAndSwap(false, true) {
 		u.mu.RLock()
 		done = u.checkDone
+		generation := u.checkGen
 		u.mu.RUnlock()
+		if kind == poolFullCheck && (done == nil || generation != iface.NetworkGeneration()) {
+			// The running check measured the old route, and waiting out its
+			// schedule would leave the pool unproven on the new one: the
+			// check re-arms the sweep as it ends.
+			u.pendingFull.Store(true)
+		}
 		return done, false
 	}
 
@@ -1196,6 +1232,7 @@ func (u *URLTestPool) beginCheck(kind poolCheckKind) (done <-chan struct{}, star
 	u.mu.Lock()
 	u.checkDone = channel
 	u.checkResults = nil
+	u.checkGen = iface.NetworkGeneration()
 	u.mu.Unlock()
 
 	if kind == poolFullCheck {
@@ -1210,6 +1247,13 @@ func (u *URLTestPool) beginCheck(kind poolCheckKind) (done <-chan struct{}, star
 			}
 			u.mu.Unlock()
 			close(channel)
+
+			if u.pendingFull.Swap(false) {
+				// A sweep of the new route was asked for while this check
+				// measured the old one: run it now instead of leaving the
+				// pool unproven until the next schedule.
+				u.scheduleCheck(poolFullCheck)
+			}
 		}()
 		defer u.markWarm()
 		switch kind {
@@ -1554,13 +1598,21 @@ func (u *URLTestPool) shouldRunFullCheck(alive, target int) bool {
 	return true
 }
 
-// noteDialSucceeded remembers the proxy that proved connectivity and rebuilds
-// an empty pool (for example after a full outage). The check runs in
-// background and is throttled, so dials never wait for it.
+// noteDialSucceeded remembers the proxy that carried traffic: it ends the
+// outage and feeds the reputation. The check runs in background and is
+// throttled, so dials never wait for it.
 func (u *URLTestPool) noteDialSucceeded(proxy C.Proxy) {
 	if tracksNodeReputation(proxy.Type()) {
 		u.reputation.DialSucceeded(proxy.Name())
 	}
+	u.noteDialAccepted(proxy)
+}
+
+// noteDialAccepted remembers the route the dial proved and rebuilds an empty
+// pool (for example after a full outage). It is the part of noteDialSucceeded
+// that does not depend on the member carrying traffic yet: a protocol whose
+// handshake the first write will prove still tells us the network works.
+func (u *URLTestPool) noteDialAccepted(proxy C.Proxy) {
 	// the member carried traffic, so the outage is over: the next full sweep
 	// follows the usual schedule again instead of the empty-streak backoff
 	u.exitBackoff("a dial succeeded")

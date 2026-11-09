@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/metacubex/mihomo/component/reputation"
+
 	C "github.com/metacubex/mihomo/constant"
 )
 
@@ -91,6 +93,43 @@ func BenchmarkURLTestPoolWarmPath(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		pool.waitWarm(ctx)
+	}
+}
+
+// BenchmarkURLTestPoolScheduleGate measures the gate every dial runs before it
+// picks a member: the network-generation compare, the outage streak read and
+// the two schedule reads. It is the steady state of a connection, so it has to
+// stay a few atomic loads and one clock read.
+func BenchmarkURLTestPoolScheduleGate(b *testing.B) {
+	pool := &URLTestPool{
+		pool:         []string{"a"},
+		interval:     time.Hour,
+		fullInterval: time.Hour,
+	}
+	pool.hasFullCheck.Store(true)
+	pool.lastFull.Store(time.Now())
+	pool.lastQuick.Store(time.Now())
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		pool.maybeScheduleCheck()
+	}
+}
+
+// BenchmarkURLTestPoolNoteDialSucceeded measures what a successful dial records:
+// the reputation of the member, the end of the outage backoff and the last-good
+// update. It runs once per connection.
+func BenchmarkURLTestPoolNoteDialSucceeded(b *testing.B) {
+	proxy := newCascadeTestProxy("a")
+	pool := &URLTestPool{pool: []string{"a"}, reputation: reputation.NewStore()}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		pool.noteDialSucceeded(proxy)
 	}
 }
 

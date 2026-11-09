@@ -2070,6 +2070,68 @@ func TestURLTestPoolNetworkChangeDropsBackoff(t *testing.T) {
 	require.Equal(t, 2, pool.emptySweepStreak())
 }
 
+// The first traffic after the device moved to another network measures the
+// pool again at once: every member was measured on the old route, so waiting
+// for the schedule of the old one would leave the pool unproven on the new
+// network.
+func TestURLTestPoolNetworkChangeStartsFullCheck(t *testing.T) {
+	var probes atomic.Int32
+	member := newPoolControlledProxy("member", nil, func(context.Context) (uint16, error) {
+		probes.Add(1)
+		return 20, nil
+	})
+	pool := newPoolForTest(t, URLTestPoolOption{FullInterval: 600}, member)
+
+	pool.maybeScheduleCheck()
+	require.False(t, pool.testing.Load(), "the schedule of a pool measured a moment ago holds")
+	require.Zero(t, probes.Load())
+
+	iface.NotifyNetworkChanged()
+	pool.maybeScheduleCheck()
+
+	require.Eventually(t, func() bool {
+		return !pool.testing.Load() && probes.Load() == 1
+	}, 5*time.Second, 10*time.Millisecond, "a network change must measure the pool at once")
+	require.Equal(t, []string{"member"}, poolNames(pool))
+}
+
+// A check that is already running when the device moves measures the old
+// route: the sweep asked for by the change must follow it instead of being lost
+// with the generation it belonged to.
+func TestURLTestPoolNetworkChangeSweepsAfterTheRunningCheck(t *testing.T) {
+	held := newPoolRelease()
+	defer held.close()
+	var probes atomic.Int32
+	member := newPoolControlledProxy("member", nil, func(ctx context.Context) (uint16, error) {
+		if probes.Add(1) == 1 {
+			// the first check runs on the old route until the test lets it go
+			select {
+			case <-held.ch:
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			}
+		}
+		return 20, nil
+	})
+	pool := newPoolForTest(t, URLTestPoolOption{FullInterval: 600}, member)
+
+	pool.scheduleCheck(poolFullCheck)
+	require.Eventually(t, func() bool { return pool.testing.Load() }, 2*time.Second, 5*time.Millisecond)
+
+	iface.NotifyNetworkChanged()
+	pool.maybeScheduleCheck()
+	require.True(t, pool.pendingFull.Load(), "the sweep of the new route must wait for the running check")
+
+	held.close()
+
+	require.Eventually(t, func() bool {
+		return !pool.testing.Load() && probes.Load() >= 2
+	}, 5*time.Second, 10*time.Millisecond,
+		"the check of the old route must be followed by a sweep of the new one")
+	require.Equal(t, []string{"member"}, poolNames(pool))
+	require.False(t, pool.pendingFull.Load())
+}
+
 // The first scheduled check on a new network gives the members that failed one
 // second attempt: a handshake that timed out while the route was settling is
 // not a verdict, so the member must not leave the pool on the first answer.
