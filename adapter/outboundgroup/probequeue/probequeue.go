@@ -175,6 +175,17 @@ func TestProxy(ctx context.Context, proxy C.Proxy, url string, expected utils.In
 			timeout = remaining
 		}
 	}
+	return TestProxyWithBudget(ctx, proxy, url, expected, timeout)
+}
+
+// TestProxyWithBudget is TestProxy with the probe budget spelled out. A caller
+// that knows the budget a group's own check uses keeps the probe key equal, so
+// the queue shares the measurement instead of running a second one beside the
+// sweep.
+func TestProxyWithBudget(ctx context.Context, proxy C.Proxy, url string, expected utils.IntRanges[uint16], timeout time.Duration) (uint16, error) {
+	if timeout <= 0 {
+		timeout = defaultTestTimeout
+	}
 
 	var delay uint16
 	var err error

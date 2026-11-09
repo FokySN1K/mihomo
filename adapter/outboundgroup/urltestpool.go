@@ -81,6 +81,11 @@ const (
 	// sweeps make the sweep skip the nodes below the suspect band of the
 	// reputation.
 	urlTestPoolPruneAfterEmptySweeps = 2
+	// urlTestPoolNetworkRetryPause is the pause before the first scheduled
+	// check on a new network retries the probes that failed: the route and DNS
+	// of a fresh network settle within it, and a handshake that timed out
+	// meanwhile is not a verdict on the member.
+	urlTestPoolNetworkRetryPause = 500 * time.Millisecond
 )
 
 // poolCheckKind selects what a scheduled check measures: the pool members only
@@ -195,6 +200,11 @@ type URLTestPool struct {
 	// networkGen is the network generation the pool last saw. A new generation
 	// drops the backoff, so the first check on the new network runs at once.
 	networkGen uint64
+	// lastCheckGen is the network generation the last scheduled check measured
+	// under. A check that starts on another generation retries its failed
+	// probes once, because a member that timed out while the network was
+	// settling is not dead.
+	lastCheckGen uint64
 	// warmCh is open while a full check is running and is closed once the first
 	// measured member is published; checkStart anchors the first-result wait, so
 	// the whole check cycle never delays dials longer than the cap.
@@ -594,7 +604,7 @@ func (u *URLTestPool) PoolCheck(ctx context.Context) (map[string]uint16, error) 
 	// caller's budget bounds only the answer: a member still being probed
 	// reports into the pool when it finishes, and a probe that ran out of its
 	// own timeout is a dead member like any other.
-	results, _ := u.probeProxies(ctx, members, time.Duration(u.testTimeout)*time.Millisecond, true, false)
+	results, _ := u.probeProxies(ctx, members, time.Duration(u.testTimeout)*time.Millisecond, true, false, false)
 	if len(results) == 0 {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -1081,9 +1091,9 @@ func (u *URLTestPool) emptySweepStreak() int {
 	return u.emptyStreak
 }
 
-// dropBackoffOnNetworkChange ends the outage backoff when the device moved to
-// another network: a member measured dead on the old network is not a verdict
-// on the new one.
+// dropBackoffOnNetworkChange ends the outage backoff and drops the marks when
+// the device moved to another network: a member measured dead, or cut by an
+// attempt-timeout, on the old network is not a verdict on the new one.
 func (u *URLTestPool) dropBackoffOnNetworkChange() {
 	generation := iface.NetworkGeneration()
 	u.mu.RLock()
@@ -1095,8 +1105,32 @@ func (u *URLTestPool) dropBackoffOnNetworkChange() {
 
 	u.mu.Lock()
 	u.networkGen = generation
+	u.suspicious = nil
+	u.cutMarks = nil
 	u.mu.Unlock()
 	u.exitBackoff("the network changed")
+}
+
+// scheduledCheckGeneration captures the network generation a scheduled check
+// runs under and reports whether its failed probes are worth one retry: the
+// first check after the device moved to another network sees timeouts the old
+// route caused, not a verdict on the members.
+func (u *URLTestPool) scheduledCheckGeneration() (uint64, bool) {
+	generation := iface.NetworkGeneration()
+	u.mu.RLock()
+	seen := u.lastCheckGen
+	u.mu.RUnlock()
+	return generation, generation != seen
+}
+
+// finishScheduledCheck records the generation the check measured under. A
+// network change that happened while the check ran stays a change: the next
+// check still retries, because the probes of this one went out on the old
+// route.
+func (u *URLTestPool) finishScheduledCheck(generation uint64) {
+	u.mu.Lock()
+	u.lastCheckGen = generation
+	u.mu.Unlock()
 }
 
 // dropBackoffOnProviderUpdate ends the outage backoff when a provider
@@ -1381,7 +1415,9 @@ func (u *URLTestPool) quickCheck() {
 	// Every result is published as it arrives, so a member that just failed
 	// leaves the pool now instead of holding its slot until the next full
 	// check, and a member that answered is usable before the slow ones end.
-	results, _ := u.testProxiesStreaming(context.Background(), poolProxies)
+	generation, retry := u.scheduledCheckGeneration()
+	results, _ := u.testProxiesStreaming(context.Background(), poolProxies, retry)
+	u.finishScheduledCheck(generation)
 	u.storeResults(results)
 	u.lastQuick.Store(time.Now())
 
@@ -1450,7 +1486,7 @@ func (u *URLTestPool) canaryProbe(ctx context.Context, release bool) (map[string
 	log.Debugln("ProxyGroup: %s probing %d canary members with a %s timeout", u.Name(), len(candidates), timeout)
 	// the canary runs in the foreground lane: a member that answers is what
 	// the very next connection leaves on
-	results, _ := u.probeProxies(ctx, candidates, timeout, true, true)
+	results, _ := u.probeProxies(ctx, candidates, timeout, true, true, false)
 	u.storeResults(results)
 	u.lastQuick.Store(time.Now())
 
@@ -1625,7 +1661,7 @@ func (u *URLTestPool) ensureRecovery(ctx context.Context) bool {
 		// The probe timeout is the recovery one, never what the starting dial
 		// has left: every later dial joins this test, and a short budget of one
 		// caller must not turn a slow member into a dead one.
-		results, tested := u.probeProxies(context.Background(), candidates, urlTestPoolRecoveryTestTimeout, true, true)
+		results, tested := u.probeProxies(context.Background(), candidates, urlTestPoolRecoveryTestTimeout, true, true, false)
 		u.applyRecovery(results, tested, len(candidates))
 		u.finishMeasurement(measure)
 	}()
@@ -1816,7 +1852,9 @@ func (u *URLTestPool) fullCheck() {
 	log.Debugln("ProxyGroup: %s start full health check for %d proxies", u.Name(), len(proxies))
 	// Publish every measured member as it arrives, so a cold pool routes by a
 	// real delay from the first result instead of waiting for the whole list.
-	results, _ := u.testProxiesStreaming(context.Background(), u.orderForCheck(proxies))
+	generation, retry := u.scheduledCheckGeneration()
+	results, _ := u.testProxiesStreaming(context.Background(), u.orderForCheck(proxies), retry)
+	u.finishScheduledCheck(generation)
 	u.storeResults(results)
 	u.applyResults(results)
 }
@@ -2026,9 +2064,11 @@ func (u *URLTestPool) publishPool(results map[string]uint16, tested map[string]s
 }
 
 // testProxiesStreaming sweeps proxies with the member timeout and publishes
-// every measured member as soon as its probe returns.
-func (u *URLTestPool) testProxiesStreaming(ctx context.Context, proxies []C.Proxy) (map[string]uint16, map[string]struct{}) {
-	return u.probeProxies(ctx, proxies, time.Duration(u.testTimeout)*time.Millisecond, true, false)
+// every measured member as soon as its probe returns. With retry set, the
+// probes that fail get one second attempt after a short pause, so the first
+// check on a new network does not publish the timeouts the old route caused.
+func (u *URLTestPool) testProxiesStreaming(ctx context.Context, proxies []C.Proxy, retry bool) (map[string]uint16, map[string]struct{}) {
+	return u.probeProxies(ctx, proxies, time.Duration(u.testTimeout)*time.Millisecond, true, false, retry)
 }
 
 // probeProxies tests proxies through the shared probe queue and returns the
@@ -2042,7 +2082,7 @@ func (u *URLTestPool) testProxiesStreaming(ctx context.Context, proxies []C.Prox
 // timeout, and the caller's context bounds only how long the caller waits for
 // the answer. A check a parent left behind keeps probing and keeps publishing,
 // because the members it measures are what the next connections need.
-func (u *URLTestPool) probeProxies(ctx context.Context, proxies []C.Proxy, timeout time.Duration, publish bool, priority bool) (map[string]uint16, map[string]struct{}) {
+func (u *URLTestPool) probeProxies(ctx context.Context, proxies []C.Proxy, timeout time.Duration, publish bool, priority bool, retry bool) (map[string]uint16, map[string]struct{}) {
 	// Every pool check, from the scheduled quick sweep to the recovery
 	// measurement, funnels its probes through here, so this is the one place
 	// that knows the whole set before the first probe answers.
@@ -2053,16 +2093,7 @@ func (u *URLTestPool) probeProxies(ctx context.Context, proxies []C.Proxy, timeo
 	tested := make(map[string]struct{}, len(proxies))
 	var mu sync.Mutex
 
-	probes := make([]probequeue.Probe, 0, len(proxies))
-	for _, proxy := range proxies {
-		probes = append(probes, probequeue.Probe{
-			Proxy:    proxy,
-			URL:      u.testUrl,
-			Expected: u.expectedRanges,
-			Timeout:  timeout,
-			Priority: priority,
-		})
-	}
+	probes := u.probesFor(proxies, timeout, priority)
 
 	// The queue decides when the probe runs; the pool's only limit is the
 	// timeout of the member itself. A group that checks without `lazy` routes
@@ -2073,7 +2104,7 @@ func (u *URLTestPool) probeProxies(ctx context.Context, proxies []C.Proxy, timeo
 	if !u.lazy {
 		submit = probequeue.SubmitForeground
 	}
-	check := submit(u.Name(), probes, func(result probequeue.Result) {
+	deliver := func(result probequeue.Result, recordFailure bool) {
 		mu.Lock()
 		defer mu.Unlock()
 
@@ -2084,7 +2115,7 @@ func (u *URLTestPool) probeProxies(ctx context.Context, proxies []C.Proxy, timeo
 				// holding a slot until the check ends
 				u.publishPartial(results, tested)
 			}
-			if !errors.Is(result.Err, context.Canceled) {
+			if recordFailure && !errors.Is(result.Err, context.Canceled) {
 				u.reputation.ProbeFailed(result.Name)
 			}
 			return
@@ -2096,8 +2127,32 @@ func (u *URLTestPool) probeProxies(ctx context.Context, proxies []C.Proxy, timeo
 			// carries every earlier result, so the pool cannot shrink back
 			u.publishPartial(results, tested)
 		}
+	}
+	// A retried check leaves the reputation to its second wave: a timeout on a
+	// network that is still settling is not a verdict, and only a member that
+	// failed both attempts has earned the failure.
+	check := submit(u.Name(), probes, func(result probequeue.Result) {
+		deliver(result, !retry)
 	})
 	check.Wait(ctx)
+
+	if retry && ctx.Err() == nil {
+		mu.Lock()
+		failed := failedProbes(proxies, results, tested)
+		mu.Unlock()
+		if len(failed) > 0 {
+			pause := time.NewTimer(urlTestPoolNetworkRetryPause)
+			select {
+			case <-pause.C:
+				retryCheck := submit(u.Name(), u.probesFor(failed, timeout, priority), func(result probequeue.Result) {
+					deliver(result, true)
+				})
+				retryCheck.Wait(ctx)
+			case <-ctx.Done():
+				pause.Stop()
+			}
+		}
+	}
 
 	// The answer is a snapshot: a check the caller left behind keeps probing
 	// and keeps publishing through the callback above, but it must not write
@@ -2105,6 +2160,41 @@ func (u *URLTestPool) probeProxies(ctx context.Context, proxies []C.Proxy, timeo
 	mu.Lock()
 	defer mu.Unlock()
 	return copyDelayResults(results), copyTestedNames(tested)
+}
+
+// failedProbes lists the proxies a check reached and measured dead, so the
+// retry wave asks exactly the questions the first one answered "no" to. A
+// member the check never reached is not retried: its probe is still running or
+// the caller left before it started.
+func failedProbes(proxies []C.Proxy, results map[string]uint16, tested map[string]struct{}) []C.Proxy {
+	failed := make([]C.Proxy, 0, len(proxies))
+	for _, proxy := range proxies {
+		if _, alive := results[proxy.Name()]; alive {
+			continue
+		}
+		if _, reached := tested[proxy.Name()]; !reached {
+			continue
+		}
+		failed = append(failed, proxy)
+	}
+	return failed
+}
+
+// probesFor builds the probes of one wave: the same URL and expected statuses
+// for every member, so a retried probe asks the queue exactly the question the
+// first wave asked and can share a probe that is still in flight.
+func (u *URLTestPool) probesFor(proxies []C.Proxy, timeout time.Duration, priority bool) []probequeue.Probe {
+	probes := make([]probequeue.Probe, 0, len(proxies))
+	for _, proxy := range proxies {
+		probes = append(probes, probequeue.Probe{
+			Proxy:    proxy,
+			URL:      u.testUrl,
+			Expected: u.expectedRanges,
+			Timeout:  timeout,
+			Priority: priority,
+		})
+	}
+	return probes
 }
 
 func copyDelayResults(results map[string]uint16) map[string]uint16 {
@@ -2325,6 +2415,7 @@ func NewURLTestPool(option GroupCommonOption, poolOption URLTestPoolOption, empt
 		preWarmRecheck:  urlTestPoolPreWarmRecheck,
 		backoffJitter:   randomBackoffJitter,
 		networkGen:      iface.NetworkGeneration(),
+		lastCheckGen:    iface.NetworkGeneration(),
 		// a member that failed a dial is skipped until the next quick check
 		// could have re-measured it
 		suspiciousTTL: interval,

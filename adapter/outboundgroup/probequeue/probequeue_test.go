@@ -477,6 +477,54 @@ func TestSubmitSharesInFlightProbe(t *testing.T) {
 	}
 }
 
+// A single-node test with the group's budget asks the same question the sweep
+// asks, so it joins the probe in flight instead of measuring the node again.
+func TestTestProxyWithBudgetSharesInFlightProbe(t *testing.T) {
+	gate := make(chan struct{})
+	var calls atomic.Int32
+	proxy := newTestProxy("shared", func(context.Context) (uint16, error) {
+		calls.Add(1)
+		<-gate
+		return 40, nil
+	})
+
+	type answer struct {
+		delay uint16
+		err   error
+	}
+	test := func() <-chan answer {
+		out := make(chan answer, 1)
+		go func() {
+			delay, err := TestProxyWithBudget(context.Background(), proxy, "https://example.com/204", nil, time.Second)
+			out <- answer{delay: delay, err: err}
+		}()
+		return out
+	}
+
+	first := test()
+	requireEventually(t, func() bool { return calls.Load() == 1 }, "the first test must hold the measurement")
+	second := test()
+
+	// The goroutine that runs the second test submits asynchronously, so wait
+	// until it has actually joined the running measurement before letting the
+	// first one finish: closing the gate earlier would race the submit.
+	key, keyed := probeKeyOf(Probe{Proxy: proxy, URL: "https://example.com/204", Timeout: time.Second, Priority: true})
+	require.True(t, keyed)
+	requireEventually(t, func() bool {
+		defaultQueue.mu.Lock()
+		defer defaultQueue.mu.Unlock()
+		entry, ok := defaultQueue.inflight[key]
+		return ok && entry.running && len(entry.waiters) == 2
+	}, "the second test must join the probe in flight")
+	close(gate)
+
+	for _, result := range []answer{<-first, <-second} {
+		require.NoError(t, result.err)
+		require.Equal(t, uint16(40), result.delay)
+	}
+	require.Equal(t, int32(1), calls.Load(), "the second test must share the measurement")
+}
+
 // The same proxy listed twice in one check is still one measurement, and both
 // entries of the check report.
 func TestSubmitSharesDuplicateProbesInBatch(t *testing.T) {

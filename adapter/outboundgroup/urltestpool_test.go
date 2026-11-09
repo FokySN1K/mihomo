@@ -2044,10 +2044,23 @@ func TestURLTestPoolNetworkChangeDropsBackoff(t *testing.T) {
 	pool.fullCheck()
 	require.Equal(t, 1, pool.emptySweepStreak())
 
+	pool.mu.Lock()
+	pool.suspicious["n0"] = time.Now().Add(time.Hour)
+	pool.cutMarks["n1"] = time.Now().Add(time.Hour)
+	pool.mu.Unlock()
+
+	// without a new generation the pool keeps both the backoff and the marks
+	pool.dropBackoffOnNetworkChange()
+	require.Equal(t, 1, pool.emptySweepStreak())
+	require.NotEmpty(t, pool.suspicious)
+	require.NotEmpty(t, pool.cutMarks)
+
 	iface.NotifyNetworkChanged()
 	pool.dropBackoffOnNetworkChange()
 	require.Zero(t, pool.emptySweepStreak())
 	require.True(t, pool.nextFullTime().IsZero(), "a network change must let the next full sweep run at once")
+	require.Empty(t, pool.suspicious, "the marks of the old network must go")
+	require.Empty(t, pool.cutMarks, "a cut on the old network must not hold a member back")
 
 	// a second call without a new generation must keep the state as it is
 	pool.mu.Lock()
@@ -2055,6 +2068,50 @@ func TestURLTestPoolNetworkChangeDropsBackoff(t *testing.T) {
 	pool.mu.Unlock()
 	pool.dropBackoffOnNetworkChange()
 	require.Equal(t, 2, pool.emptySweepStreak())
+}
+
+// The first scheduled check on a new network gives the members that failed one
+// second attempt: a handshake that timed out while the route was settling is
+// not a verdict, so the member must not leave the pool on the first answer.
+func TestURLTestPoolFirstCheckAfterNetworkChangeRetriesFailed(t *testing.T) {
+	var probes atomic.Int32
+	flake := newPoolControlledProxy("flake", nil, func(context.Context) (uint16, error) {
+		if probes.Add(1) == 1 {
+			return 0, errors.New("the route is not settled yet")
+		}
+		return 20, nil
+	})
+	pool := newPoolForTest(t, URLTestPoolOption{}, flake)
+
+	iface.NotifyNetworkChanged()
+	pool.fullCheck()
+
+	require.Equal(t, []string{"flake"}, poolNames(pool),
+		"the member that answered on the retry must stay in the pool")
+	require.EqualValues(t, 2, probes.Load(),
+		"the first check on a new network must retry the failed member once")
+
+	pool.fullCheck()
+	require.EqualValues(t, 3, probes.Load(), "a check on the same generation must not retry")
+}
+
+// A member that fails both attempts earns one failure, and the retry is not
+// repeated: only the first check after the network change pays for it.
+func TestURLTestPoolScheduledCheckRetriesFailedOnce(t *testing.T) {
+	var probes atomic.Int32
+	dead := newPoolControlledProxy("dead", nil, func(context.Context) (uint16, error) {
+		probes.Add(1)
+		return 0, errors.New("dead")
+	})
+	pool := newPoolForTest(t, URLTestPoolOption{}, dead)
+
+	iface.NotifyNetworkChanged()
+	pool.fullCheck()
+	require.EqualValues(t, 2, probes.Load(), "the failed member must get one second attempt")
+	require.Empty(t, poolNames(pool))
+
+	pool.fullCheck()
+	require.EqualValues(t, 3, probes.Load(), "a later check on the same network must not retry")
 }
 
 func TestURLTestPoolProviderUpdateDropsBackoff(t *testing.T) {
