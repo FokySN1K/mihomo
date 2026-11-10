@@ -301,6 +301,9 @@ dns:
   # 配置fake-ip-filter的匹配模式，默认为blacklist，即如果匹配成功不返回fake-ip
   # 可设置为whitelist，即只有匹配成功才返回fake-ip
   # 也可配置为rule，规则模式语法见fake-ip-filter说明
+  # 还可配置为route，直接复用下面的 rules 判断：命中 DIRECT 的域名返回真实 IP，
+  # 命中代理、REJECT 或没有规则命中的走 fake-ip；此时 fake-ip-filter 必须留空
+  # 注意：DNS 阶段只知道域名，GEOIP、IP-CIDR、PROCESS-NAME 等规则不会命中
   fake-ip-filter-mode: blacklist
   # 配置fakeip查询返回的TTL，非必要情况下请勿修改
   fake-ip-ttl: 1

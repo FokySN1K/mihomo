@@ -725,7 +725,7 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
 
 	parseIPV6(rawCfg) // must before DNS and Tun
 
-	dnsCfg, err := parseDNS(rawCfg, ruleProviders)
+	dnsCfg, err := parseDNS(rawCfg, ruleProviders, rules)
 	if err != nil {
 		return nil, err
 	}
@@ -1424,7 +1424,7 @@ func parseNameServerPolicy(nsPolicy *orderedmap.OrderedMap[string, any], adapter
 	return policy, nil
 }
 
-func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS, error) {
+func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider, routeRules []C.Rule) (*DNS, error) {
 	cfg := rawCfg.DNS
 	if cfg.Enable && len(cfg.NameServer) == 0 {
 		return nil, fmt.Errorf("if DNS configuration is turned on, NameServer cannot be empty")
@@ -1520,7 +1520,7 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 
 	if cfg.EnhancedMode == C.DNSFakeIP {
 		var fakeIPDomainSetBuilder *trie.DomainSetBuilder
-		if cfg.FakeIPFilterMode != C.FilterRule && len(dnsCfg.Fallback) != 0 {
+		if cfg.FakeIPFilterMode != C.FilterRule && cfg.FakeIPFilterMode != C.FilterRoute && len(dnsCfg.Fallback) != 0 {
 			fakeIPDomainSetBuilder = &trie.DomainSetBuilder{}
 			for _, fb := range dnsCfg.Fallback {
 				if net.ParseIP(fb.Addr) != nil {
@@ -1534,13 +1534,19 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 
 		skipper := &fakeip.Skipper{Mode: cfg.FakeIPFilterMode}
 
-		if cfg.FakeIPFilterMode == C.FilterRule {
+		switch cfg.FakeIPFilterMode {
+		case C.FilterRule:
 			rules, err := parseFakeIPRules(cfg.FakeIPFilter, ruleProviders)
 			if err != nil {
 				return nil, err
 			}
 			skipper.Rules = rules
-		} else {
+		case C.FilterRoute:
+			if len(cfg.FakeIPFilter) != 0 {
+				return nil, errors.New("dns.fake-ip-filter is ignored in 'route' mode, remove it or use 'rule' mode")
+			}
+			skipper.Router = routeRules
+		default:
 			host, err := parseDomain(cfg.FakeIPFilter, fakeIPDomainSetBuilder, "dns.fake-ip-filter", ruleProviders)
 			if err != nil {
 				return nil, err

@@ -104,6 +104,7 @@ var FilterModeMapping = map[string]FilterMode{
 	FilterBlackList.String(): FilterBlackList,
 	FilterWhiteList.String(): FilterWhiteList,
 	FilterRule.String():      FilterRule,
+	FilterRoute.String():     FilterRoute,
 }
 
 type FilterMode int
@@ -112,6 +113,7 @@ const (
 	FilterBlackList FilterMode = iota
 	FilterWhiteList
 	FilterRule
+	FilterRoute
 )
 
 func (e FilterMode) String() string {
@@ -122,6 +124,8 @@ func (e FilterMode) String() string {
 		return "whitelist"
 	case FilterRule:
 		return "rule"
+	case FilterRoute:
+		return "route"
 	default:
 		return "unknown"
 	}
