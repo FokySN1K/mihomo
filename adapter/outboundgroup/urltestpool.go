@@ -89,14 +89,16 @@ const (
 )
 
 // poolCheckKind selects what a scheduled check measures: the pool members only
-// (quick), every candidate of the providers (full), or the few members worth
-// one cheap probe while the outage backoff postpones a full sweep (canary).
+// (quick), every candidate of the providers (full), the few members worth one
+// cheap probe while the outage backoff postpones a full sweep (canary), or the
+// reputation leaders a lazy group probes before its first dial (warm).
 type poolCheckKind int
 
 const (
 	poolQuickCheck poolCheckKind = iota
 	poolFullCheck
 	poolCanaryCheck
+	poolWarmCheck
 )
 
 type URLTestPoolOption struct {
@@ -130,10 +132,13 @@ type URLTestPoolOption struct {
 // several quick checks in a row, a full check is started early to refill it.
 // The pool also fills itself before the first dial: the executor asks it to
 // warm up as soon as the config is applied, so the first connection does not
-// pay for the cold-start probe. On a cold start every measured member is
-// published as soon as its probe returns, and a dial waits only for the first
-// result (bounded by `timeout` and a 2s cap), so it is not routed to the first
-// proxy of the list only because nothing has been measured.
+// pay for the cold-start probe. A lazy group does not sweep its candidates at
+// a start: it measures only the members the reputation trusts, which fills the
+// pool for the first dial without a sweep of the whole provider. On a cold
+// start every measured member is published as soon as its probe returns, and a
+// dial waits only for the first result (bounded by `timeout` and a 2s cap), so
+// it is not routed to the first proxy of the list only because nothing has
+// been measured.
 // Dial failures mark the used proxy as suspicious so the next connection is
 // routed to the next best pool member; with `attempt-timeout` set, the next
 // member is tried inside the same call as well.
@@ -1235,7 +1240,7 @@ func (u *URLTestPool) beginCheck(kind poolCheckKind) (done <-chan struct{}, star
 	u.checkGen = iface.NetworkGeneration()
 	u.mu.Unlock()
 
-	if kind == poolFullCheck {
+	if kind == poolFullCheck || kind == poolWarmCheck {
 		u.beginWarmup()
 	}
 	go func() {
@@ -1259,6 +1264,8 @@ func (u *URLTestPool) beginCheck(kind poolCheckKind) (done <-chan struct{}, star
 		switch kind {
 		case poolFullCheck:
 			u.fullCheck()
+		case poolWarmCheck:
+			u.warmCheck()
 		case poolCanaryCheck:
 			u.canaryCheck()
 		default:
@@ -1373,12 +1380,11 @@ func (u *URLTestPool) waitWarm(ctx context.Context) {
 // the check waits for them: a full check started over the empty fallback would
 // only mark the pool empty for the next interval. A change of one of the
 // group's providers wakes the wait, which turns it into one proxy list read
-// per change instead of a poll every interval. `lazy` opts out, because the
-// profile asked for checks driven only by real traffic.
+// per change instead of a poll every interval. A `lazy` group keeps its checks
+// driven by real traffic and is not swept here, but it still measures the
+// members the reputation trusts: that is the handful of probes the first dial
+// would spend anyway, and it takes the wait away from it.
 func (u *URLTestPool) WarmUp() {
-	if u.lazy {
-		return
-	}
 	if !u.preWarming.CompareAndSwap(false, true) {
 		return
 	}
@@ -1406,8 +1412,78 @@ func (u *URLTestPool) WarmUp() {
 		if !u.waitProvidersReady(urlTestPoolPreWarmWait, loaded) {
 			return
 		}
+		if u.lazy {
+			u.scheduleCheck(poolWarmCheck)
+			return
+		}
 		u.maybeScheduleCheck()
 	}()
+}
+
+// warmCheck fills a lazy pool before the first dial: it measures the members
+// the reputation trusts instead of sweeping every candidate of the providers.
+// A group that asked for checks driven by traffic otherwise pays for them with
+// its first connection, and probing the leaders costs the pool size instead.
+// The result goes through applyResults, so the pool starts with a real
+// measurement and the first dial neither waits for one nor starts a sweep of
+// its own.
+func (u *URLTestPool) warmCheck() {
+	proxies := u.GetProxies(true)
+	if !u.proxiesReady(proxies) {
+		return
+	}
+
+	candidates := u.reputationCandidates(proxies, u.poolSize)
+	if len(candidates) == 0 {
+		return
+	}
+
+	log.Infoln("ProxyGroup: %s start smart warm-up of %d candidates", u.Name(), len(candidates))
+	results, _ := u.probeProxies(context.Background(), candidates, time.Duration(u.testTimeout)*time.Millisecond, true, false, false)
+	if len(results) == 0 {
+		// a warm-up that measured nothing says nothing about the pool: the
+		// device may still be bringing its network up, and the first dial has
+		// to find its own answer instead of inheriting an empty-sweep backoff
+		log.Infoln("ProxyGroup: %s smart warm-up measured nothing, the first dial takes over", u.Name())
+		return
+	}
+	u.storeResults(results)
+	u.applyResults(results)
+}
+
+// reputationCandidates lists the candidates a warm-up probes: the members with
+// the best reputation, in list order among equals, so a profile that has never
+// been measured still starts from the first proxies of its subscription. A
+// member the reputation sank below the suspect band is left to the sweep: the
+// warm-up exists to prepare a working pool, not to retry what already failed.
+func (u *URLTestPool) reputationCandidates(proxies []C.Proxy, limit int) []C.Proxy {
+	if limit <= 0 {
+		return nil
+	}
+
+	type warmCandidate struct {
+		proxy C.Proxy
+		score int
+	}
+	items := make([]warmCandidate, 0, len(proxies))
+	for _, proxy := range proxies {
+		items = append(items, warmCandidate{proxy: proxy, score: u.reputation.Score(proxy.Name())})
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		return items[i].score > items[j].score
+	})
+
+	picked := make([]C.Proxy, 0, limit)
+	for _, item := range items {
+		if len(picked) == limit {
+			break
+		}
+		if item.score <= reputation.Suspect {
+			continue
+		}
+		picked = append(picked, item.proxy)
+	}
+	return picked
 }
 
 // waitProvidersReady waits until the providers of the group have proxies and
@@ -1619,6 +1695,11 @@ func (u *URLTestPool) noteDialAccepted(proxy C.Proxy) {
 
 	u.mu.Lock()
 	u.lastGood = proxy.Name()
+	// a member that carried a connection is not suspicious: a mark earned on
+	// another route, or by a sweep that measured nothing at all, must not
+	// outlive the proof that this one works
+	delete(u.suspicious, proxy.Name())
+	delete(u.cutMarks, proxy.Name())
 	empty := len(u.pool) == 0
 	u.mu.Unlock()
 	if !empty {
@@ -2143,6 +2224,11 @@ func (u *URLTestPool) probeProxies(ctx context.Context, proxies []C.Proxy, timeo
 
 	results := make(map[string]uint16, len(proxies))
 	tested := make(map[string]struct{}, len(proxies))
+	// failed collects the members a wave measured dead. The reputation takes
+	// them only once the wave measured at least one alive member: when the
+	// whole candidate list times out, the route is down and the verdict
+	// belongs to the network, not to every node the wave reached.
+	failed := make([]string, 0, len(proxies))
 	var mu sync.Mutex
 
 	probes := u.probesFor(proxies, timeout, priority)
@@ -2168,7 +2254,7 @@ func (u *URLTestPool) probeProxies(ctx context.Context, proxies []C.Proxy, timeo
 				u.publishPartial(results, tested)
 			}
 			if recordFailure && !errors.Is(result.Err, context.Canceled) {
-				u.reputation.ProbeFailed(result.Name)
+				failed = append(failed, result.Name)
 			}
 			return
 		}
@@ -2210,8 +2296,26 @@ func (u *URLTestPool) probeProxies(ctx context.Context, proxies []C.Proxy, timeo
 	// and keeps publishing through the callback above, but it must not write
 	// the maps this caller reads.
 	mu.Lock()
-	defer mu.Unlock()
-	return copyDelayResults(results), copyTestedNames(tested)
+	pending := append([]string(nil), failed...)
+	snapshot := copyDelayResults(results)
+	testedNames := copyTestedNames(tested)
+	mu.Unlock()
+
+	u.recordProbeFailures(snapshot, pending)
+	return snapshot, testedNames
+}
+
+// recordProbeFailures charges the members a check measured dead. A wave that
+// measured nothing alive is not a verdict on the members: an outage takes the
+// whole candidate list down at once, and charging every node for it would sink
+// a node that worked for days after one dead sweep.
+func (u *URLTestPool) recordProbeFailures(results map[string]uint16, failed []string) {
+	if len(results) == 0 || len(failed) == 0 {
+		return
+	}
+	for _, name := range failed {
+		u.reputation.ProbeFailed(name)
+	}
 }
 
 // failedProbes lists the proxies a check reached and measured dead, so the

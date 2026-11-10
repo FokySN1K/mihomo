@@ -1475,25 +1475,75 @@ func (d *delayedPoolProvider) Proxies() []C.Proxy {
 	}
 }
 
-// TestURLTestPoolWarmUpSkipsLazy guards the opt-out: a lazy pool runs a check
-// only when real traffic asks for it.
-func TestURLTestPoolWarmUpSkipsLazy(t *testing.T) {
-	probe := &poolProbeProxy{cascadeFakeProxy: newPoolSucceedingProxy("fast", &dialLog{})}
-	probe.testFn = func() (uint16, error) { return 20, nil }
+// TestURLTestPoolWarmUpMeasuresLazyLeaders guards the lazy warm-up: the profile
+// asked for checks driven by traffic, so the group does not sweep its
+// candidates at a start, but it still measures the members the reputation
+// trusts, and only those. The first dial then routes by a real measurement
+// without paying for a check of its own.
+func TestURLTestPoolWarmUpMeasuresLazyLeaders(t *testing.T) {
+	var probes atomic.Int32
+	members := make([]C.Proxy, 0, 4)
+	for i := 0; i < 4; i++ {
+		members = append(members, newPoolControlledProxy(
+			fmt.Sprintf("member-%d", i), nil, func(context.Context) (uint16, error) {
+				probes.Add(1)
+				return 20, nil
+			}))
+	}
 
-	pd, err := provider.NewCompatibleProvider("pool", []C.Proxy{probe},
+	pd, err := provider.NewCompatibleProvider("pool", members,
 		provider.NewHealthCheck(nil, "", 0, 0, false, nil))
 	require.NoError(t, err)
 
-	pool, err := NewURLTestPool(GroupCommonOption{Name: "pool", Lazy: true},
+	pool, err := NewURLTestPool(GroupCommonOption{Name: "pool", Lazy: true, Interval: 300},
+		URLTestPoolOption{PoolSize: 2}, newPoolEmptyFallback(), []P.ProxyProvider{pd})
+	require.NoError(t, err)
+	pool.testUrl = "http://127.0.0.1:1/"
+
+	// the reputation trusts the two last members, so they are the ones worth
+	// the probes; the rest waits for the sweep the traffic starts
+	for i := 0; i < 5; i++ {
+		pool.reputation.DialSucceeded("member-3")
+	}
+	pool.reputation.DialSucceeded("member-2")
+
+	pool.WarmUp()
+
+	require.Eventually(t, func() bool { return len(poolNames(pool)) == 2 }, 2*time.Second, 5*time.Millisecond,
+		"the warm-up must fill a lazy pool before the first dial")
+	require.ElementsMatch(t, []string{"member-2", "member-3"}, poolNames(pool))
+	require.Equal(t, int32(2), probes.Load(), "a lazy warm-up measures the pool size, not every candidate")
+	require.Eventually(t, pool.hasFullCheck.Load, 2*time.Second, 5*time.Millisecond,
+		"the warm-up must count as the first measurement of the pool")
+}
+
+// A lazy pool whose reputation leaders do not answer keeps the slow path: the
+// first dial starts its own check instead of inheriting an empty sweep.
+func TestURLTestPoolWarmUpLeavesDeadLazyPoolToTheDial(t *testing.T) {
+	var probes atomic.Int32
+	dead := newPoolControlledProxy("dead", nil, func(context.Context) (uint16, error) {
+		probes.Add(1)
+		return 0, errors.New("probe failed")
+	})
+
+	pd, err := provider.NewCompatibleProvider("pool", []C.Proxy{dead},
+		provider.NewHealthCheck(nil, "", 0, 0, false, nil))
+	require.NoError(t, err)
+
+	pool, err := NewURLTestPool(GroupCommonOption{Name: "pool", Lazy: true, Interval: 300},
 		URLTestPoolOption{}, newPoolEmptyFallback(), []P.ProxyProvider{pd})
 	require.NoError(t, err)
 	pool.testUrl = "http://127.0.0.1:1/"
 
 	pool.WarmUp()
 
-	require.False(t, pool.preWarming.Load(), "a lazy pool must not start a warm-up")
-	require.False(t, pool.hasFullCheck.Load())
+	require.Eventually(t, func() bool { return probes.Load() == 1 && !pool.testing.Load() }, time.Second, 5*time.Millisecond,
+		"the warm-up must probe the reputation leaders")
+	require.False(t, pool.hasFullCheck.Load(), "a warm-up that measured nothing must not mark the pool checked")
+	require.Empty(t, poolNames(pool))
+	pool.mu.RLock()
+	require.Zero(t, pool.nextFullAt, "a warm-up that measured nothing must not start an outage backoff")
+	pool.mu.RUnlock()
 }
 
 // TestURLTestPoolLazyReadStartsNoCheck guards the read path: a lazy pool stays
@@ -1603,11 +1653,33 @@ func TestURLTestPoolProbeFailureLowersReputation(t *testing.T) {
 	broken := newPoolControlledProxy("rep-broken", nil, func(context.Context) (uint16, error) {
 		return 0, errors.New("probe failed")
 	})
-	pool := newPoolForTest(t, URLTestPoolOption{}, broken)
+	alive := newPoolControlledProxy("rep-alive", nil, poolProbeOk(10))
+	pool := newPoolForTest(t, URLTestPoolOption{}, broken, alive)
+
+	_, err := pool.PoolCheck(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, -10, pool.reputation.Score("rep-broken"))
+	require.Zero(t, pool.reputation.Score("rep-alive"), "a measured member must not be charged")
+}
+
+// A sweep that measured nothing alive is a verdict on the route, not on the
+// nodes: an outage takes the whole candidate list down at once, and the store
+// must not sink every member for it.
+func TestURLTestPoolEmptySweepKeepsReputation(t *testing.T) {
+	var probes atomic.Int32
+	dead := func(name string) C.Proxy {
+		return newPoolControlledProxy(name, nil, func(context.Context) (uint16, error) {
+			probes.Add(1)
+			return 0, errors.New("probe failed")
+		})
+	}
+	pool := newPoolForTest(t, URLTestPoolOption{}, dead("rep-a"), dead("rep-b"))
 
 	_, err := pool.PoolCheck(context.Background())
 	require.Error(t, err, "a check that found nothing alive reports it")
-	require.Equal(t, -10, pool.reputation.Score("rep-broken"))
+	require.Equal(t, int32(2), probes.Load(), "both candidates must be measured")
+	require.Zero(t, pool.reputation.Score("rep-a"))
+	require.Zero(t, pool.reputation.Score("rep-b"))
 }
 
 // The emergency test is shared with every dial that joins it, so its probes get
@@ -1754,6 +1826,24 @@ func TestURLTestPoolSuspicionExpires(t *testing.T) {
 		defer pool.mu.RUnlock()
 		return !pool.isSuspiciousLocked("a")
 	}, time.Second, 5*time.Millisecond, "a suspicion must not outlive its ttl")
+}
+
+// A member that carried a connection is not suspicious, whatever mark an
+// earlier dial or a sweep of a dead network left on it.
+func TestURLTestPoolDialClearsMarks(t *testing.T) {
+	carried := newPoolControlledProxy("carried", nil, poolProbeOk(10))
+	pool := newPoolForTest(t, URLTestPoolOption{}, carried)
+
+	pool.markSuspicious("carried")
+	pool.markCut("carried")
+
+	pool.noteDialAccepted(pool.GetProxies(false)[0])
+
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+	require.False(t, pool.isSuspiciousLocked("carried"), "a dial that carried traffic clears the suspicion")
+	require.Empty(t, pool.cutMarks, "a dial that carried traffic clears the cut grace")
+	require.Equal(t, "carried", pool.lastGood)
 }
 
 // The state a ui needs to explain a slow switch is part of the group's json.
