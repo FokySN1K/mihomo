@@ -44,6 +44,8 @@ type Resolver struct {
 	fallbackDomainFilters []C.DomainMatcher
 	fallbackIPFilters     []C.IpMatcher
 	fallbackLazyQuery     bool
+	hedgeDelay            time.Duration
+	health                *upstreamHealth
 	group                 singleflight.Group[*D.Msg]
 	cache                 dnsCache
 	policy                []dnsPolicy
@@ -220,7 +222,7 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 			result, cache, err = batchExchange(ctx, matched, m)
 			return
 		}
-		result, cache, err = batchExchange(ctx, r.main, m)
+		result, cache, err = batchExchange(ctx, r.activeMain(), m)
 		return
 	}
 
@@ -309,11 +311,28 @@ func (r *Resolver) ipExchange(ctx context.Context, m *D.Msg) (msg *D.Msg, err er
 	onlyFallback := r.shouldOnlyQueryFallback(m)
 
 	if onlyFallback {
-		res := <-r.asyncExchange(ctx, r.fallback, m)
+		res := <-r.asyncExchange(ctx, r.fallbackClients(), m)
 		return res.Msg, res.Error
 	}
 
-	msgCh := r.asyncExchange(ctx, r.main, m)
+	main := r.main
+	if r.health != nil {
+		if alive := r.health.pick(r.main); len(alive) != 0 {
+			main = alive
+		} else if r.fallback != nil {
+			// every main upstream is cooling down: the fallback is all that is left
+			res := <-r.asyncExchange(ctx, r.fallbackClients(), m)
+			return res.Msg, res.Error
+		}
+	}
+
+	mainCtx := ctx
+	if r.health != nil && r.hedgeDelay > 0 && len(r.fallback) != 0 {
+		// the hedge may answer before the main group finishes, so main is
+		// detached from the caller's cancel and reports its real outcome
+		mainCtx = detachedDeadline(ctx)
+	}
+	msgCh := r.asyncExchange(mainCtx, main, m)
 
 	if r.fallback == nil { // directly return if no fallback servers are available
 		res := <-msgCh
@@ -321,9 +340,13 @@ func (r *Resolver) ipExchange(ctx context.Context, m *D.Msg) (msg *D.Msg, err er
 		return
 	}
 
+	if r.hedgeDelay > 0 {
+		return r.hedgedExchange(ctx, m, msgCh)
+	}
+
 	var fallbackMsg <-chan *result
 	if !r.fallbackLazyQuery {
-		fallbackMsg = r.asyncExchange(ctx, r.fallback, m)
+		fallbackMsg = r.asyncExchange(ctx, r.fallbackClients(), m)
 	}
 	res := <-msgCh
 	if res.Error == nil {
@@ -339,7 +362,7 @@ func (r *Resolver) ipExchange(ctx context.Context, m *D.Msg) (msg *D.Msg, err er
 	}
 
 	if fallbackMsg == nil {
-		fallbackMsg = r.asyncExchange(ctx, r.fallback, m)
+		fallbackMsg = r.asyncExchange(ctx, r.fallbackClients(), m)
 	}
 	res = <-fallbackMsg
 	msg, err = res.Msg, res.Error
@@ -402,6 +425,7 @@ func (r *Resolver) ClearCache() {
 
 func (r *Resolver) ResetConnection() {
 	if r != nil {
+		r.health.reset()
 		for _, c := range r.main {
 			c.ResetConnection()
 		}
@@ -483,6 +507,9 @@ type Config struct {
 	FallbackIPFilter     []C.IpMatcher
 	FallbackDomainFilter []C.DomainMatcher
 	FallbackLazyQuery    bool
+	FallbackHedgeDelay   uint
+	NameserverMaxFails   int
+	NameserverCooldown   uint
 	Policy               []Policy
 	ProxyServerPolicy    []Policy
 	CacheAlgorithm       string
@@ -598,12 +625,16 @@ func NewResolver(config Config) (rs Resolvers) {
 		return
 	}
 
+	health := newUpstreamHealth(config.NameserverMaxFails, time.Duration(config.NameserverCooldown)*time.Second)
+	hedgeDelay := time.Duration(config.FallbackHedgeDelay) * time.Millisecond
 	r := &Resolver{
 		ipv6:        config.IPv6,
-		main:        cacheTransform(config.Main),
+		main:        trackClients(cacheTransform(config.Main), health),
 		cache:       config.newCache(),
 		ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
 		policy:      makePolicy(config.Policy),
+		hedgeDelay:  hedgeDelay,
+		health:      health,
 	}
 	r.defaultResolver = defaultResolver
 	rs.Resolver = r
@@ -611,19 +642,23 @@ func NewResolver(config Config) (rs Resolvers) {
 	if len(config.ProxyServer) != 0 {
 		rs.ProxyResolver = &Resolver{
 			ipv6:        config.IPv6,
-			main:        cacheTransform(config.ProxyServer),
+			main:        trackClients(cacheTransform(config.ProxyServer), health),
 			cache:       config.newCache(),
 			ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
 			policy:      makePolicy(config.ProxyServerPolicy),
+			hedgeDelay:  hedgeDelay,
+			health:      health,
 		}
 	}
 
 	if len(config.DirectServer) != 0 {
 		rs.DirectResolver = &Resolver{
 			ipv6:        config.IPv6,
-			main:        cacheTransform(config.DirectServer),
+			main:        trackClients(cacheTransform(config.DirectServer), health),
 			cache:       config.newCache(),
 			ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
+			hedgeDelay:  hedgeDelay,
+			health:      health,
 		}
 		if config.DirectFollowPolicy {
 			rs.DirectResolver.policy = r.policy
@@ -631,7 +666,7 @@ func NewResolver(config Config) (rs Resolvers) {
 	}
 
 	if len(config.Fallback) != 0 {
-		r.fallback = cacheTransform(config.Fallback)
+		r.fallback = trackClients(cacheTransform(config.Fallback), health)
 		r.fallbackIPFilters = config.FallbackIPFilter
 		r.fallbackDomainFilters = config.FallbackDomainFilter
 		r.fallbackLazyQuery = config.FallbackLazyQuery

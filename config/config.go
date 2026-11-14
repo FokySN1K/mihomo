@@ -161,6 +161,9 @@ type DNS struct {
 	FallbackIPFilter      []C.IpMatcher
 	FallbackDomainFilter  []C.DomainMatcher
 	FallbackLazyQuery     bool
+	FallbackHedgeDelay    uint
+	NameserverMaxFails    int
+	NameserverCooldown    uint
 	Listen                string
 	ListenRoutingMark     int
 	EnhancedMode          C.DNSMode
@@ -236,6 +239,9 @@ type RawDNS struct {
 	Fallback                     []string                            `yaml:"fallback" json:"fallback"`
 	FallbackFilter               RawFallbackFilter                   `yaml:"fallback-filter" json:"fallback-filter"`
 	FallbackLazyQuery            bool                                `yaml:"fallback-lazy-query" json:"fallback-lazy-query"`
+	FallbackHedgeDelay           uint                                `yaml:"fallback-hedge-delay" json:"fallback-hedge-delay"`
+	NameserverMaxFails           *uint                               `yaml:"nameserver-max-fails" json:"nameserver-max-fails"`
+	NameserverCooldown           uint                                `yaml:"nameserver-cooldown" json:"nameserver-cooldown"`
 	Listen                       string                              `yaml:"listen" json:"listen"`
 	ListenRoutingMark            int                                 `yaml:"listen-routing-mark" json:"listen-routing-mark"`
 	EnhancedMode                 C.DNSMode                           `yaml:"enhanced-mode" json:"enhanced-mode"`
@@ -1454,6 +1460,19 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider, routeR
 
 	if dnsCfg.Fallback, err = parseNameServer(cfg.Fallback, cfg.RespectRules, cfg.PreferH3); err != nil {
 		return nil, err
+	}
+
+	dnsCfg.FallbackHedgeDelay = cfg.FallbackHedgeDelay
+	dnsCfg.NameserverMaxFails = 3
+	if cfg.NameserverMaxFails != nil {
+		dnsCfg.NameserverMaxFails = int(*cfg.NameserverMaxFails)
+	}
+	dnsCfg.NameserverCooldown = cfg.NameserverCooldown
+	if dnsCfg.NameserverCooldown == 0 {
+		dnsCfg.NameserverCooldown = 30
+	}
+	if dnsCfg.FallbackHedgeDelay > 0 && len(dnsCfg.Fallback) == 0 {
+		log.Warnln("dns.fallback-hedge-delay has no effect without dns.fallback")
 	}
 
 	if dnsCfg.NameServerPolicy, err = parseNameServerPolicy(cfg.NameServerPolicy, "dns.nameserver-policy", ruleProviders, cfg.RespectRules, cfg.PreferH3); err != nil {
