@@ -161,6 +161,9 @@ type DNS struct {
 	FallbackIPFilter      []C.IpMatcher
 	FallbackDomainFilter  []C.DomainMatcher
 	FallbackLazyQuery     bool
+	FallbackHedgeDelay    uint
+	NameserverMaxFails    int
+	NameserverCooldown    uint
 	Listen                string
 	ListenRoutingMark     int
 	EnhancedMode          C.DNSMode
@@ -236,6 +239,9 @@ type RawDNS struct {
 	Fallback                     []string                            `yaml:"fallback" json:"fallback"`
 	FallbackFilter               RawFallbackFilter                   `yaml:"fallback-filter" json:"fallback-filter"`
 	FallbackLazyQuery            bool                                `yaml:"fallback-lazy-query" json:"fallback-lazy-query"`
+	FallbackHedgeDelay           uint                                `yaml:"fallback-hedge-delay" json:"fallback-hedge-delay"`
+	NameserverMaxFails           *uint                               `yaml:"nameserver-max-fails" json:"nameserver-max-fails"`
+	NameserverCooldown           uint                                `yaml:"nameserver-cooldown" json:"nameserver-cooldown"`
 	Listen                       string                              `yaml:"listen" json:"listen"`
 	ListenRoutingMark            int                                 `yaml:"listen-routing-mark" json:"listen-routing-mark"`
 	EnhancedMode                 C.DNSMode                           `yaml:"enhanced-mode" json:"enhanced-mode"`
@@ -725,7 +731,7 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
 
 	parseIPV6(rawCfg) // must before DNS and Tun
 
-	dnsCfg, err := parseDNS(rawCfg, ruleProviders)
+	dnsCfg, err := parseDNS(rawCfg, ruleProviders, rules)
 	if err != nil {
 		return nil, err
 	}
@@ -1424,7 +1430,7 @@ func parseNameServerPolicy(nsPolicy *orderedmap.OrderedMap[string, any], adapter
 	return policy, nil
 }
 
-func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS, error) {
+func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider, routeRules []C.Rule) (*DNS, error) {
 	cfg := rawCfg.DNS
 	if cfg.Enable && len(cfg.NameServer) == 0 {
 		return nil, fmt.Errorf("if DNS configuration is turned on, NameServer cannot be empty")
@@ -1454,6 +1460,19 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 
 	if dnsCfg.Fallback, err = parseNameServer(cfg.Fallback, cfg.RespectRules, cfg.PreferH3); err != nil {
 		return nil, err
+	}
+
+	dnsCfg.FallbackHedgeDelay = cfg.FallbackHedgeDelay
+	dnsCfg.NameserverMaxFails = 3
+	if cfg.NameserverMaxFails != nil {
+		dnsCfg.NameserverMaxFails = int(*cfg.NameserverMaxFails)
+	}
+	dnsCfg.NameserverCooldown = cfg.NameserverCooldown
+	if dnsCfg.NameserverCooldown == 0 {
+		dnsCfg.NameserverCooldown = 30
+	}
+	if dnsCfg.FallbackHedgeDelay > 0 && len(dnsCfg.Fallback) == 0 {
+		log.Warnln("dns.fallback-hedge-delay has no effect without dns.fallback")
 	}
 
 	if dnsCfg.NameServerPolicy, err = parseNameServerPolicy(cfg.NameServerPolicy, "dns.nameserver-policy", ruleProviders, cfg.RespectRules, cfg.PreferH3); err != nil {
@@ -1520,7 +1539,7 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 
 	if cfg.EnhancedMode == C.DNSFakeIP {
 		var fakeIPDomainSetBuilder *trie.DomainSetBuilder
-		if cfg.FakeIPFilterMode != C.FilterRule && len(dnsCfg.Fallback) != 0 {
+		if cfg.FakeIPFilterMode != C.FilterRule && cfg.FakeIPFilterMode != C.FilterRoute && len(dnsCfg.Fallback) != 0 {
 			fakeIPDomainSetBuilder = &trie.DomainSetBuilder{}
 			for _, fb := range dnsCfg.Fallback {
 				if net.ParseIP(fb.Addr) != nil {
@@ -1534,13 +1553,19 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 
 		skipper := &fakeip.Skipper{Mode: cfg.FakeIPFilterMode}
 
-		if cfg.FakeIPFilterMode == C.FilterRule {
+		switch cfg.FakeIPFilterMode {
+		case C.FilterRule:
 			rules, err := parseFakeIPRules(cfg.FakeIPFilter, ruleProviders)
 			if err != nil {
 				return nil, err
 			}
 			skipper.Rules = rules
-		} else {
+		case C.FilterRoute:
+			if len(cfg.FakeIPFilter) != 0 {
+				return nil, errors.New("dns.fake-ip-filter is ignored in 'route' mode, remove it or use 'rule' mode")
+			}
+			skipper.Router = routeRules
+		default:
 			host, err := parseDomain(cfg.FakeIPFilter, fakeIPDomainSetBuilder, "dns.fake-ip-filter", ruleProviders)
 			if err != nil {
 				return nil, err
