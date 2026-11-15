@@ -24,6 +24,13 @@ import (
 // milliseconds, when the profile does not set `timeout`.
 const defaultGroupTestTimeout = 5000
 
+// groupDataPlaneWatch bounds how long a group waits for the first byte of a
+// handshake before it treats the flow as a silent node. The groups below do not
+// rank their members themselves, so this only decides how soon the dead flow is
+// closed and counted as a failed dial that a health check reacts to: a dial that
+// accepted the route is not proof that the node carries the traffic.
+const groupDataPlaneWatch = 2 * time.Second
+
 type GroupBase struct {
 	*outbound.Base
 	hidden            bool
