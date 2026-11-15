@@ -38,8 +38,10 @@ const (
 	// defaultURLTestPoolAttemptTimeout bounds one member dial when the profile
 	// does not set `attempt-timeout`: a member that hangs must not spend the
 	// whole dial budget of the connection, so the next member of the pool is
-	// tried while the caller still waits.
-	defaultURLTestPoolAttemptTimeout = 3 * time.Second
+	// tried while the caller still waits. A working dial is one round trip;
+	// the second and a half covers a slow handshake of a node that still works
+	// and leaves the rest of the tunnel budget to the next member.
+	defaultURLTestPoolAttemptTimeout = 1500 * time.Millisecond
 	// urlTestPoolCutGrace is how long a member our own attempt-timeout cut stays
 	// out of the next choices. A cut is not proof of death — a slow handshake
 	// still means the node works — so it must not sit out the whole interval a
@@ -53,8 +55,10 @@ const (
 	// defaultURLTestPoolFirstResultWait caps how long a dial of a cold start
 	// waits for the first measured member. The wait is also bounded by the probe
 	// timeout (a result cannot arrive sooner) and is counted from the start of
-	// the check, so a check cycle never delays dials longer than this.
-	defaultURLTestPoolFirstResultWait = 2 * time.Second
+	// the check, so a check cycle never delays dials longer than this. It is
+	// short on purpose: a blind dial of a decent node connects sooner than the
+	// first probe answers, and the pool corrects a failed guess right after.
+	defaultURLTestPoolFirstResultWait = 300 * time.Millisecond
 	// urlTestPoolPreWarmRecheck is the safety net of a pre-warm: a load of a
 	// provider of the group wakes the wait at once, and this only covers a load
 	// that finished before the group subscribed.
@@ -86,6 +90,36 @@ const (
 	// of a fresh network settle within it, and a handshake that timed out
 	// meanwhile is not a verdict on the member.
 	urlTestPoolNetworkRetryPause = 500 * time.Millisecond
+	// urlTestPoolDataStrike is how long a member that accepted the handshake
+	// and then went silent stays out of the next dials. The first strike is
+	// cheap on purpose: one flow may have hit a broken destination, so the
+	// member gets its place back within a reconnect, and only a member that
+	// keeps dying after the handshake backs off further.
+	urlTestPoolDataStrike = 30 * time.Second
+	// urlTestPoolDataStrikeMax caps that demotion: a node that keeps accepting
+	// the handshake and never carrying the flow must stop returning every
+	// interval.
+	urlTestPoolDataStrikeMax = 5 * time.Minute
+	// urlTestPoolDataStrikeWindow resets the strike count: strikes spread wider
+	// than this are separate incidents and do not escalate.
+	urlTestPoolDataStrikeWindow = 15 * time.Minute
+	// urlTestPoolFirstByteFloor is the least time the reply watchdog gives a
+	// handshake, even to a member that always answers at once: a TLS handshake
+	// of a busy server takes a moment even on a healthy route.
+	urlTestPoolFirstByteFloor = 800 * time.Millisecond
+	// urlTestPoolFirstByteFactor scales the watchdog by the measured answer
+	// time of the member, so a slow but working node is not cut on its own
+	// normal latency.
+	urlTestPoolFirstByteFactor = 3
+	// urlTestPoolFirstByteCap bounds the watchdog: past it, waiting is worse
+	// than a retry on another member.
+	urlTestPoolFirstByteCap = 2500 * time.Millisecond
+	// urlTestPoolFirstByteWeight is the EWMA weight of a fresh answer time: a
+	// single slow answer moves the baseline by a quarter of its distance.
+	urlTestPoolFirstByteWeight = 4
+	// urlTestPoolDataEvidenceCap bounds the per-member evidence maps: a
+	// subscription that rotates names must not grow them for the whole session.
+	urlTestPoolDataEvidenceCap = 512
 )
 
 // poolCheckKind selects what a scheduled check measures: the pool members only
@@ -182,7 +216,16 @@ type URLTestPool struct {
 	// from suspicious: it only stays out of the next choices, and a failure mark
 	// that is already there is never shortened by it.
 	cutMarks map[string]time.Time
-	fastNode C.Proxy
+	// dataMarks holds the members that accepted the handshake and went silent,
+	// with the time the mark expires and the strike count behind it. A check
+	// that measures the node alive does not clear it: a probe answers in
+	// milliseconds while the flow a user waits for hung, and that is exactly
+	// the outage the mark exists to catch. Only a real answered byte clears it.
+	dataMarks map[string]*poolDataMark
+	// firstBytes is the measured answer time of every member, used to size the
+	// reply watchdog of the next connection.
+	firstBytes map[string]*poolFirstByte
+	fastNode   C.Proxy
 	// measuring is the emergency test of lastPool that runs while the pool has
 	// nothing measured alive. Every dial of the exhausted pool joins it instead
 	// of probing on its own; it is cleared as the test ends.
@@ -263,6 +306,25 @@ func newPoolMeasurement() *poolMeasurement {
 	return &poolMeasurement{alive: make(chan struct{}), done: make(chan struct{})}
 }
 
+// poolDataMark is the evidence a member left after the handshake: it accepted
+// the first write and never answered. The strike count outlives the expiry, so
+// a member that keeps dying after the handshake backs off further every time;
+// a member that carries a real answer resets it.
+type poolDataMark struct {
+	until   time.Time
+	strikes int
+	last    time.Time
+}
+
+// poolFirstByte is the running average of how long a member takes to answer
+// the handshake, in the EWMA form: the watchdog of the next connection is
+// scaled by it, so a slow but working member is not cut on its own latency.
+type poolFirstByte struct {
+	avg  time.Duration
+	hits int
+	last time.Time
+}
+
 // DialContext implements C.ProxyAdapter
 func (u *URLTestPool) DialContext(ctx context.Context, metadata *C.Metadata) (c C.Conn, err error) {
 	u.maybeScheduleCheck()
@@ -313,20 +375,19 @@ func (u *URLTestPool) DialContext(ctx context.Context, metadata *C.Metadata) (c 
 	if err == nil {
 		c.AppendToChains(u)
 		if N.NeedHandshake(c) {
-			// The dial only accepted the connection: the first write is what
-			// proves the member carries traffic, so the reputation is
-			// credited there and not twice. The route itself works already,
-			// so the outage bookkeeping runs now.
+			// The dial only accepted the connection: the first byte the
+			// member answers with is what proves it carries traffic, so the
+			// reputation is credited there and not twice. The route itself
+			// works already, so the outage bookkeeping runs now.
 			u.noteDialAccepted(proxy)
-			c = callback.NewFirstWriteCallBackConn(c, func(err error) {
-				if err == nil {
-					u.noteDialSucceeded(proxy)
-				} else {
-					u.onProxyFailed(proxy, err)
-				}
-			})
+			c = u.observeDataPlane(proxy, c, true)
 		} else {
+			// The dial of this protocol already completed its own handshake
+			// (QUIC, an authentication exchange), so it is proof of life. The
+			// observer still watches the data plane: a node that stops
+			// answering after it is what the watchdog catches.
 			u.noteDialSucceeded(proxy)
+			c = u.observeDataPlane(proxy, c, false)
 		}
 	}
 
@@ -696,7 +757,7 @@ func (u *URLTestPool) UsableMembers() int {
 	now := time.Now()
 	// a member cut by our own attempt-timeout cannot carry traffic within the
 	// grace either, so a parent must not count it as a reason to stay
-	marks := make(map[string]struct{}, len(u.suspicious)+len(u.cutMarks))
+	marks := make(map[string]struct{}, len(u.suspicious)+len(u.cutMarks)+len(u.dataMarks))
 	for name, until := range u.suspicious {
 		if now.Before(until) {
 			marks[name] = struct{}{}
@@ -704,6 +765,14 @@ func (u *URLTestPool) UsableMembers() int {
 	}
 	for name, until := range u.cutMarks {
 		if now.Before(until) {
+			marks[name] = struct{}{}
+		}
+	}
+	// a member that accepted the handshake and went silent is out of the next
+	// choices for the same reason: a parent that keeps a pool with nothing
+	// else left only repeats the flow that just died
+	for name, mark := range u.dataMarks {
+		if now.Before(mark.until) {
 			marks[name] = struct{}{}
 		}
 	}
@@ -754,8 +823,15 @@ func (u *URLTestPool) MarshalJSON() ([]byte, error) {
 			suspicious = append(suspicious, name)
 		}
 	}
+	silent := make([]string, 0, len(u.dataMarks))
+	for name, mark := range u.dataMarks {
+		if ts.Before(mark.until) {
+			silent = append(silent, name)
+		}
+	}
 	u.mu.RUnlock()
 	sort.Strings(suspicious)
+	sort.Strings(silent)
 
 	// The type is the adapter's own name: hosts that know url-test-pool show it
 	// as such, and the built-in fields below still let the rest render the group
@@ -772,6 +848,7 @@ func (u *URLTestPool) MarshalJSON() ([]byte, error) {
 		"lastGood":       lastGood,
 		"recovering":     recovering,
 		"suspicious":     suspicious,
+		"dataSilent":     silent,
 		"hidden":         u.Hidden(),
 		"icon":           u.Icon(),
 		"emptyFallback":  u.EmptyFallback().Name(),
@@ -959,8 +1036,11 @@ func (u *URLTestPool) isSuspiciousLocked(name string) bool {
 	if until, ok := u.suspicious[name]; ok && now.Before(until) {
 		return true
 	}
-	until, ok := u.cutMarks[name]
-	return ok && now.Before(until)
+	if until, ok := u.cutMarks[name]; ok && now.Before(until) {
+		return true
+	}
+	mark, ok := u.dataMarks[name]
+	return ok && now.Before(mark.until)
 }
 
 func (u *URLTestPool) onProxyFailed(proxy C.Proxy, err error) {
@@ -1135,6 +1215,9 @@ func (u *URLTestPool) dropBackoffOnNetworkChange() bool {
 	u.networkGen = generation
 	u.suspicious = nil
 	u.cutMarks = nil
+	// a member that stayed silent on the old route is not a verdict on the
+	// new one either: the same node often works fine after the device moves
+	u.dataMarks = nil
 	u.mu.Unlock()
 	u.exitBackoff("the network changed")
 	return true
@@ -1675,19 +1758,30 @@ func (u *URLTestPool) shouldRunFullCheck(alive, target int) bool {
 }
 
 // noteDialSucceeded remembers the proxy that carried traffic: it ends the
-// outage and feeds the reputation. The check runs in background and is
-// throttled, so dials never wait for it.
+// outage, feeds the reputation and clears the marks a failure earned. It runs
+// only on evidence of traffic: a dial that merely accepted the connection
+// proves the route works, not that the node carries the flow.
 func (u *URLTestPool) noteDialSucceeded(proxy C.Proxy) {
 	if tracksNodeReputation(proxy.Type()) {
 		u.reputation.DialSucceeded(proxy.Name())
 	}
+
+	u.mu.Lock()
+	// a member that carried a connection is not suspicious: a mark earned on
+	// another route, or by a sweep that measured nothing at all, must not
+	// outlive the proof that this one works
+	delete(u.suspicious, proxy.Name())
+	delete(u.cutMarks, proxy.Name())
+	u.mu.Unlock()
+
 	u.noteDialAccepted(proxy)
 }
 
 // noteDialAccepted remembers the route the dial proved and rebuilds an empty
 // pool (for example after a full outage). It is the part of noteDialSucceeded
 // that does not depend on the member carrying traffic yet: a protocol whose
-// handshake the first write will prove still tells us the network works.
+// handshake the first byte will prove still tells us the network works, so the
+// route bookkeeping must not wait for it.
 func (u *URLTestPool) noteDialAccepted(proxy C.Proxy) {
 	// the member carried traffic, so the outage is over: the next full sweep
 	// follows the usual schedule again instead of the empty-streak backoff
@@ -1695,11 +1789,6 @@ func (u *URLTestPool) noteDialAccepted(proxy C.Proxy) {
 
 	u.mu.Lock()
 	u.lastGood = proxy.Name()
-	// a member that carried a connection is not suspicious: a mark earned on
-	// another route, or by a sweep that measured nothing at all, must not
-	// outlive the proof that this one works
-	delete(u.suspicious, proxy.Name())
-	delete(u.cutMarks, proxy.Name())
 	empty := len(u.pool) == 0
 	u.mu.Unlock()
 	if !empty {
@@ -1710,6 +1799,167 @@ func (u *URLTestPool) noteDialAccepted(proxy C.Proxy) {
 		return
 	}
 	u.scheduleCheck(poolFullCheck)
+}
+
+// observeDataPlane installs the data-plane observer of a fresh connection. The
+// observer catches what the dial cannot see: a member that accepted the
+// handshake and then went silent, reset the flow, or ended it without an
+// answer. The watchdog is sized by the answer time measured for the member.
+// creditFirstByte marks a protocol whose dial says nothing about the carrier:
+// its reputation is credited at the first answered byte.
+func (u *URLTestPool) observeDataPlane(proxy C.Proxy, c C.Conn, creditFirstByte bool) C.Conn {
+	if callback.IsDataPlaneObserved(c) {
+		return c
+	}
+
+	return callback.NewDataPlaneConn(c, callback.DataPlaneOptions{
+		Handshake:        true,
+		FirstByteTimeout: u.firstByteWatchdog(proxy.Name()),
+		OnFirstByte: func(delay time.Duration) {
+			u.noteDataAnswered(proxy, delay)
+			if creditFirstByte {
+				u.noteDialSucceeded(proxy)
+			}
+		},
+		OnDrop: func(err error) {
+			u.onDataSilent(proxy, err)
+		},
+	})
+}
+
+// noteDataAnswered records a member that carried a real answer: the proof
+// clears the silent mark at once, resets its strike count and feeds the
+// watchdog baseline of the next connection.
+func (u *URLTestPool) noteDataAnswered(proxy C.Proxy, delay time.Duration) {
+	name := proxy.Name()
+	now := time.Now()
+
+	u.mu.Lock()
+	delete(u.dataMarks, name)
+	if u.firstBytes == nil {
+		u.firstBytes = make(map[string]*poolFirstByte)
+	}
+	sample := u.firstBytes[name]
+	if sample == nil {
+		sample = &poolFirstByte{}
+		u.firstBytes[name] = sample
+	}
+	if sample.hits == 0 {
+		sample.avg = delay
+	} else {
+		sample.avg += (delay - sample.avg) / urlTestPoolFirstByteWeight
+	}
+	if sample.hits < 1000 {
+		sample.hits++
+	}
+	sample.last = now
+	u.pruneDataEvidenceLocked(now)
+	u.mu.Unlock()
+}
+
+// firstByteWatchdog sizes the reply watchdog of the next connection: never
+// below the floor, scaled by what the member usually takes to answer, never
+// above the cap.
+func (u *URLTestPool) firstByteWatchdog(name string) time.Duration {
+	watch := urlTestPoolFirstByteFloor
+
+	u.mu.RLock()
+	sample := u.firstBytes[name]
+	if sample != nil && sample.hits > 0 {
+		if scaled := sample.avg * urlTestPoolFirstByteFactor; scaled > watch {
+			watch = scaled
+		}
+	}
+	u.mu.RUnlock()
+
+	if watch > urlTestPoolFirstByteCap {
+		watch = urlTestPoolFirstByteCap
+	}
+	return watch
+}
+
+// onDataSilent records a member that carried the handshake and then went
+// silent. That is the failure a dial cannot see: the node accepted the
+// connection, so the dial reported success, and the user was left waiting on
+// the flow. The first strike keeps the member out for one reconnect only; a
+// member that keeps dying after the handshake doubles its demotion up to the
+// cap, and a real answered byte clears the evidence at once.
+func (u *URLTestPool) onDataSilent(proxy C.Proxy, err error) {
+	if !shouldTrackDialFailure(proxy.Type(), err) {
+		return
+	}
+
+	name := proxy.Name()
+	now := time.Now()
+
+	u.mu.Lock()
+	if u.dataMarks == nil {
+		u.dataMarks = make(map[string]*poolDataMark)
+	}
+	mark := u.dataMarks[name]
+	if mark == nil {
+		mark = &poolDataMark{}
+		u.dataMarks[name] = mark
+	}
+	if now.Sub(mark.last) > urlTestPoolDataStrikeWindow {
+		mark.strikes = 0
+	}
+	mark.strikes++
+	mark.last = now
+
+	ttl := urlTestPoolDataStrike
+	for strikes := mark.strikes; strikes > 1 && ttl < urlTestPoolDataStrikeMax; strikes-- {
+		ttl *= 2
+	}
+	if ttl > urlTestPoolDataStrikeMax {
+		ttl = urlTestPoolDataStrikeMax
+	}
+	if until := now.Add(ttl); until.After(mark.until) {
+		mark.until = until
+	}
+	strikes := mark.strikes
+	if u.fastNode != nil && u.fastNode.Name() == name {
+		u.fastNode = nil
+	}
+	exhausted := len(u.pool) > 0
+	for _, poolName := range u.pool {
+		if !u.isSuspiciousLocked(poolName) {
+			exhausted = false
+			break
+		}
+	}
+	u.pruneDataEvidenceLocked(now)
+	u.mu.Unlock()
+
+	log.Warnln("ProxyGroup: %s: %s accepted the handshake and went silent (%v), keep it out for %s", u.Name(), name, err, ttl)
+	if strikes > 1 && tracksNodeReputation(proxy.Type()) {
+		u.reputation.DataFailed(name)
+	}
+	if exhausted {
+		// every member of the pool is out of the next choices: the emergency
+		// test and a fresh sweep are the only ways to find one that still
+		// carries the flow the probes alone could not see
+		u.requestFullCheckOnExhaustion()
+	}
+}
+
+// pruneDataEvidenceLocked bounds the per-member evidence maps: a subscription
+// that rotates servers must not grow them for the whole session.
+func (u *URLTestPool) pruneDataEvidenceLocked(now time.Time) {
+	if len(u.dataMarks) > urlTestPoolDataEvidenceCap {
+		for name, mark := range u.dataMarks {
+			if now.Sub(mark.last) > urlTestPoolDataStrikeWindow {
+				delete(u.dataMarks, name)
+			}
+		}
+	}
+	if len(u.firstBytes) > urlTestPoolDataEvidenceCap {
+		for name, sample := range u.firstBytes {
+			if now.Sub(sample.last) > urlTestPoolDataStrikeWindow {
+				delete(u.firstBytes, name)
+			}
+		}
+	}
 }
 
 // recoverAfterFailure joins the emergency test of the last non-empty pool and
@@ -2577,5 +2827,7 @@ func NewURLTestPool(option GroupCommonOption, poolOption URLTestPoolOption, empt
 		suspiciousTTL: interval,
 		suspicious:    make(map[string]time.Time),
 		cutMarks:      make(map[string]time.Time),
+		dataMarks:     make(map[string]*poolDataMark),
+		firstBytes:    make(map[string]*poolFirstByte),
 	}, nil
 }

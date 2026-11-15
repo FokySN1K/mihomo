@@ -39,13 +39,22 @@ func (f *Fallback) DialContext(ctx context.Context, metadata *C.Metadata) (C.Con
 		f.onDialFailed(proxy.Type(), err, f.healthCheck)
 	}
 
-	if N.NeedHandshake(c) {
-		c = callback.NewFirstWriteCallBackConn(c, func(err error) {
-			if err == nil {
+	if N.NeedHandshake(c) && !callback.IsDataPlaneObserved(c) {
+		// The dial only accepted the connection: the first byte the member
+		// answers with is what proves it carries traffic. A node that takes the
+		// first write and never answers is closed by the watchdog and counted
+		// as a failed dial, which is what the group health check reacts to. A
+		// nested group may already watch this connection: one dead flow must
+		// cost one demotion, not one per wrapping level.
+		c = callback.NewDataPlaneConn(c, callback.DataPlaneOptions{
+			Handshake:        true,
+			FirstByteTimeout: groupDataPlaneWatch,
+			OnFirstByte: func(time.Duration) {
 				f.onDialSuccess()
-			} else {
+			},
+			OnDrop: func(err error) {
 				f.onDialFailed(proxy.Type(), err, f.healthCheck)
-			}
+			},
 		})
 	}
 

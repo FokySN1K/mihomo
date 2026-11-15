@@ -66,6 +66,20 @@ const (
 	// stop returning every failed-cooldown and costing a broken connection per
 	// cycle.
 	cascadeMaxFailedCooldown = 5 * time.Minute
+	// cascadeDataWatch bounds how long a candidate may stay silent after the
+	// handshake it accepted: a TLS flow of a working node answers within a
+	// round trip, and waiting longer only leaves the user on a dead node. It is
+	// a fixed bound because a cascade does not measure its members itself.
+	cascadeDataWatch = 2 * time.Second
+	// cascadeDataCooldown is how long a candidate that accepted the handshake
+	// and then went silent keeps its place. The first strike is short on
+	// purpose: one flow may have hit a broken destination, so the candidate
+	// gets its place back within a reconnect, and only a candidate that keeps
+	// dying after the handshake backs off further.
+	cascadeDataCooldown = 3 * time.Second
+	// cascadeDataEscalateWindow resets the strike count of a candidate: silent
+	// deaths spread wider than this are separate incidents and do not escalate.
+	cascadeDataEscalateWindow = 15 * time.Minute
 )
 
 // errNoAliveMember reports a group candidate whose own check found nothing.
@@ -150,6 +164,15 @@ type cascadeState struct {
 	// answering probes but cannot carry traffic backs off instead of returning
 	// to the rotation every failed-cooldown. A successful dial resets it.
 	dialFaults int
+	// dataUntil is the end of the demotion a silent data plane earned: the
+	// candidate accepted the handshake and never answered the flow. dataAt and
+	// dataCount track repeated silent deaths inside cascadeDataEscalateWindow,
+	// so a candidate that keeps doing it backs off further instead of costing
+	// one broken flow per connection. Only a real answered byte clears it: a
+	// probe says nothing about the flow a user waited on.
+	dataUntil time.Time
+	dataAt    time.Time
+	dataCount int
 	// recheckedAt and rechecking throttle and single-flight the background probe
 	// that decides whether a cut candidate is alive.
 	recheckedAt time.Time
@@ -217,15 +240,7 @@ func (c *Cascade) DialContext(ctx context.Context, metadata *C.Metadata) (conn C
 			if err == nil {
 				conn.AppendToChains(c)
 				c.onAttemptSucceeded(proxy.Name())
-				if N.NeedHandshake(conn) {
-					conn = callback.NewFirstWriteCallBackConn(conn, func(err error) {
-						if err == nil {
-							c.onDialSuccess()
-						} else {
-							c.onAttemptFailed(proxy, err)
-						}
-					})
-				}
+				conn = c.observeDataPlane(proxy, conn)
 				return conn, nil
 			}
 
@@ -574,7 +589,7 @@ func (c *Cascade) UsableMembers() int {
 			continue
 		}
 		seen[name] = struct{}{}
-		if state, ok := c.states[name]; ok && state.failedUntil.After(now) {
+		if state, ok := c.states[name]; ok && (state.failedUntil.After(now) || state.dataUntil.After(now)) {
 			continue
 		}
 		usable++
@@ -603,7 +618,10 @@ func (c *Cascade) candidateOrder(proxies []C.Proxy) []C.Proxy {
 
 	failed := func(name string) bool {
 		state, ok := c.states[name]
-		return ok && state.failedUntil.After(now)
+		if !ok {
+			return false
+		}
+		return state.failedUntil.After(now) || state.dataUntil.After(now)
 	}
 
 	allFailed := true
@@ -672,12 +690,12 @@ func (c *Cascade) candidateOrder(proxies []C.Proxy) []C.Proxy {
 		}
 		state, ok := c.states[name]
 		switch {
-		case ok && state.alive && !state.failedUntil.After(now):
-			ranks[i] = cascadeRankAlive
-		case !ok || !state.failedUntil.After(now):
-			ranks[i] = cascadeRankWarm
-		default:
+		case ok && (state.failedUntil.After(now) || state.dataUntil.After(now)):
 			ranks[i] = cascadeRankCooling
+		case ok && state.alive:
+			ranks[i] = cascadeRankAlive
+		default:
+			ranks[i] = cascadeRankWarm
 		}
 	}
 
@@ -963,6 +981,83 @@ func (c *Cascade) onAttemptSucceeded(name string) {
 	c.mu.Unlock()
 }
 
+// observeDataPlane installs the data-plane observer of a fresh connection. A
+// connection that already carries one (a nested pool watches its own members)
+// is left alone: one dead flow must cost one demotion, not one per level.
+// creditFirstByte marks a protocol whose dial says nothing about the carrier:
+// its first answered byte is what ends the failed-dial bookkeeping.
+func (c *Cascade) observeDataPlane(proxy C.Proxy, conn C.Conn) C.Conn {
+	if callback.IsDataPlaneObserved(conn) {
+		return conn
+	}
+
+	creditFirstByte := N.NeedHandshake(conn)
+	return callback.NewDataPlaneConn(conn, callback.DataPlaneOptions{
+		Handshake:        true,
+		FirstByteTimeout: cascadeDataWatch,
+		OnFirstByte: func(time.Duration) {
+			c.onDataAnswered(proxy.Name())
+			if creditFirstByte {
+				c.onDialSuccess()
+			}
+		},
+		OnDrop: func(err error) {
+			c.onDataSilent(proxy, err)
+		},
+	})
+}
+
+// onDataAnswered records a candidate that carried a real answer: the proof
+// clears the silent mark and its strike count at once.
+func (c *Cascade) onDataAnswered(name string) {
+	c.mu.Lock()
+	if state, ok := c.states[name]; ok {
+		state.dataUntil = time.Time{}
+		state.dataAt = time.Time{}
+		state.dataCount = 0
+	}
+	c.mu.Unlock()
+}
+
+// onDataSilent records a candidate that carried the handshake and then went
+// silent. That is the failure a dial cannot see: the candidate accepted the
+// connection, so the dial reported success and the user was left waiting on
+// the flow. The first strike keeps the candidate out for one reconnect only; a
+// candidate that keeps dying after the handshake doubles its demotion up to
+// the failed-dial cap, and a real answered byte clears the evidence at once.
+func (c *Cascade) onDataSilent(proxy C.Proxy, err error) {
+	if !shouldTrackDialFailure(proxy.Type(), err) {
+		return
+	}
+
+	now := time.Now()
+
+	c.mu.Lock()
+	state := c.ensureStateLocked(proxy.Name())
+	if !state.dataAt.IsZero() && now.Sub(state.dataAt) > cascadeDataEscalateWindow {
+		state.dataCount = 0
+	}
+	state.dataAt = now
+	state.dataCount++
+
+	cooldown := cascadeDataCooldown
+	for strikes := state.dataCount; strikes > 1 && cooldown < cascadeMaxFailedCooldown; strikes-- {
+		cooldown *= 2
+	}
+	if cooldown > cascadeMaxFailedCooldown {
+		cooldown = cascadeMaxFailedCooldown
+	}
+	if until := now.Add(cooldown); until.After(state.dataUntil) {
+		state.dataUntil = until
+	}
+	if c.active == proxy.Name() {
+		c.active = ""
+	}
+	c.mu.Unlock()
+
+	log.Warnln("ProxyGroup: %s candidate %s accepted the handshake and went silent (%v), keep it out for %s", c.Name(), proxy.Name(), err, cooldown)
+}
+
 // onAttemptFailed records a failed dial and reports whether the candidate kept
 // its place. A candidate that owns the failover between its own members is not
 // demoted while it still has a working member inside the switch-grace window:
@@ -1190,7 +1285,7 @@ func (c *Cascade) settleActive(proxies []C.Proxy) {
 
 	alive := func(name string) bool {
 		state, ok := c.states[name]
-		return ok && state.alive && !state.failedUntil.After(now)
+		return ok && state.alive && !state.failedUntil.After(now) && !state.dataUntil.After(now)
 	}
 
 	if c.selected != "" && alive(c.selected) {

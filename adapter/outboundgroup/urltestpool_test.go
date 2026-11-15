@@ -1138,10 +1138,15 @@ func TestURLTestPoolFirstResultWaitFollowsTimeout(t *testing.T) {
 	require.Equal(t, defaultURLTestPoolFirstResultWait, pool.firstResultWait,
 		"the default probe timeout is longer than the cap")
 
+	pool, err = NewURLTestPool(GroupCommonOption{Name: "pool", TestTimeout: 200}, URLTestPoolOption{}, newPoolEmptyFallback(), nil)
+	require.NoError(t, err)
+	require.Equal(t, 200*time.Millisecond, pool.firstResultWait,
+		"a probe shorter than the cap bounds the wait")
+
 	pool, err = NewURLTestPool(GroupCommonOption{Name: "pool", TestTimeout: 800}, URLTestPoolOption{}, newPoolEmptyFallback(), nil)
 	require.NoError(t, err)
-	require.Equal(t, 800*time.Millisecond, pool.firstResultWait,
-		"a result cannot be published before the probe timeout expires")
+	require.Equal(t, defaultURLTestPoolFirstResultWait, pool.firstResultWait,
+		"a probe longer than the cap must not delay a cold dial past it")
 }
 
 // newColdPoolForTest builds a pool that never ran a check, so a dial starts one.
@@ -1828,21 +1833,30 @@ func TestURLTestPoolSuspicionExpires(t *testing.T) {
 	}, time.Second, 5*time.Millisecond, "a suspicion must not outlive its ttl")
 }
 
-// A member that carried a connection is not suspicious, whatever mark an
-// earlier dial or a sweep of a dead network left on it.
+// A member that carried traffic is not suspicious, whatever mark an earlier
+// dial or a sweep of a dead network left on it. A dial that only accepted the
+// connection is not that proof: the node has not carried the flow yet, and the
+// missing proof is exactly what the outage of a silent node looks like.
 func TestURLTestPoolDialClearsMarks(t *testing.T) {
 	carried := newPoolControlledProxy("carried", nil, poolProbeOk(10))
 	pool := newPoolForTest(t, URLTestPoolOption{}, carried)
+	proxy := pool.GetProxies(false)[0]
 
 	pool.markSuspicious("carried")
 	pool.markCut("carried")
 
-	pool.noteDialAccepted(pool.GetProxies(false)[0])
+	pool.noteDialAccepted(proxy)
+	pool.mu.RLock()
+	require.True(t, pool.isSuspiciousLocked("carried"),
+		"a dial that only accepted the connection says nothing about the flow")
+	pool.mu.RUnlock()
+
+	pool.noteDialSucceeded(proxy)
 
 	pool.mu.RLock()
 	defer pool.mu.RUnlock()
-	require.False(t, pool.isSuspiciousLocked("carried"), "a dial that carried traffic clears the suspicion")
-	require.Empty(t, pool.cutMarks, "a dial that carried traffic clears the cut grace")
+	require.False(t, pool.isSuspiciousLocked("carried"), "a flow that carried traffic clears the suspicion")
+	require.Empty(t, pool.cutMarks, "a flow that carried traffic clears the cut grace")
 	require.Equal(t, "carried", pool.lastGood)
 }
 

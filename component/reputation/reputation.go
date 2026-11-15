@@ -44,6 +44,11 @@ const (
 	// probeFall is the drop of a failed health probe. It is weaker evidence
 	// than a failed dial: the probe carries no application traffic.
 	probeFall = 10
+	// dataFall is the drop of a connection the node accepted and then stopped
+	// answering. It is stronger evidence than a failed probe -- the node took
+	// the handshake and then left the flow to hang -- but weaker than a failed
+	// dial: one broken destination may cost a node that otherwise works.
+	dataFall = 15
 	// recoveryStreak is how many successful dials in a row lift a suspect
 	// node back to neutral: the network changed and it works again.
 	recoveryStreak = 3
@@ -239,6 +244,27 @@ func (s *Store) ProbeFailed(name string) {
 	now := time.Now()
 	e := s.entryLocked(name)
 	e.Score = int16(clamp(e.decayed(now) - probeFall))
+	e.LastSeen = now
+	s.markDirtyLocked(name)
+}
+
+// DataFailed records a connection the node accepted and then left without an
+// answer. The node proved it is reachable, so this is weaker evidence than a
+// failed dial, but the flow a user waited on never got its first byte, which
+// makes it stronger evidence than a failed probe. Neither the failure nor the
+// success streak moves: one broken destination is not a verdict on the node.
+func (s *Store) DataFailed(name string) {
+	if s == nil {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.loadLocked()
+	now := time.Now()
+	e := s.entryLocked(name)
+	e.Score = int16(clamp(e.decayed(now) - dataFall))
 	e.LastSeen = now
 	s.markDirtyLocked(name)
 }
