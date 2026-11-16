@@ -1133,6 +1133,15 @@ func (c *Cascade) graceRetries(proxy C.Proxy) int {
 func (c *Cascade) onAttemptTimedOut(proxy C.Proxy) {
 	now := time.Now()
 
+	// A candidate that has nothing left to switch to inside itself keeps the
+	// short cut cooldown: escalating it to the full failed-cooldown would
+	// blacklist the only path it has for a route that is slow, not dead, and
+	// the next dial through the group would have nothing better to take.
+	orphan := false
+	if verdict, ok := usableMemberOf(proxy); ok && verdict.UsableMembers() <= 1 {
+		orphan = true
+	}
+
 	c.mu.Lock()
 	state := c.ensureStateLocked(proxy.Name())
 	if !state.timeoutAt.IsZero() && now.Sub(state.timeoutAt) > cascadeTimeoutEscalateWindow {
@@ -1141,7 +1150,7 @@ func (c *Cascade) onAttemptTimedOut(proxy C.Proxy) {
 	state.timeoutAt = now
 	state.timeoutCount++
 	count := state.timeoutCount
-	escalated := count >= cascadeTimeoutEscalateAfter && c.failedCooldown > 0
+	escalated := count >= cascadeTimeoutEscalateAfter && c.failedCooldown > 0 && !orphan
 
 	cooldown := cascadeTimeoutCooldown
 	if escalated {
@@ -1165,6 +1174,8 @@ func (c *Cascade) onAttemptTimedOut(proxy C.Proxy) {
 
 	if escalated {
 		log.Debugln("ProxyGroup: %s candidate %s was cut by attempt-timeout %d times, demoted for %s", c.Name(), proxy.Name(), count, c.failedCooldown)
+	} else if orphan && count >= cascadeTimeoutEscalateAfter {
+		log.Debugln("ProxyGroup: %s candidate %s was cut by attempt-timeout %d times but has no other member to switch to, keeping the short cooldown", c.Name(), proxy.Name(), count)
 	}
 	if !recheck {
 		return

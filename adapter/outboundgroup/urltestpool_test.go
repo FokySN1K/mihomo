@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -626,6 +627,22 @@ func newPoolOrderedProxy(name string, alive bool, delay uint16) *poolOrderedProx
 	return &poolOrderedProxy{cascadeFakeProxy: newCascadeTestProxy(name), alive: alive, delay: delay}
 }
 
+// poolPromotionProxy reports itself measured alive and lets a test decide what
+// its own probe answers, so the promotion gate is exercised without touching
+// the network.
+type poolPromotionProxy struct {
+	*poolOrderedProxy
+	probe func(context.Context) (uint16, error)
+}
+
+func (p *poolPromotionProxy) URLTest(ctx context.Context, _ string, _ utils.IntRanges[uint16]) (uint16, error) {
+	return p.probe(ctx)
+}
+
+func newPoolPromotionProxy(name string, delay uint16, probe func(context.Context) (uint16, error)) *poolPromotionProxy {
+	return &poolPromotionProxy{poolOrderedProxy: newPoolOrderedProxy(name, true, delay), probe: probe}
+}
+
 // A sweep probes the members that answered last time first, so the first wave
 // of an outage refills the pool instead of walking a whole provider.
 func TestURLTestPoolCheckOrdersMeasuredFirst(t *testing.T) {
@@ -659,6 +676,193 @@ func TestURLTestPoolRecoveryScansAfterMiss(t *testing.T) {
 	require.Len(t, scan, urlTestPoolRecoveryScanLimit, "the scan must stay bounded")
 	require.Equal(t, "p00", scan[0].Name())
 	require.Equal(t, fmt.Sprintf("p%02d", urlTestPoolRecoveryScanLimit-1), scan[len(scan)-1].Name())
+}
+
+// Every miss of the emergency test moves its window on, so a list longer than
+// one scan is not replayed from the same head forever: the head is
+// deterministic, and an outage that killed those members would keep it dead.
+func TestURLTestPoolRecoveryScanRotatesAfterMisses(t *testing.T) {
+	proxies := make([]C.Proxy, 0, 2*urlTestPoolRecoveryScanLimit+10)
+	for i := 0; i < 2*urlTestPoolRecoveryScanLimit+10; i++ {
+		proxies = append(proxies, newPoolOrderedProxy(fmt.Sprintf("p%02d", i), true, uint16(i)))
+	}
+
+	pool := &URLTestPool{testUrl: poolTestUrl}
+
+	pool.recoveryMisses = 1
+	first := pool.recoveryCandidates(proxies)
+	require.Len(t, first, urlTestPoolRecoveryScanLimit)
+	require.Equal(t, "p00", first[0].Name())
+
+	pool.recoveryMisses = 2
+	second := pool.recoveryCandidates(proxies)
+	require.Len(t, second, urlTestPoolRecoveryScanLimit)
+	require.Equal(t, fmt.Sprintf("p%02d", urlTestPoolRecoveryScanLimit), second[0].Name(),
+		"a second miss must scan the next window")
+
+	pool.recoveryMisses = 3
+	last := pool.recoveryCandidates(proxies)
+	require.Len(t, last, urlTestPoolRecoveryScanLimit)
+	require.Equal(t, fmt.Sprintf("p%02d", 2*urlTestPoolRecoveryScanLimit), last[0].Name())
+	require.Equal(t, "p09", last[len(last)-1].Name(), "a window past the end wraps around the list")
+}
+
+// A candidate measured before the freshness window may already be gone: the
+// dial keeps the member that is up, and the candidate is verified by one
+// background probe before it takes the dial. A second dial shares that probe
+// instead of loading the path again.
+func TestURLTestPoolStaleCandidateIsVerifiedBeforePromotion(t *testing.T) {
+	var calls atomic.Int32
+	release := make(chan struct{})
+	current := newPoolOrderedProxy("current", true, 500)
+	candidate := newPoolPromotionProxy("candidate", 20, func(ctx context.Context) (uint16, error) {
+		calls.Add(1)
+		select {
+		case <-release:
+			return 15, nil
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	})
+	pool := newPoolForTest(t, URLTestPoolOption{}, current, candidate)
+	proxies := []C.Proxy{current, candidate}
+
+	stale := time.Now().Add(-urlTestPoolPromotionFreshness - time.Minute)
+	pool.mu.Lock()
+	pool.fastNode = current
+	pool.measuredAt = map[string]time.Time{"current": time.Now(), "candidate": stale}
+	pool.mu.Unlock()
+
+	proxy, _ := pool.pickFast(proxies)
+	require.Equal(t, "current", proxy.Name(), "a stale measurement must not take the dial off a working member")
+	require.Eventually(t, func() bool { return calls.Load() == 1 }, time.Second, 5*time.Millisecond,
+		"the stale candidate must be verified by one probe")
+
+	proxy, _ = pool.pickFast(proxies)
+	require.Equal(t, "current", proxy.Name())
+	require.Equal(t, int32(1), calls.Load(), "a second dial must share the probe that already runs")
+
+	close(release)
+	require.Eventually(t, func() bool {
+		pool.mu.RLock()
+		defer pool.mu.RUnlock()
+		return pool.promotionFreshLocked("candidate", time.Now())
+	}, time.Second, 5*time.Millisecond, "an answer of the probe must stamp the measurement")
+
+	proxy, _ = pool.pickFast(proxies)
+	require.Equal(t, "candidate", proxy.Name(), "a verified candidate takes the dial")
+}
+
+// A candidate measured within the freshness window is promoted at once: the
+// gate only exists to catch measurements the pool cannot trust any more.
+func TestURLTestPoolFreshCandidatePromotesAtOnce(t *testing.T) {
+	var calls atomic.Int32
+	current := newPoolOrderedProxy("current", true, 500)
+	candidate := newPoolPromotionProxy("candidate", 20, func(context.Context) (uint16, error) {
+		calls.Add(1)
+		return 20, nil
+	})
+	pool := newPoolForTest(t, URLTestPoolOption{}, current, candidate)
+
+	now := time.Now()
+	pool.mu.Lock()
+	pool.fastNode = current
+	pool.measuredAt = map[string]time.Time{"current": now, "candidate": now}
+	pool.mu.Unlock()
+
+	proxy, _ := pool.pickFast([]C.Proxy{current, candidate})
+	require.Equal(t, "candidate", proxy.Name(), "a fresh measurement promotes at once")
+	require.Equal(t, int32(0), calls.Load(), "a fresh measurement needs no verification")
+
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+	require.Equal(t, "candidate", pool.fastNode.Name())
+}
+
+// The gate never keeps a marked member: a member that failed a dial is
+// replaced at once, whatever the age of the measurement behind the candidate.
+func TestURLTestPoolMarkedMemberIsReplacedWithoutVerification(t *testing.T) {
+	var calls atomic.Int32
+	dead := newPoolOrderedProxy("dead", true, 500)
+	candidate := newPoolPromotionProxy("candidate", 20, func(context.Context) (uint16, error) {
+		calls.Add(1)
+		return 20, nil
+	})
+	pool := newPoolForTest(t, URLTestPoolOption{}, dead, candidate)
+
+	pool.markSuspicious("dead")
+	stale := time.Now().Add(-urlTestPoolPromotionFreshness - time.Minute)
+	pool.mu.Lock()
+	pool.fastNode = dead
+	pool.measuredAt = map[string]time.Time{"dead": stale, "candidate": stale}
+	pool.mu.Unlock()
+
+	proxy, _ := pool.pickFast([]C.Proxy{dead, candidate})
+	require.Equal(t, "candidate", proxy.Name(), "a marked member must not hold the dial while a candidate is verified")
+	require.Equal(t, int32(0), calls.Load())
+}
+
+// Several different members cut by our own attempt-timeout within the window
+// say the route itself is slow: the pool checks itself early instead of
+// waiting for the next schedule. The check is throttled, so a route that stays
+// slow is not swept behind every dial.
+func TestURLTestPoolCutStormChecksThePoolEarly(t *testing.T) {
+	var probes atomic.Int32
+	member := func(name string) *poolControlledProxy {
+		return newPoolControlledProxy(name, nil, func(context.Context) (uint16, error) {
+			probes.Add(1)
+			return 10, nil
+		})
+	}
+	a, b, c := member("a"), member("b"), member("c")
+	pool := newPoolForTest(t, URLTestPoolOption{}, a, b, c, member("d"))
+
+	errCut := context.DeadlineExceeded
+	pool.onProxyCut(a, errCut)
+	pool.onProxyCut(b, errCut)
+	require.False(t, pool.testing.Load(), "two cuts of two members are not a storm")
+
+	pool.onProxyCut(c, errCut)
+	require.Eventually(t, func() bool { return probes.Load() > 0 }, time.Second, 5*time.Millisecond,
+		"a storm of cuts must start a check")
+	require.Eventually(t, func() bool { return !pool.testing.Load() }, time.Second, 5*time.Millisecond)
+
+	before := probes.Load()
+	pool.onProxyCut(a, errCut)
+	pool.onProxyCut(b, errCut)
+	pool.onProxyCut(c, errCut)
+	time.Sleep(50 * time.Millisecond)
+	require.Equal(t, before, probes.Load(), "the storm check is throttled")
+}
+
+// The flows of one incident die together: silently dropped flows of the same
+// member within the dedupe window are one strike, not one per flow.
+func TestURLTestPoolSilentFlowsOfOneIncidentCountOnce(t *testing.T) {
+	dead := newCascadeTestProxy("dead")
+	pool := newPoolForTest(t, URLTestPoolOption{}, dead)
+	errSilent := errors.New("connection reset by peer")
+
+	pool.onDataSilent(dead, errSilent)
+	pool.onDataSilent(dead, errSilent)
+	pool.onDataSilent(dead, errSilent)
+
+	pool.mu.RLock()
+	mark := pool.dataMarks["dead"]
+	strikes := mark.strikes
+	until := mark.until
+	pool.mu.RUnlock()
+	require.Equal(t, 1, strikes, "flows of one incident must not escalate the demotion")
+	require.LessOrEqual(t, time.Until(until), urlTestPoolDataStrike+time.Second)
+
+	pool.mu.Lock()
+	mark.last = time.Now().Add(-urlTestPoolStrikeDedupe - time.Second)
+	pool.mu.Unlock()
+	pool.onDataSilent(dead, errSilent)
+
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+	require.Equal(t, 2, pool.dataMarks["dead"].strikes, "a later incident escalates")
+	require.Greater(t, time.Until(pool.dataMarks["dead"].until), urlTestPoolDataStrike+time.Second)
 }
 
 // A dial with nothing measured alive waits for the running sweep to publish its
@@ -2318,4 +2522,226 @@ func TestURLTestPoolPrunesSuspectsAfterEmptySweeps(t *testing.T) {
 
 	pool.emptyStreak = 3
 	require.Len(t, pool.orderForCheck(pool.Proxies()), 3, "every other sweep measures the suspect band again")
+}
+
+// A dial of an exhausted pool must not leave on a member the pool already
+// marked as out of play: the mark is the evidence that the flow hung on it, so
+// dialing it again spends the attempt budget on a node known dead.
+func TestURLTestPoolBlindDialSkipsMarkedLastGood(t *testing.T) {
+	marked := newPoolControlledProxy("marked", nil, poolProbeOk(10))
+	clean := newPoolControlledProxy("clean", nil, poolProbeOk(10))
+	pool := newExhaustedPoolForTest(t, marked, clean)
+	pool.mu.Lock()
+	pool.lastGood = "marked"
+	pool.mu.Unlock()
+	pool.markSuspicious("marked")
+
+	proxy, exhausted := pool.fastForDial(false)
+	require.True(t, exhausted)
+	require.Equal(t, "clean", proxy.Name(),
+		"the last known good is marked, so the dial must leave on the member the mark does not cover")
+}
+
+// A data mark is the same evidence: the member accepted the handshake and left
+// the flow hanging, so an exhausted dial must not come back to it.
+func TestURLTestPoolBlindDialSkipsSilentMember(t *testing.T) {
+	silent := newPoolControlledProxy("silent", nil, poolProbeOk(10))
+	clean := newPoolControlledProxy("clean", nil, poolProbeOk(10))
+	pool := newExhaustedPoolForTest(t, silent, clean)
+	pool.mu.Lock()
+	pool.lastGood = "silent"
+	pool.mu.Unlock()
+	pool.onDataSilent(silent, errors.New("no answer"))
+
+	proxy, exhausted := pool.fastForDial(false)
+	require.True(t, exhausted)
+	require.Equal(t, "clean", proxy.Name())
+}
+
+// A pool whose every member is marked has nothing better than the member whose
+// mark ends first: it is the least punished one.
+func TestURLTestPoolBlindDialPicksTheSoonestMark(t *testing.T) {
+	a := newPoolControlledProxy("a", nil, poolProbeOk(10))
+	b := newPoolControlledProxy("b", nil, poolProbeOk(10))
+	c := newPoolControlledProxy("c", nil, poolProbeOk(10))
+	pool := newExhaustedPoolForTest(t, a, b, c)
+	pool.mu.Lock()
+	pool.pool = nil
+	pool.lastGood = "a"
+	pool.mu.Unlock()
+	pool.markSuspiciousFor("a", 10*time.Minute)
+	pool.markSuspiciousFor("b", time.Minute)
+	pool.markSuspiciousFor("c", 5*time.Minute)
+
+	proxy, exhausted := pool.fastForDial(false)
+	require.True(t, exhausted)
+	require.Equal(t, "b", proxy.Name())
+}
+
+// The sweep must leave the members it already marked for the tail: those marks
+// are the evidence a dying route leaves behind, and the first wave is the only
+// chance to find a survivor.
+func TestURLTestPoolOrderForCheckLeavesMarkedLast(t *testing.T) {
+	pool := &URLTestPool{testUrl: poolTestUrl}
+	marked := newPoolOrderedProxy("marked", true, 5)
+	dead := newPoolOrderedProxy("dead", false, 0)
+	other := newPoolOrderedProxy("other", false, 0)
+	pool.suspicious = map[string]time.Time{"marked": time.Now().Add(time.Minute)}
+
+	require.Equal(t, []string{"dead", "other", "marked"},
+		cascadeProxyNames(pool.orderForCheck([]C.Proxy{marked, dead, other})),
+		"a marked member must not take the head of the sweep, even with the best delay")
+}
+
+// A subscription that lists dozens of one transport must not fill the whole
+// first wave with it: the survivor of an outage that took that transport down
+// waits in the queue otherwise.
+func TestURLTestPoolOrderForCheckCoversTransports(t *testing.T) {
+	wave := probequeue.GetConcurrency()
+	members := make([]C.Proxy, 0, wave+1)
+	for i := 0; i <= wave; i++ {
+		members = append(members, newCascadeFakeProxy(fmt.Sprintf("same%02d", i), C.Hysteria2, nil, nil, 100))
+	}
+	members = append(members, newCascadeFakeProxy("odd-vless", C.Vless, nil, nil, 100))
+
+	pool := &URLTestPool{testUrl: poolTestUrl}
+	ordered := pool.orderForCheck(members)
+
+	require.Len(t, ordered, len(members))
+	require.Equal(t, "odd-vless", ordered[0].Name(),
+		"the only member of its transport must lead the first wave instead of waiting behind it")
+}
+
+// A member the pool already marked as dead must not hold a wave for the whole
+// member timeout: one that is back answers within the short budget.
+func TestURLTestPoolMarkedMemberGetsAShortProbeBudget(t *testing.T) {
+	clean := newPoolControlledProxy("clean", nil, poolProbeOk(10))
+	silent := newPoolControlledProxy("silent", nil, poolProbeOk(10))
+	failed := newPoolControlledProxy("failed", nil, poolProbeOk(10))
+	cut := newPoolControlledProxy("cut", nil, poolProbeOk(10))
+	pool := newPoolForTest(t, URLTestPoolOption{}, clean, silent, failed, cut)
+	pool.mu.Lock()
+	pool.pool = nil // the marks must not start an emergency sweep here
+	pool.mu.Unlock()
+
+	pool.onDataSilent(silent, errors.New("no answer"))
+	pool.markSuspicious("failed")
+	pool.markCut("cut")
+
+	base := 3 * time.Second
+	probes := pool.probesFor([]C.Proxy{clean, silent, failed, cut}, base, false)
+	require.Equal(t, base, probes[0].Timeout)
+	require.Equal(t, urlTestPoolMarkedProbeTimeout, probes[1].Timeout)
+	require.Equal(t, urlTestPoolMarkedProbeTimeout, probes[2].Timeout)
+	require.Equal(t, base, probes[3].Timeout,
+		"a cut by our own attempt-timeout is not evidence about the node")
+
+	require.Equal(t, time.Second, pool.probeTimeoutFor(clean, time.Second),
+		"a budget below the short one stays the wave's own")
+}
+
+// A member probed with the short budget of a marked one must not be charged
+// for the failure its mark already carries: a slow but working node would sink
+// twice for one outage.
+func TestURLTestPoolShortProbeDoesNotChargeMarkedMember(t *testing.T) {
+	marked := newPoolControlledProxy("marked", nil, poolProbeOk(10))
+	fresh := newPoolControlledProxy("fresh", nil, poolProbeOk(10))
+	pool := newPoolForTest(t, URLTestPoolOption{}, marked, fresh)
+	pool.mu.Lock()
+	pool.pool = nil
+	pool.mu.Unlock()
+	pool.markSuspicious("marked")
+
+	results := map[string]uint16{"alive": 1}
+	failed := []string{"marked", "fresh"}
+
+	// a wave with the member's own timeout shortens the probe of the marked
+	// one, so its failure is not a new verdict
+	pool.recordProbeFailures(results, failed, 3*time.Second)
+	require.Zero(t, pool.reputation.Score("marked"),
+		"the short budget of a marked member is not a new verdict")
+	require.Equal(t, -10, pool.reputation.Score("fresh"))
+
+	// a wave that already runs on the short budget gave both members the same
+	// timeout, so it charges both exactly as it did before the short budget
+	pool.recordProbeFailures(results, failed, urlTestPoolMarkedProbeTimeout)
+	require.Equal(t, -10, pool.reputation.Score("marked"))
+}
+
+// orderForCheckBeforeMarks is the sweep order the pool used before the marks
+// and the transport coverage: delay, then reputation, then name. The outage
+// test keeps it to measure what the new order changed.
+func orderForCheckBeforeMarks(pool *URLTestPool, proxies []C.Proxy) []C.Proxy {
+	ordered := append([]C.Proxy(nil), proxies...)
+	scores := make(map[string]int, len(ordered))
+	for _, proxy := range ordered {
+		scores[proxy.Name()] = pool.reputation.Score(proxy.Name())
+	}
+	sort.SliceStable(ordered, func(i, j int) bool {
+		left := ordered[i].LastDelayForTestUrl(pool.testUrl)
+		right := ordered[j].LastDelayForTestUrl(pool.testUrl)
+		if left != right {
+			return left < right
+		}
+		if scores[ordered[i].Name()] != scores[ordered[j].Name()] {
+			return scores[ordered[i].Name()] > scores[ordered[j].Name()]
+		}
+		return ordered[i].Name() < ordered[j].Name()
+	})
+	return ordered
+}
+
+// A sweep of a pool that lost its route must find a survivor in its first
+// wave. This replays the shape of a real outage: the members that carried
+// traffic until the route died top the reputation and still hold a fresh
+// data-plane mark, while the survivors are the cold nodes behind them. The
+// previous order spent the whole first wave on the marked members and found a
+// survivor only in the next one, twice the member timeout later.
+func TestURLTestPoolOutageSweepFindsASurvivorInTheFirstWave(t *testing.T) {
+	const (
+		total = 62
+		busy  = 40
+		alive = 7
+	)
+	wave := probequeue.GetConcurrency()
+
+	members := make([]C.Proxy, 0, total)
+	for i := 0; i < total; i++ {
+		members = append(members, newPoolOrderedProxy(fmt.Sprintf("p%02d", i), false, 0))
+	}
+	pool := newPoolForTest(t, URLTestPoolOption{}, members...)
+
+	// the members that carried traffic until the route died: the reputation
+	// prefers them, and the data plane already marked them silent
+	for i := 0; i < busy; i++ {
+		name := members[i].Name()
+		for n := 0; n < 20; n++ {
+			pool.reputation.DialSucceeded(name)
+		}
+		pool.onDataSilent(members[i], errors.New("no answer"))
+	}
+
+	// the survivors are cold nodes, not the ones the reputation trusts
+	survivors := make(map[string]struct{}, alive)
+	for i := busy; i < busy+alive; i++ {
+		survivors[members[i].Name()] = struct{}{}
+	}
+
+	firstAlive := func(ordered []C.Proxy) int {
+		for i, proxy := range ordered {
+			if _, ok := survivors[proxy.Name()]; ok {
+				return i
+			}
+		}
+		return -1
+	}
+
+	before := firstAlive(orderForCheckBeforeMarks(pool, members))
+	after := firstAlive(pool.orderForCheck(members))
+	t.Logf("first wave is %d probes: the first survivor sits at %d before, %d after (%d and %d probes needed)",
+		wave, before, after, before+1, after+1)
+
+	require.GreaterOrEqual(t, before, wave, "the previous order left every survivor outside the first wave")
+	require.Less(t, after, wave, "the survivors must be in the first wave")
+	require.Less(t, after, busy, "the cold nodes must go before the marked ones")
 }

@@ -182,6 +182,13 @@ func TestURLTestPoolSilentStrikesDoubleTheTTL(t *testing.T) {
 		urlTestPoolDataStrikeMax,
 	}
 	for i, ttl := range ttls {
+		// the strikes of this test are separate incidents: the pool counts the
+		// flows that die within urlTestPoolStrikeDedupe as one of them
+		pool.mu.Lock()
+		if mark := pool.dataMarks["a"]; mark != nil {
+			mark.last = time.Now().Add(-urlTestPoolStrikeDedupe - time.Second)
+		}
+		pool.mu.Unlock()
 		pool.onDataSilent(a, errors.New("connection reset by peer"))
 
 		pool.mu.RLock()

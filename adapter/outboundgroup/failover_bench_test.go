@@ -2,6 +2,8 @@ package outboundgroup
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"testing"
@@ -14,6 +16,7 @@ import (
 	"github.com/metacubex/mihomo/component/reputation"
 	C "github.com/metacubex/mihomo/constant"
 	P "github.com/metacubex/mihomo/constant/provider"
+	"github.com/metacubex/mihomo/log"
 
 	"github.com/stretchr/testify/require"
 )
@@ -171,5 +174,96 @@ func benchmarkCascadeDial(b *testing.B, handshake bool) {
 			b.Fatal(err)
 		}
 		_ = conn.Close()
+	}
+}
+
+// BenchmarkURLTestPoolOrderForCheck measures the ordering a full sweep pays
+// for every candidate of a large provider, with the marks and the reputation a
+// real outage leaves behind.
+func BenchmarkURLTestPoolOrderForCheck(b *testing.B) {
+	b.Run("62", func(b *testing.B) { benchmarkOrderForCheck(b, 62) })
+	b.Run("500", func(b *testing.B) { benchmarkOrderForCheck(b, 500) })
+}
+
+// BenchmarkURLTestPoolOrderForCheckBefore measures the order the pool used
+// before the marks and the transport coverage on the same list, so the cost of
+// the fix is read from one run of the benchmark instead of two builds.
+func BenchmarkURLTestPoolOrderForCheckBefore(b *testing.B) {
+	b.Run("62", func(b *testing.B) { benchmarkOrderForCheckBefore(b, 62) })
+	b.Run("500", func(b *testing.B) { benchmarkOrderForCheckBefore(b, 500) })
+}
+
+func newBenchOrderMembers(b *testing.B, size int) (*URLTestPool, []C.Proxy) {
+	b.Helper()
+
+	// the setup marks the members, and the warning of every mark would bury
+	// the benchmark line it belongs to
+	previous := log.Level()
+	log.SetLevel(log.ERROR)
+	b.Cleanup(func() { log.SetLevel(previous) })
+
+	members := make([]C.Proxy, 0, size)
+	for i := 0; i < size; i++ {
+		members = append(members, newPoolOrderedProxy(fmt.Sprintf("p%03d", i), false, 0))
+	}
+	pool := newBenchPool(b, members...)
+	for i := 0; i < size/2; i++ {
+		name := members[i].Name()
+		for n := 0; n < 5; n++ {
+			pool.reputation.DialSucceeded(name)
+		}
+		pool.onDataSilent(members[i], errors.New("no answer"))
+	}
+	return pool, members
+}
+
+func benchmarkOrderForCheck(b *testing.B, size int) {
+	pool, members := newBenchOrderMembers(b, size)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if ordered := pool.orderForCheck(members); len(ordered) != len(members) {
+			b.Fatal("the sweep lost members")
+		}
+	}
+}
+
+func benchmarkOrderForCheckBefore(b *testing.B, size int) {
+	pool, members := newBenchOrderMembers(b, size)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if ordered := orderForCheckBeforeMarks(pool, members); len(ordered) != len(members) {
+			b.Fatal("the sweep lost members")
+		}
+	}
+}
+
+// BenchmarkURLTestPoolBlindDialFallback measures the member choice of a dial
+// that has nothing measured alive, with every member of a large provider
+// marked: the fallback scans the list for the member whose mark ends first.
+func BenchmarkURLTestPoolBlindDialFallback(b *testing.B) {
+	members := make([]C.Proxy, 0, 62)
+	for i := 0; i < 62; i++ {
+		members = append(members, newBenchMember(fmt.Sprintf("p%02d", i), false))
+	}
+	pool := newBenchPool(b, members...)
+
+	until := time.Now().Add(time.Minute)
+	pool.mu.Lock()
+	for _, proxy := range members {
+		pool.suspicious[proxy.Name()] = until
+	}
+	pool.lastGood = members[0].Name()
+	pool.mu.Unlock()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if pool.blindDialFallback(members) == nil {
+			b.Fatal("no fallback member")
+		}
 	}
 }

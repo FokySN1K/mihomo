@@ -438,6 +438,25 @@ func TestCascadeTimeoutCutEscalatesAfterRepeatedCuts(t *testing.T) {
 		"a candidate cut over and over must take the full failed-cooldown")
 }
 
+// A candidate that has nothing left to switch to inside itself keeps the short
+// cut cooldown: the route is slow, not the candidate dead, and a long blackout
+// of its only member would leave the group with nothing better to dial.
+func TestCascadeTimeoutCutKeepsOrphanCandidateOnShortCooldown(t *testing.T) {
+	inner := adapter.NewProxy(newPoolForTest(t, URLTestPoolOption{}, newCascadeUnreachableProxy("only")))
+	group := newCascadeForTest(t, CascadeOption{FailedCooldown: intPtr(30)}, inner)
+
+	for i := 0; i < cascadeTimeoutEscalateAfter; i++ {
+		group.onAttemptTimedOut(inner)
+	}
+
+	group.mu.RLock()
+	state := *group.states[inner.Name()]
+	group.mu.RUnlock()
+	require.GreaterOrEqual(t, state.timeoutCount, cascadeTimeoutEscalateAfter)
+	require.WithinDuration(t, time.Now().Add(cascadeTimeoutCooldown), state.failedUntil, 2*time.Second,
+		"a candidate with no member to switch to must keep the short cooldown")
+}
+
 func TestCascadeTimeoutCutRecheckRestoresCandidate(t *testing.T) {
 	proxy := newCascadeTestProxy("slow")
 	group := newCascadeForTest(t, CascadeOption{}, proxy)

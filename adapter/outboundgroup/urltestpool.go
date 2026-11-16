@@ -47,6 +47,17 @@ const (
 	// still means the node works — so it must not sit out the whole interval a
 	// failed health check earns.
 	urlTestPoolCutGrace = 3 * time.Second
+	// urlTestPoolStormCuts is how many different members our own
+	// attempt-timeout has to cut within urlTestPoolStormWindow before the pool
+	// reads it as a storm and checks itself early. One cut may be one slow
+	// node; several members cut within seconds say the route itself is slow,
+	// and a check is what tells the pool which of them still answer.
+	urlTestPoolStormCuts   = 3
+	urlTestPoolStormWindow = 3 * time.Second
+	// urlTestPoolStormThrottle bounds how often a storm may start a check: a
+	// route that stays slow keeps cutting, and a check per dial would turn the
+	// outage into a sweep of the pool behind every connection.
+	urlTestPoolStormThrottle = 20 * time.Second
 	// urlTestPoolRecoveryWait is the head start an exhausted dial gives the
 	// emergency test before it falls back to the last known good proxy. The
 	// first probe of the test usually answers within it, so the dial leaves on
@@ -103,6 +114,11 @@ const (
 	// urlTestPoolDataStrikeWindow resets the strike count: strikes spread wider
 	// than this are separate incidents and do not escalate.
 	urlTestPoolDataStrikeWindow = 15 * time.Minute
+	// urlTestPoolStrikeDedupe is how close two silent flows have to be to count
+	// as one incident. The flows of one connection die together when a member
+	// goes silent, and each of them would otherwise double the demotion of a
+	// member that took a single hit.
+	urlTestPoolStrikeDedupe = 10 * time.Second
 	// urlTestPoolFirstByteFloor is the least time the reply watchdog gives a
 	// handshake, even to a member that always answers at once: a TLS handshake
 	// of a busy server takes a moment even on a healthy route.
@@ -120,6 +136,26 @@ const (
 	// urlTestPoolDataEvidenceCap bounds the per-member evidence maps: a
 	// subscription that rotates names must not grow them for the whole session.
 	urlTestPoolDataEvidenceCap = 512
+	// urlTestPoolMarkedProbeTimeout is the probe budget of a member the pool
+	// already marked as out of play: a dial it failed or a flow that died
+	// after the handshake. Such a member has to prove it is back, and one that
+	// answers does so within this budget, so a sweep must not spend the whole
+	// member timeout on the nodes the previous one already measured dead.
+	urlTestPoolMarkedProbeTimeout = 1500 * time.Millisecond
+	// urlTestPoolPromotionFreshness bounds the age of the measurement a member
+	// is promoted on. A measured delay carries no age of its own: the proxy
+	// keeps the last number until a check overwrites it, so a node that died
+	// after the previous sweep still reports the fastest delay of the pool and
+	// takes the next dial down with it. A candidate measured longer ago than
+	// this, or never, is verified by one background probe before it replaces
+	// the member a dial is already using.
+	urlTestPoolPromotionFreshness = 2 * time.Minute
+	// urlTestPoolFirstWaveCoverage is how many members the transport coverage
+	// of a sweep may move into its head. The queue starts about forty probes
+	// at once, so the head of the order is the wave; four slots are enough to
+	// keep every transport of a subscription in it without pushing the
+	// measured leaders out.
+	urlTestPoolFirstWaveCoverage = 4
 )
 
 // poolCheckKind selects what a scheduled check measures: the pool members only
@@ -216,6 +252,11 @@ type URLTestPool struct {
 	// from suspicious: it only stays out of the next choices, and a failure mark
 	// that is already there is never shortened by it.
 	cutMarks map[string]time.Time
+	// cutStorm holds the recent cuts by member, so the pool can tell a storm of
+	// attempt-timeouts from one slow node, and stormChecked is when that storm
+	// last started a check (the throttle of the next one).
+	cutStorm     []poolCut
+	stormChecked time.Time
 	// dataMarks holds the members that accepted the handshake and went silent,
 	// with the time the mark expires and the strike count behind it. A check
 	// that measures the node alive does not clear it: a probe answers in
@@ -226,6 +267,11 @@ type URLTestPool struct {
 	// reply watchdog of the next connection.
 	firstBytes map[string]*poolFirstByte
 	fastNode   C.Proxy
+	// measuredAt is when the pool last saw each member measured alive, by a
+	// check or by a dial that reached it. A proxy reports its last delay
+	// without an age, so this map is what keeps a stale measurement from
+	// promoting a member the pool cannot trust any more.
+	measuredAt map[string]time.Time
 	// measuring is the emergency test of lastPool that runs while the pool has
 	// nothing measured alive. Every dial of the exhausted pool joins it instead
 	// of probing on its own; it is cleared as the test ends.
@@ -314,6 +360,13 @@ type poolDataMark struct {
 	until   time.Time
 	strikes int
 	last    time.Time
+}
+
+// poolCut is one member our own attempt-timeout cut, stamped so the pool can
+// count how many different members were cut within a window.
+type poolCut struct {
+	name string
+	at   time.Time
 }
 
 // poolFirstByte is the running average of how long a member takes to answer
@@ -561,10 +614,10 @@ func (u *URLTestPool) failedDialFallback(ctx context.Context, tried map[string]s
 	if candidate.udp {
 		proxies = udpProxies(proxies)
 	}
-	if last := u.lastGoodProxy(proxies); last != nil {
-		if _, ok := tried[last.Name()]; !ok {
-			log.Debugln("ProxyGroup: %s: %s found by the emergency test failed, dialing the last known good %s", u.Name(), candidate.proxy.Name(), last.Name())
-			return last
+	if fallback := u.blindDialFallback(proxies); fallback != nil {
+		if _, ok := tried[fallback.Name()]; !ok {
+			log.Debugln("ProxyGroup: %s: %s found by the emergency test failed, dialing the blind fallback %s", u.Name(), candidate.proxy.Name(), fallback.Name())
+			return fallback
 		}
 	}
 	return nil
@@ -909,8 +962,14 @@ func (u *URLTestPool) fastForTraffic(touch bool, usable func([]C.Proxy) []C.Prox
 		return proxy, false
 	}
 
-	if last := u.lastGoodProxy(proxies); last != nil {
-		return last, true
+	if fallback := u.blindDialFallback(proxies); fallback != nil {
+		if fallback.Name() != proxy.Name() {
+			// the member the pool already marked as out of play is the one it
+			// would have dialed before, so the log names both and a field log
+			// shows which memory the dial left on instead
+			log.Debugln("ProxyGroup: %s: %s is marked out of play, dialing %s instead", u.Name(), proxy.Name(), fallback.Name())
+		}
+		return fallback, true
 	}
 
 	// the emergency test belongs to traffic as well: a read of an empty lazy
@@ -925,21 +984,113 @@ func (u *URLTestPool) fastForTraffic(touch bool, usable func([]C.Proxy) []C.Prox
 // still exists in the current proxy list.
 func (u *URLTestPool) lastGoodProxy(proxies []C.Proxy) C.Proxy {
 	u.mu.RLock()
-	name := u.lastGood
-	u.mu.RUnlock()
-	if name == "" {
+	defer u.mu.RUnlock()
+	return u.lastGoodLocked(proxies)
+}
+
+func (u *URLTestPool) lastGoodLocked(proxies []C.Proxy) C.Proxy {
+	if u.lastGood == "" {
 		return nil
 	}
 
 	for _, proxy := range proxies {
-		if proxy.Name() == name {
+		if proxy.Name() == u.lastGood {
 			return proxy
 		}
 	}
 	return nil
 }
 
+// blindDialFallback picks the member an exhausted dial leaves on when nothing
+// is measured alive. The last known good keeps the dial while no mark covers
+// it: it is the only member known to have carried traffic. A member the pool
+// already marked as out of play is not dialed on that memory alone — a flow
+// that hung on it would hang again — so the dial leaves on the best member the
+// marks do not cover, and only a pool whose every member is marked falls back
+// to the one whose mark ends first.
+func (u *URLTestPool) blindDialFallback(proxies []C.Proxy) C.Proxy {
+	if len(proxies) == 0 {
+		return nil
+	}
+
+	now := time.Now()
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	clean := make([]C.Proxy, 0, len(proxies))
+	for _, proxy := range proxies {
+		if u.markUntilLocked(proxy.Name(), now).IsZero() {
+			clean = append(clean, proxy)
+		}
+	}
+
+	if last := u.lastGoodLocked(clean); last != nil {
+		return last
+	}
+	if best := u.bestAliveLocked(clean, false); best != nil {
+		return best
+	}
+	if len(clean) > 0 {
+		return u.bestGuessLocked(clean)
+	}
+
+	var soonest C.Proxy
+	var soonestUntil time.Time
+	for _, proxy := range proxies {
+		until := u.markUntilLocked(proxy.Name(), now)
+		if soonest == nil || until.Before(soonestUntil) {
+			soonest = proxy
+			soonestUntil = until
+		}
+	}
+	return soonest
+}
+
+// markUntilLocked returns the end of the longest mark the pool holds on the
+// member: a dial it failed, our own attempt-timeout cut, or a flow that died
+// after the handshake. A zero time means the member is not marked.
+func (u *URLTestPool) markUntilLocked(name string, now time.Time) time.Time {
+	var until time.Time
+	if t, ok := u.suspicious[name]; ok && now.Before(t) {
+		until = t
+	}
+	if t, ok := u.cutMarks[name]; ok && now.Before(t) && t.After(until) {
+		until = t
+	}
+	if mark, ok := u.dataMarks[name]; ok && now.Before(mark.until) && mark.until.After(until) {
+		until = mark.until
+	}
+	return until
+}
+
+// failedUntilLocked is markUntilLocked without the grace of our own cut: a cut
+// says nothing about the node, so a probe must not be shortened for it.
+func (u *URLTestPool) failedUntilLocked(name string, now time.Time) time.Time {
+	var until time.Time
+	if t, ok := u.suspicious[name]; ok && now.Before(t) {
+		until = t
+	}
+	if mark, ok := u.dataMarks[name]; ok && now.Before(mark.until) && mark.until.After(until) {
+		until = mark.until
+	}
+	return until
+}
+
 func (u *URLTestPool) pickFast(proxies []C.Proxy) (C.Proxy, bool) {
+	proxy, exhausted, verify := u.pickFastLocked(proxies)
+	if verify != nil {
+		// The pool held the promotion back: the candidate is measured by one
+		// background probe, and the next dial promotes it once the answer
+		// stamps the measurement. The probe runs outside the pool lock.
+		u.startPromotionProbe(verify)
+	}
+	return proxy, exhausted
+}
+
+// pickFastLocked chooses the member a dial leaves on. It reports the member a
+// background probe still has to verify before the pool promotes it over the
+// member the dial is already using.
+func (u *URLTestPool) pickFastLocked(proxies []C.Proxy) (C.Proxy, bool, C.Proxy) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
@@ -947,7 +1098,7 @@ func (u *URLTestPool) pickFast(proxies []C.Proxy) (C.Proxy, bool) {
 		for _, proxy := range proxies {
 			if proxy.Name() == u.selected && proxy.AliveForTestUrl(u.testUrl) && !u.isSuspiciousLocked(proxy.Name()) {
 				u.fastNode = proxy
-				return proxy, false
+				return proxy, false, nil
 			}
 		}
 	}
@@ -970,17 +1121,73 @@ func (u *URLTestPool) pickFast(proxies []C.Proxy) (C.Proxy, bool) {
 	}
 	if best == nil {
 		u.fastNode = nil
-		return u.bestGuessLocked(proxies), exhausted
+		return u.bestGuessLocked(proxies), exhausted, nil
 	}
 
+	now := time.Now()
 	if u.fastNode != nil && u.fastNode.AliveForTestUrl(u.testUrl) &&
-		!u.isSuspiciousLocked(u.fastNode.Name()) && containsProxy(candidates, u.fastNode) &&
-		u.fastNode.LastDelayForTestUrl(u.testUrl) <= best.LastDelayForTestUrl(u.testUrl)+u.tolerance {
-		return u.fastNode, exhausted
+		!u.isSuspiciousLocked(u.fastNode.Name()) && containsProxy(candidates, u.fastNode) {
+		bestDelay := best.LastDelayForTestUrl(u.testUrl)
+		if u.fastNode.LastDelayForTestUrl(u.testUrl) <= bestDelay+u.tolerance {
+			return u.fastNode, exhausted, nil
+		}
+		// A member the pool never measured (0xffff is not a delay but the
+		// absence of one) is not faster on paper: its place among the other
+		// unmeasured members is list order, and there is no measurement a
+		// probe could make fresh.
+		if bestDelay != 0xffff && !u.promotionFreshLocked(best.Name(), now) {
+			// The candidate is faster on paper only: its measurement is older
+			// than urlTestPoolPromotionFreshness, so the member may already be
+			// gone, and a dial that leaves on it pays the outage the memory
+			// hides. The pool keeps the member that is up and has the candidate
+			// probed before it takes the dial.
+			return u.fastNode, exhausted, best
+		}
 	}
 
 	u.fastNode = best
-	return best, exhausted
+	return best, exhausted, nil
+}
+
+// promotionFreshLocked reports whether the pool measured the member recently
+// enough to promote it over the member a dial is already using.
+func (u *URLTestPool) promotionFreshLocked(name string, now time.Time) bool {
+	at, ok := u.measuredAt[name]
+	return ok && now.Sub(at) < urlTestPoolPromotionFreshness
+}
+
+// startPromotionProbe measures one candidate before the pool promotes it. The
+// probe is the same question a sweep asks — same URL, expected statuses and
+// budget — so a check already measuring that member hands its probe over
+// instead of loading the path twice, and only an answer stamps the measurement
+// as fresh. A failed probe writes nothing: the proxy's own bookkeeping marks it
+// not alive, and the next dial picks another candidate.
+//
+// It runs on its own goroutine: the queue measures a member that is itself a
+// group inline on the caller's goroutine, and a dial must not wait for that.
+func (u *URLTestPool) startPromotionProbe(proxy C.Proxy) {
+	probe := probequeue.Probe{
+		Proxy:    proxy,
+		URL:      u.testUrl,
+		Expected: u.expectedRanges,
+		Timeout:  u.probeTimeoutFor(proxy, time.Duration(u.testTimeout)*time.Millisecond),
+	}
+	submit := probequeue.Submit
+	if !u.lazy {
+		submit = probequeue.SubmitForeground
+	}
+	go submit(u.Name(), []probequeue.Probe{probe}, func(result probequeue.Result) {
+		if result.Err != nil {
+			return
+		}
+		now := time.Now()
+		u.mu.Lock()
+		if u.measuredAt == nil {
+			u.measuredAt = make(map[string]time.Time)
+		}
+		u.measuredAt[result.Name] = now
+		u.mu.Unlock()
+	})
 }
 
 func (u *URLTestPool) poolProxiesLocked(proxies []C.Proxy) []C.Proxy {
@@ -1059,9 +1266,44 @@ func (u *URLTestPool) onProxyFailed(proxy C.Proxy, err error) {
 // once instead of sitting out the whole interval. A cut is not a failure of the
 // node, so it does not count toward the group health check either.
 func (u *URLTestPool) onProxyCut(proxy C.Proxy, err error) {
-	if shouldTrackDialFailure(proxy.Type(), err) {
-		u.markCut(proxy.Name())
+	if !shouldTrackDialFailure(proxy.Type(), err) {
+		return
 	}
+	u.markCut(proxy.Name())
+	u.noteCutStorm(proxy.Name(), time.Now())
+}
+
+// noteCutStorm starts a quick check when several different members are cut by
+// our own attempt-timeout within urlTestPoolStormWindow. One cut may be one
+// slow node; a storm of them says the route the whole pool goes through is
+// slow, and a check is what tells the pool which members still answer. The
+// check is throttled, so a route that stays slow is not swept behind every
+// connection, and a repeated cut of the same member is not a storm.
+func (u *URLTestPool) noteCutStorm(name string, now time.Time) {
+	u.mu.Lock()
+	kept := u.cutStorm[:0]
+	for _, cut := range u.cutStorm {
+		if cut.name != name && now.Sub(cut.at) <= urlTestPoolStormWindow {
+			kept = append(kept, cut)
+		}
+	}
+	kept = append(kept, poolCut{name: name, at: now})
+	if len(kept) > urlTestPoolStormCuts*2 {
+		kept = kept[len(kept)-urlTestPoolStormCuts*2:]
+	}
+	u.cutStorm = kept
+	storm := len(kept) >= urlTestPoolStormCuts &&
+		(u.stormChecked.IsZero() || now.Sub(u.stormChecked) >= urlTestPoolStormThrottle)
+	if storm {
+		u.stormChecked = now
+	}
+	u.mu.Unlock()
+
+	if !storm {
+		return
+	}
+	log.Debugln("ProxyGroup: %s: attempt-timeout cut %d members within %s, checking the pool early", u.Name(), len(kept), urlTestPoolStormWindow)
+	u.scheduleCheck(poolQuickCheck)
 }
 
 // healthCheck is called by GroupBase when the same proxy failed several times in a row
@@ -1790,6 +2032,12 @@ func (u *URLTestPool) noteDialAccepted(proxy C.Proxy) {
 	u.mu.Lock()
 	u.lastGood = proxy.Name()
 	empty := len(u.pool) == 0
+	if u.measuredAt == nil {
+		u.measuredAt = make(map[string]time.Time)
+	}
+	// the member carried a dial, so it is alive as of now: that is the
+	// freshest evidence the pool has and the one a promotion may rely on
+	u.measuredAt[proxy.Name()] = time.Now()
 	u.mu.Unlock()
 	if !empty {
 		return
@@ -1904,7 +2152,13 @@ func (u *URLTestPool) onDataSilent(proxy C.Proxy, err error) {
 	if now.Sub(mark.last) > urlTestPoolDataStrikeWindow {
 		mark.strikes = 0
 	}
-	mark.strikes++
+	// The flows of one incident die together: the first silent flow starts the
+	// strike, and the ones that follow it within the dedupe window only extend
+	// the demotion. Without this, a burst of parallel connections turns one
+	// silent node into the fastest possible escalation within a second.
+	if mark.strikes == 0 || now.Sub(mark.last) >= urlTestPoolStrikeDedupe {
+		mark.strikes++
+	}
 	mark.last = now
 
 	ttl := urlTestPoolDataStrike
@@ -2069,7 +2323,26 @@ func (u *URLTestPool) recoveryCandidates(proxies []C.Proxy) []C.Proxy {
 
 	scan := u.orderForCheck(proxies)
 	if len(scan) > urlTestPoolRecoveryScanLimit {
-		scan = scan[:urlTestPoolRecoveryScanLimit]
+		// Every miss moves the window on: the head of the order is
+		// deterministic, so an outage that killed those members would replay
+		// the same window of the order forever and never reach the rest of
+		// the list. The first scan keeps the head; each further miss starts
+		// one window later, wrapping around.
+		offset := 0
+		if misses > 1 {
+			offset = ((misses - 1) * urlTestPoolRecoveryScanLimit) % len(scan)
+		}
+		if offset > 0 {
+			window := make([]C.Proxy, 0, urlTestPoolRecoveryScanLimit)
+			window = append(window, scan[offset:]...)
+			window = append(window, scan[:offset]...)
+			if len(window) > urlTestPoolRecoveryScanLimit {
+				window = window[:urlTestPoolRecoveryScanLimit]
+			}
+			scan = window
+		} else {
+			scan = scan[:urlTestPoolRecoveryScanLimit]
+		}
 	}
 	return scan
 }
@@ -2247,6 +2520,11 @@ func (u *URLTestPool) fullCheck() {
 // find an alive member. A pool that lost its route is then refilled from the
 // first results instead of after every candidate of a large provider was
 // probed, which is what made an outage look like a long search for a node.
+// The members the pool marked as out of play go behind the rest, because those
+// marks are what a route that just died leaves behind: a sweep that starts
+// with them spends its first wave on the nodes the previous one already
+// measured dead, and the transport coverage keeps the wave from being filled
+// by one transport of a mixed subscription.
 func (u *URLTestPool) orderForCheck(proxies []C.Proxy) []C.Proxy {
 	ordered := append([]C.Proxy(nil), proxies...)
 	if u.shouldPruneSuspects() {
@@ -2265,28 +2543,109 @@ func (u *URLTestPool) orderForCheck(proxies []C.Proxy) []C.Proxy {
 			ordered = kept
 		}
 	}
-	// The scores are read once instead of inside the comparator: a sweep of a
-	// large provider must not take the store lock for every comparison.
-	scores := make(map[string]int, len(ordered))
-	for _, proxy := range ordered {
-		scores[proxy.Name()] = u.reputation.Score(proxy.Name())
+	// The marks, the delays and the scores are read once instead of inside the
+	// comparator: a sweep of a large provider must not take the pool lock, the
+	// proxy state or the store lock for every comparison.
+	type checkOrder struct {
+		proxy  C.Proxy
+		marked bool
+		delay  uint16
+		score  int
 	}
-	sort.SliceStable(ordered, func(i, j int) bool {
-		left := ordered[i].LastDelayForTestUrl(u.testUrl)
-		right := ordered[j].LastDelayForTestUrl(u.testUrl)
-		if left != right {
-			return left < right
+	items := make([]checkOrder, len(ordered))
+	now := time.Now()
+	u.mu.RLock()
+	for i, proxy := range ordered {
+		items[i] = checkOrder{
+			proxy:  proxy,
+			marked: !u.markUntilLocked(proxy.Name(), now).IsZero(),
+		}
+	}
+	u.mu.RUnlock()
+	for i := range items {
+		items[i].delay = items[i].proxy.LastDelayForTestUrl(u.testUrl)
+		items[i].score = u.reputation.Score(items[i].proxy.Name())
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].marked != items[j].marked {
+			return !items[i].marked
+		}
+		if items[i].delay != items[j].delay {
+			return items[i].delay < items[j].delay
 		}
 		// Every member that is not measured alive right now shares the max
 		// delay, so the reputation decides which of them is worth probing
 		// first: a node that carried traffic before is likelier to come back
 		// than one that has been failing for days.
-		if scores[ordered[i].Name()] != scores[ordered[j].Name()] {
-			return scores[ordered[i].Name()] > scores[ordered[j].Name()]
+		if items[i].score != items[j].score {
+			return items[i].score > items[j].score
 		}
-		return ordered[i].Name() < ordered[j].Name()
+		return items[i].proxy.Name() < items[j].proxy.Name()
 	})
-	return ordered
+	for i := range items {
+		ordered[i] = items[i].proxy
+	}
+	return u.coverTransports(ordered)
+}
+
+// coverTransports moves one member of every transport the head of a sweep does
+// not have into that head. A subscription that lists dozens of hysteria2 nodes
+// and a couple of vless ones hides the survivors of a QUIC outage behind the
+// whole first wave: the wave spends its budget on one transport while the node
+// that answers is still queued. The promoted members keep their relative
+// order and the rest of the sweep keeps its own, so a sweep that already covers
+// every transport of its head is left untouched.
+func (u *URLTestPool) coverTransports(ordered []C.Proxy) []C.Proxy {
+	wave := probequeue.GetConcurrency()
+	if wave <= 0 || len(ordered) <= wave {
+		return ordered
+	}
+
+	// a subscription mixes a handful of transports, so a small slice beats a
+	// map on both the lookup and the allocation
+	present := make([]C.AdapterType, 0, 4+urlTestPoolFirstWaveCoverage)
+	hasType := func(adapterType C.AdapterType) bool {
+		for _, seen := range present {
+			if seen == adapterType {
+				return true
+			}
+		}
+		return false
+	}
+	for _, proxy := range ordered[:wave] {
+		if !hasType(proxy.Type()) {
+			present = append(present, proxy.Type())
+		}
+	}
+
+	var promoted [urlTestPoolFirstWaveCoverage]C.Proxy
+	count := 0
+	for _, proxy := range ordered[wave:] {
+		if count == urlTestPoolFirstWaveCoverage {
+			break
+		}
+		if hasType(proxy.Type()) {
+			continue
+		}
+		present = append(present, proxy.Type())
+		promoted[count] = proxy
+		count++
+	}
+	if count == 0 {
+		return ordered
+	}
+
+	covered := make([]C.Proxy, len(ordered))
+	copy(covered, promoted[:count])
+	next := count
+	for _, proxy := range ordered {
+		if containsProxy(promoted[:count], proxy) {
+			continue
+		}
+		covered[next] = proxy
+		next++
+	}
+	return covered
 }
 
 // shouldPruneSuspects reports whether a full sweep should skip the nodes below
@@ -2404,6 +2763,19 @@ func (u *URLTestPool) publishPool(results map[string]uint16, tested map[string]s
 
 	now := time.Now()
 	u.mu.Lock()
+	if u.measuredAt == nil {
+		u.measuredAt = make(map[string]time.Time, len(results))
+	}
+	for name := range results {
+		u.measuredAt[name] = now
+	}
+	if len(u.measuredAt) > urlTestPoolDataEvidenceCap {
+		for name, at := range u.measuredAt {
+			if now.Sub(at) > urlTestPoolDataStrikeWindow {
+				delete(u.measuredAt, name)
+			}
+		}
+	}
 	if !final {
 		for _, name := range u.pool {
 			if len(names) >= u.poolSize {
@@ -2551,7 +2923,7 @@ func (u *URLTestPool) probeProxies(ctx context.Context, proxies []C.Proxy, timeo
 	testedNames := copyTestedNames(tested)
 	mu.Unlock()
 
-	u.recordProbeFailures(snapshot, pending)
+	u.recordProbeFailures(snapshot, pending, timeout)
 	return snapshot, testedNames
 }
 
@@ -2559,11 +2931,34 @@ func (u *URLTestPool) probeProxies(ctx context.Context, proxies []C.Proxy, timeo
 // measured nothing alive is not a verdict on the members: an outage takes the
 // whole candidate list down at once, and charging every node for it would sink
 // a node that worked for days after one dead sweep.
-func (u *URLTestPool) recordProbeFailures(results map[string]uint16, failed []string) {
+//
+// A member the pool already marked is left alone when the wave probed it with
+// the short budget: that failure says no more than the mark already does, and
+// charging it again would sink a slow but working node twice for one outage.
+func (u *URLTestPool) recordProbeFailures(results map[string]uint16, failed []string, timeout time.Duration) {
 	if len(results) == 0 || len(failed) == 0 {
 		return
 	}
+
+	// only a shortened wave needs the marks: a member probed with its own
+	// timeout is measured exactly as before
+	var marked map[string]struct{}
+	if timeout > urlTestPoolMarkedProbeTimeout {
+		now := time.Now()
+		marked = make(map[string]struct{}, len(failed))
+		u.mu.RLock()
+		for _, name := range failed {
+			if !u.failedUntilLocked(name, now).IsZero() {
+				marked[name] = struct{}{}
+			}
+		}
+		u.mu.RUnlock()
+	}
+
 	for _, name := range failed {
+		if _, ok := marked[name]; ok {
+			continue
+		}
 		u.reputation.ProbeFailed(name)
 	}
 }
@@ -2588,7 +2983,8 @@ func failedProbes(proxies []C.Proxy, results map[string]uint16, tested map[strin
 
 // probesFor builds the probes of one wave: the same URL and expected statuses
 // for every member, so a retried probe asks the queue exactly the question the
-// first wave asked and can share a probe that is still in flight.
+// first wave asked and can share a probe that is still in flight. The budget
+// stays the wave's own, except for the members the pool already marked as dead.
 func (u *URLTestPool) probesFor(proxies []C.Proxy, timeout time.Duration, priority bool) []probequeue.Probe {
 	probes := make([]probequeue.Probe, 0, len(proxies))
 	for _, proxy := range proxies {
@@ -2596,11 +2992,31 @@ func (u *URLTestPool) probesFor(proxies []C.Proxy, timeout time.Duration, priori
 			Proxy:    proxy,
 			URL:      u.testUrl,
 			Expected: u.expectedRanges,
-			Timeout:  timeout,
+			Timeout:  u.probeTimeoutFor(proxy, timeout),
 			Priority: priority,
 		})
 	}
 	return probes
+}
+
+// probeTimeoutFor shortens the budget of a member the pool already marked as
+// out of play: a dial it failed or a flow that died after the handshake. One
+// that answers now does so within the short budget, and the wave must not spend
+// the whole member timeout on the nodes the previous sweep already measured
+// dead while the unknowns wait behind them. A cut by our own attempt-timeout is
+// not evidence about the node, so it keeps the member's own timeout.
+func (u *URLTestPool) probeTimeoutFor(proxy C.Proxy, timeout time.Duration) time.Duration {
+	if timeout <= urlTestPoolMarkedProbeTimeout {
+		return timeout
+	}
+	now := time.Now()
+	u.mu.RLock()
+	marked := !u.failedUntilLocked(proxy.Name(), now).IsZero()
+	u.mu.RUnlock()
+	if !marked {
+		return timeout
+	}
+	return urlTestPoolMarkedProbeTimeout
 }
 
 func copyDelayResults(results map[string]uint16) map[string]uint16 {
