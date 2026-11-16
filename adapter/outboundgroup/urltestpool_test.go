@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -733,12 +734,12 @@ func TestURLTestPoolStaleCandidateIsVerifiedBeforePromotion(t *testing.T) {
 	pool.measuredAt = map[string]time.Time{"current": time.Now(), "candidate": stale}
 	pool.mu.Unlock()
 
-	proxy, _ := pool.pickFast(proxies)
+	proxy, _ := pool.pickFast(proxies, true)
 	require.Equal(t, "current", proxy.Name(), "a stale measurement must not take the dial off a working member")
 	require.Eventually(t, func() bool { return calls.Load() == 1 }, time.Second, 5*time.Millisecond,
 		"the stale candidate must be verified by one probe")
 
-	proxy, _ = pool.pickFast(proxies)
+	proxy, _ = pool.pickFast(proxies, true)
 	require.Equal(t, "current", proxy.Name())
 	require.Equal(t, int32(1), calls.Load(), "a second dial must share the probe that already runs")
 
@@ -749,7 +750,7 @@ func TestURLTestPoolStaleCandidateIsVerifiedBeforePromotion(t *testing.T) {
 		return pool.promotionFreshLocked("candidate", time.Now())
 	}, time.Second, 5*time.Millisecond, "an answer of the probe must stamp the measurement")
 
-	proxy, _ = pool.pickFast(proxies)
+	proxy, _ = pool.pickFast(proxies, true)
 	require.Equal(t, "candidate", proxy.Name(), "a verified candidate takes the dial")
 }
 
@@ -770,7 +771,7 @@ func TestURLTestPoolFreshCandidatePromotesAtOnce(t *testing.T) {
 	pool.measuredAt = map[string]time.Time{"current": now, "candidate": now}
 	pool.mu.Unlock()
 
-	proxy, _ := pool.pickFast([]C.Proxy{current, candidate})
+	proxy, _ := pool.pickFast([]C.Proxy{current, candidate}, true)
 	require.Equal(t, "candidate", proxy.Name(), "a fresh measurement promotes at once")
 	require.Equal(t, int32(0), calls.Load(), "a fresh measurement needs no verification")
 
@@ -797,7 +798,7 @@ func TestURLTestPoolMarkedMemberIsReplacedWithoutVerification(t *testing.T) {
 	pool.measuredAt = map[string]time.Time{"dead": stale, "candidate": stale}
 	pool.mu.Unlock()
 
-	proxy, _ := pool.pickFast([]C.Proxy{dead, candidate})
+	proxy, _ := pool.pickFast([]C.Proxy{dead, candidate}, true)
 	require.Equal(t, "candidate", proxy.Name(), "a marked member must not hold the dial while a candidate is verified")
 	require.Equal(t, int32(0), calls.Load())
 }
@@ -2355,6 +2356,7 @@ func TestURLTestPoolNetworkChangeDropsBackoff(t *testing.T) {
 	pool.mu.Lock()
 	pool.suspicious["n0"] = time.Now().Add(time.Hour)
 	pool.cutMarks["n1"] = time.Now().Add(time.Hour)
+	pool.measuredAt = map[string]time.Time{"n0": time.Now()}
 	pool.mu.Unlock()
 
 	// without a new generation the pool keeps both the backoff and the marks
@@ -2369,6 +2371,8 @@ func TestURLTestPoolNetworkChangeDropsBackoff(t *testing.T) {
 	require.True(t, pool.nextFullTime().IsZero(), "a network change must let the next full sweep run at once")
 	require.Empty(t, pool.suspicious, "the marks of the old network must go")
 	require.Empty(t, pool.cutMarks, "a cut on the old network must not hold a member back")
+	require.Empty(t, pool.measuredAt,
+		"a measurement of the old route must not stay fresh enough to promote its member")
 
 	// a second call without a new generation must keep the state as it is
 	pool.mu.Lock()
@@ -2593,23 +2597,140 @@ func TestURLTestPoolOrderForCheckLeavesMarkedLast(t *testing.T) {
 		"a marked member must not take the head of the sweep, even with the best delay")
 }
 
+// A member the reputation trusts is likelier to answer than a faster one that
+// nobody has proven yet, and a cold sweep has one budget to spend: the tier
+// must decide before the delay. The fast members are still measured in the
+// same sweep; only their wave is later.
+func TestURLTestPoolOrderForCheckPrefersTheTrustedTier(t *testing.T) {
+	trusted := newPoolOrderedProxy("trusted", true, 300)
+	fast := newPoolOrderedProxy("fast", true, 10)
+	sunk := newPoolOrderedProxy("sunk", true, 5)
+	pool := newPoolForTest(t, URLTestPoolOption{}, trusted, fast, sunk)
+	for i := 0; i < 20; i++ {
+		pool.reputation.DialSucceeded("trusted")
+	}
+	for i := 0; i < 4; i++ {
+		pool.reputation.ProbeFailed("sunk")
+	}
+	require.GreaterOrEqual(t, pool.reputation.Score("trusted"), reputation.Trusted)
+	require.Less(t, pool.reputation.Score("sunk"), reputation.Suspect)
+
+	ordered := pool.orderForCheck([]C.Proxy{sunk, fast, trusted})
+	require.Equal(t, []string{"trusted", "fast", "sunk"}, cascadeProxyNames(ordered),
+		"the tier must decide before the measured delay")
+}
+
+// The pool is cold when nothing it could route by was measured: a proxy is
+// created alive, so only a per-URL delay tells a measured member from one the
+// pool never reached.
+func TestURLTestPoolHasUsableNodeDetectsColdStart(t *testing.T) {
+	cold := newPoolOrderedProxy("cold", true, measuredURLDelay)
+	warm := newPoolOrderedProxy("warm", true, 40)
+	pool := newPoolForTest(t, URLTestPoolOption{}, cold, warm)
+
+	require.False(t, pool.hasUsableNode([]C.Proxy{cold}),
+		"a proxy alive by default but never measured is not a node the pool can route by")
+	require.True(t, pool.hasUsableNode([]C.Proxy{cold, warm}))
+
+	pool.markSuspicious("warm")
+	require.False(t, pool.hasUsableNode([]C.Proxy{warm}),
+		"a marked member does not count, however it was measured")
+
+	pool.ForceSet("cold")
+	require.True(t, pool.hasUsableNode([]C.Proxy{cold}),
+		"the member the profile pinned is a decision, not a cold guess")
+}
+
+func probeSubmitPointer(submit func(string, []probequeue.Probe, func(probequeue.Result)) *probequeue.Check) uintptr {
+	return reflect.ValueOf(submit).Pointer()
+}
+
+// A cold pool must not queue its sweep behind the checks of the groups that
+// already route; a warm one checks in the lane its `lazy` asks for.
+func TestURLTestPoolColdCheckChoosesTheUrgentLane(t *testing.T) {
+	cold := newPoolOrderedProxy("cold", true, measuredURLDelay)
+	warm := newPoolOrderedProxy("warm", true, 40)
+	pool := newPoolForTest(t, URLTestPoolOption{}, cold, warm)
+
+	require.NotEqual(t, probeSubmitPointer(probequeue.Submit),
+		probeSubmitPointer(pool.probeSubmit([]C.Proxy{cold}, false)),
+		"a cold pool must not wait behind the background sweeps")
+	require.NotEqual(t, probeSubmitPointer(probequeue.SubmitForeground),
+		probeSubmitPointer(pool.probeSubmit([]C.Proxy{cold}, false)),
+		"a cold pool must overtake the warm checks as well")
+	require.Equal(t, probeSubmitPointer(probequeue.SubmitForeground),
+		probeSubmitPointer(pool.probeSubmit([]C.Proxy{cold, warm}, false)),
+		"a warm non-lazy pool checks in the foreground lane")
+	require.Equal(t, probeSubmitPointer(probequeue.Submit),
+		probeSubmitPointer(pool.probeSubmit([]C.Proxy{cold}, true)),
+		"a wave a dial waits on keeps the priority its probes carry")
+}
+
 // A subscription that lists dozens of one transport must not fill the whole
 // first wave with it: the survivor of an outage that took that transport down
-// waits in the queue otherwise.
+// waits in the queue otherwise. The members must report real delays here: with
+// an unmeasured list the sort falls back to the name and the test would pass
+// whatever the coverage does.
 func TestURLTestPoolOrderForCheckCoversTransports(t *testing.T) {
 	wave := probequeue.GetConcurrency()
-	members := make([]C.Proxy, 0, wave+1)
-	for i := 0; i <= wave; i++ {
-		members = append(members, newCascadeFakeProxy(fmt.Sprintf("same%02d", i), C.Hysteria2, nil, nil, 100))
+	member := func(name string, adapterType C.AdapterType) C.Proxy {
+		return &poolOrderedProxy{
+			cascadeFakeProxy: newCascadeFakeProxy(name, adapterType, nil, nil, 100),
+			alive:            true,
+			delay:            100,
+		}
 	}
-	members = append(members, newCascadeFakeProxy("odd-vless", C.Vless, nil, nil, 100))
+	members := make([]C.Proxy, 0, wave+2)
+	members = append(members, member("same00", C.Hysteria2)) // the name order puts it first on its own
+	for i := 1; i <= wave; i++ {
+		members = append(members, member(fmt.Sprintf("same%02d", i), C.Hysteria2))
+	}
+	members = append(members, member("zzz-vless", C.Vless))
 
 	pool := &URLTestPool{testUrl: poolTestUrl}
 	ordered := pool.orderForCheck(members)
 
 	require.Len(t, ordered, len(members))
-	require.Equal(t, "odd-vless", ordered[0].Name(),
+	require.Equal(t, "zzz-vless", ordered[0].Name(),
 		"the only member of its transport must lead the first wave instead of waiting behind it")
+	require.Equal(t, "same00", ordered[1].Name(),
+		"the rest of the sweep must keep its order behind the promoted member")
+}
+
+// A unique transport must not pull a member the reputation already sank, or
+// one the pool marked, into the first wave: the sort just moved it to the back
+// for a reason, and the wave would spend its budget on the same dead node.
+func TestURLTestPoolOrderForCheckDoesNotPromoteIneligibleTransports(t *testing.T) {
+	wave := probequeue.GetConcurrency()
+	member := func(name string, adapterType C.AdapterType) C.Proxy {
+		return &poolOrderedProxy{
+			cascadeFakeProxy: newCascadeFakeProxy(name, adapterType, nil, nil, 100),
+			alive:            true,
+			delay:            100,
+		}
+	}
+	members := make([]C.Proxy, 0, wave+3)
+	for i := 0; i <= wave; i++ {
+		members = append(members, member(fmt.Sprintf("same%02d", i), C.Hysteria2))
+	}
+	sunk := member("a-vless", C.Vless)
+	marked := member("b-vless", C.Vless)
+	members = append(members, sunk, marked)
+
+	pool := &URLTestPool{testUrl: poolTestUrl, reputation: reputation.NewStore()}
+	for i := 0; i < 4; i++ {
+		pool.reputation.ProbeFailed(sunk.Name())
+	}
+	require.Less(t, pool.reputation.Score(sunk.Name()), reputation.Suspect)
+	pool.suspicious = map[string]time.Time{marked.Name(): time.Now().Add(time.Minute)}
+
+	ordered := pool.orderForCheck(members)
+	require.Len(t, ordered, len(members))
+	require.Equal(t, "same00", ordered[0].Name(),
+		"an ineligible transport must not take the head of the wave")
+	require.Equal(t, []string{"a-vless", "b-vless"},
+		cascadeProxyNames(ordered[len(ordered)-2:]),
+		"the sunk and the marked members stay at the tail the sort put them in")
 }
 
 // A member the pool already marked as dead must not hold a wave for the whole

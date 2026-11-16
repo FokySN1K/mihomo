@@ -1412,20 +1412,25 @@ func NewCascade(option GroupCommonOption, cascadeOption CascadeOption, emptyFall
 		testUrl = C.DefaultTestURL
 	}
 
+	base, err := NewGroupBase(GroupBaseOption{
+		Name:           option.Name,
+		Type:           C.Cascade,
+		Hidden:         option.Hidden,
+		Icon:           option.Icon,
+		Filter:         option.Filter,
+		ExcludeFilter:  option.ExcludeFilter,
+		ExcludeType:    option.ExcludeType,
+		TestTimeout:    option.TestTimeout,
+		MaxFailedTimes: option.MaxFailedTimes,
+		EmptyFallback:  emptyFallback,
+		Providers:      providers,
+	})
+	if err != nil {
+		return nil, err
+	}
+
 	return &Cascade{
-		GroupBase: NewGroupBase(GroupBaseOption{
-			Name:           option.Name,
-			Type:           C.Cascade,
-			Hidden:         option.Hidden,
-			Icon:           option.Icon,
-			Filter:         option.Filter,
-			ExcludeFilter:  option.ExcludeFilter,
-			ExcludeType:    option.ExcludeType,
-			TestTimeout:    option.TestTimeout,
-			MaxFailedTimes: option.MaxFailedTimes,
-			EmptyFallback:  emptyFallback,
-			Providers:      providers,
-		}),
+		GroupBase:      base,
 		disableUDP:     option.DisableUDP,
 		testUrl:        testUrl,
 		expectedStatus: option.ExpectedStatus,

@@ -617,6 +617,246 @@ func TestSetConcurrencyClamps(t *testing.T) {
 	require.Equal(t, maxConcurrency, GetConcurrency())
 }
 
+// The urgent ring serves the checks of the groups that have nothing to route
+// by before both warm lanes, and keeps its own round-robin.
+func TestPopLockedUrgentBeforeWarmLanes(t *testing.T) {
+	q := &queue{limit: 1}
+
+	newBatch := func(prefix string, count int) *batch {
+		probes := make([]*probeEntry, 0, count)
+		for i := 0; i < count; i++ {
+			probes = append(probes, &probeEntry{probe: Probe{Proxy: newTestProxy(fmt.Sprintf("%s%d", prefix, i), okProbe(1))}})
+		}
+		return &batch{q: q, probes: probes}
+	}
+
+	q.urgent = []*batch{newBatch("ua", 2), newBatch("ub", 2)}
+	q.foreground = []*batch{newBatch("fa", 2)}
+	q.ring = []*batch{newBatch("bg", 2)}
+
+	var order []string
+	for q.hasWorkLocked() {
+		order = append(order, q.popLocked().entry.probe.Proxy.Name())
+	}
+	require.Equal(t, []string{"ua0", "ub0", "ua1", "ub1", "fa0", "fa1", "bg0", "bg1"}, order,
+		"the urgent ring must be served before the warm lanes and keep its own round-robin")
+}
+
+// A cold check does not join a twin that still waits in the ring: it would
+// wait behind the whole sweep, which is what the urgent lane exists to prevent.
+// The map keeps the more urgent measurement, so the next cold ask joins it.
+func TestUrgentProbeDoesNotJoinQueuedRingTwin(t *testing.T) {
+	q := newQueue(1)
+	gate := make(chan struct{})
+
+	blocker := newTestProxy("blocker", func(context.Context) (uint16, error) {
+		<-gate
+		return 1, nil
+	})
+	var calls atomic.Int32
+	twin := newTestProxy("twin", func(context.Context) (uint16, error) {
+		calls.Add(1)
+		return 5, nil
+	})
+
+	block := q.submit("block", false, []Probe{{Proxy: blocker, Timeout: time.Second}}, nil)
+	requireEventually(t, func() bool {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		return q.running == 1
+	}, "the blocker must own the only slot")
+
+	probe := Probe{Proxy: twin, URL: "https://example.com/204", Timeout: time.Second}
+	sweep := q.submit("sweep", false, []Probe{probe}, nil)
+	cold := q.submitInLane("cold", laneUrgent, laneForeground, []Probe{probe}, nil)
+
+	key, keyed := probeKeyOf(probe)
+	require.True(t, keyed)
+	q.mu.Lock()
+	urgentQueued := len(q.urgent)
+	ringQueued := len(q.ring)
+	entryLane := q.inflight[key].lane
+	q.mu.Unlock()
+	require.Equal(t, 1, urgentQueued, "the cold check must not wait behind the queued ring twin")
+	require.Equal(t, 1, ringQueued, "the sweep keeps its own entry")
+	require.Equal(t, laneUrgent, entryLane, "the map must keep the more urgent measurement of the key")
+
+	close(gate)
+	require.True(t, block.Wait(context.Background()))
+	require.True(t, sweep.Wait(context.Background()))
+	require.True(t, cold.Wait(context.Background()))
+	require.Equal(t, int32(2), calls.Load(),
+		"the twin must be measured twice when the queued ring entry could not be shared")
+}
+
+// Two cold checks of the same measurement are one question: the second joins
+// the entry already queued in the urgent lane.
+func TestUrgentProbeJoinsQueuedUrgentTwin(t *testing.T) {
+	q := newQueue(1)
+	gate := make(chan struct{})
+
+	blocker := newTestProxy("blocker", func(context.Context) (uint16, error) {
+		<-gate
+		return 1, nil
+	})
+	var calls atomic.Int32
+	twin := newTestProxy("twin", func(context.Context) (uint16, error) {
+		calls.Add(1)
+		return 5, nil
+	})
+
+	block := q.submit("block", false, []Probe{{Proxy: blocker, Timeout: time.Second}}, nil)
+	requireEventually(t, func() bool {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		return q.running == 1
+	}, "the blocker must own the only slot")
+
+	probe := Probe{Proxy: twin, URL: "https://example.com/204", Timeout: time.Second}
+	first := q.submitInLane("cold", laneUrgent, laneForeground, []Probe{probe}, nil)
+	second := q.submitInLane("cold", laneUrgent, laneForeground, []Probe{probe}, nil)
+
+	key, keyed := probeKeyOf(probe)
+	require.True(t, keyed)
+	q.mu.Lock()
+	queued := len(q.urgent)
+	waiters := len(q.inflight[key].waiters)
+	q.mu.Unlock()
+	require.Equal(t, 1, queued, "the second cold check must join the queued urgent probe")
+	require.Equal(t, 2, waiters)
+
+	close(gate)
+	require.True(t, block.Wait(context.Background()))
+	require.True(t, first.Wait(context.Background()))
+	require.True(t, second.Wait(context.Background()))
+	require.Equal(t, int32(1), calls.Load(), "the member must be probed once")
+}
+
+// The first alive result takes the rest of a cold check out of the urgent
+// ring: the pool found a member, so the remaining probes are ordinary work and
+// must stop delaying the groups that are still looking. The entries keep the
+// lane they dropped to, so the next cold ask does not join them.
+func TestUrgentCheckDemotesAfterFirstAliveResult(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rest lane
+		home func(q *queue) []*batch
+	}{
+		{name: "foreground", rest: laneForeground, home: func(q *queue) []*batch { return q.foreground }},
+		{name: "ring", rest: laneRing, home: func(q *queue) []*batch { return q.ring }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := newQueue(1)
+			firstStarted := make(chan struct{})
+			releaseFirst := make(chan struct{})
+			secondStarted := make(chan struct{})
+			releaseSecond := make(chan struct{})
+
+			probe := func(name string, run func(context.Context) (uint16, error)) Probe {
+				return Probe{Proxy: newTestProxy(name, run), URL: "https://example.com/204", Timeout: time.Second}
+			}
+			probes := []Probe{
+				probe("p0", func(context.Context) (uint16, error) {
+					close(firstStarted)
+					<-releaseFirst
+					return 10, nil
+				}),
+				probe("p1", func(context.Context) (uint16, error) {
+					close(secondStarted)
+					<-releaseSecond
+					return 10, nil
+				}),
+				probe("p2", okProbe(10)),
+				probe("p3", okProbe(10)),
+			}
+
+			check := q.submitInLane("cold", laneUrgent, tc.rest, probes, nil)
+			<-firstStarted
+
+			q.mu.Lock()
+			urgentBefore := len(q.urgent)
+			q.mu.Unlock()
+			require.Equal(t, 1, urgentBefore, "the cold check must start in the urgent ring")
+
+			close(releaseFirst)
+			<-secondStarted
+
+			requireEventually(t, func() bool {
+				q.mu.Lock()
+				defer q.mu.Unlock()
+				return len(q.urgent) == 0
+			}, "the first alive result must take the rest of the check out of the urgent ring")
+
+			q.mu.Lock()
+			home := tc.home(q)
+			homeLen := len(home)
+			var homeLane lane
+			var nextLane lane
+			if homeLen > 0 {
+				homeLane = home[0].lane
+				if next := home[0].next; next < len(home[0].probes) {
+					nextLane = home[0].probes[next].lane
+				}
+			}
+			q.mu.Unlock()
+			require.Equal(t, 1, homeLen, "the rest of the check must wait in its home lane")
+			require.Equal(t, tc.rest, homeLane)
+			require.Equal(t, tc.rest, nextLane, "a queued entry must keep the lane it dropped to")
+
+			close(releaseSecond)
+			require.True(t, check.Wait(context.Background()))
+		})
+	}
+}
+
+// A profile with several cold groups at once: the urgent ring hands out one
+// probe per group in turn, so every cold group starts looking for a working
+// member in the first wave instead of waiting for the group ahead of it to
+// finish. A group that finds a member drops its remaining probes to its home
+// lane, and a group that wakes up later still takes the urgent lane ahead of
+// those leftovers. A probe that already waits in the urgent lane under the
+// same key is joined instead (see TestUrgentProbeJoinsQueuedUrgentTwin),
+// which is the only case where a late group does not stand in the ring itself.
+func TestColdGroupsShareTheFirstWaveAndLateGroupStaysUrgent(t *testing.T) {
+	q := &queue{limit: 1}
+
+	newBatch := func(prefix string, count int, rest lane) *batch {
+		probes := make([]*probeEntry, 0, count)
+		for i := 0; i < count; i++ {
+			probes = append(probes, &probeEntry{probe: Probe{Proxy: newTestProxy(fmt.Sprintf("%s%d", prefix, i), okProbe(1))}})
+		}
+		return &batch{q: q, probes: probes, lane: laneUrgent, rest: rest}
+	}
+	pop := func() string { return q.popLocked().entry.probe.Proxy.Name() }
+
+	first := newBatch("g1-", 4, laneForeground)  // lazy: false
+	second := newBatch("g2-", 4, laneForeground) // lazy: false
+	third := newBatch("g3-", 4, laneForeground)  // lazy: false
+	q.urgent = []*batch{first, second, third}
+
+	require.Equal(t, []string{"g1-0", "g2-0", "g3-0", "g1-1"},
+		[]string{pop(), pop(), pop(), pop()},
+		"the first wave must give each cold group a slot, not sweep the first group whole")
+
+	// The first group has measured a member: its remaining probes are ordinary
+	// foreground work, and the groups still looking keep the urgent ring.
+	q.demoteLocked(first)
+	require.Equal(t, []string{"g2-1", "g3-1", "g2-2", "g3-2"},
+		[]string{pop(), pop(), pop(), pop()},
+		"the leftovers of a group that found a member must not delay the groups still looking")
+
+	// A lazy group joins while the sweep is running: it is cold too, and where
+	// the urgent cursor stands decides whether it jumps ahead of the round or
+	// waits for the turn after it. Either way both of its probes are served
+	// before the foreground leftovers, so a group the user only reached later
+	// still gets its working member without waiting for the whole sweep.
+	fourth := newBatch("g4-", 2, laneRing)
+	q.urgent = append(q.urgent, fourth)
+	require.Equal(t, []string{"g4-0", "g2-3", "g3-3", "g4-1", "g1-2", "g1-3"},
+		[]string{pop(), pop(), pop(), pop(), pop(), pop()},
+		"a cold group that starts later must still be served before the leftovers")
+}
+
 // Two priority probes of the same measurement are one question: the second
 // caller waits on the entry already queued in the priority lane instead of
 // loading the member a second time.

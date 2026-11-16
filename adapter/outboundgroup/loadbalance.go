@@ -327,21 +327,26 @@ func NewLoadBalance(option GroupCommonOption, loadBalanceOption LoadBalanceOptio
 	default:
 		return nil, fmt.Errorf("%w: %s", errStrategy, loadBalanceOption.Strategy)
 	}
+	base, err := NewGroupBase(GroupBaseOption{
+		Name:           option.Name,
+		Type:           C.LoadBalance,
+		Hidden:         option.Hidden,
+		Icon:           option.Icon,
+		Filter:         option.Filter,
+		ExcludeFilter:  option.ExcludeFilter,
+		ExcludeType:    option.ExcludeType,
+		TestTimeout:    option.TestTimeout,
+		MaxFailedTimes: option.MaxFailedTimes,
+		EmptyFallback:  emptyFallback,
+		Providers:      providers,
+		UsePosition:    option.UsePosition,
+	})
+	if err != nil {
+		return nil, err
+	}
+
 	return &LoadBalance{
-		GroupBase: NewGroupBase(GroupBaseOption{
-			Name:           option.Name,
-			Type:           C.LoadBalance,
-			Hidden:         option.Hidden,
-			Icon:           option.Icon,
-			Filter:         option.Filter,
-			ExcludeFilter:  option.ExcludeFilter,
-			ExcludeType:    option.ExcludeType,
-			TestTimeout:    option.TestTimeout,
-			MaxFailedTimes: option.MaxFailedTimes,
-			EmptyFallback:  emptyFallback,
-			Providers:      providers,
-			UsePosition:    option.UsePosition,
-		}),
+		GroupBase:      base,
 		strategyFn:     strategyFn,
 		disableUDP:     option.DisableUDP,
 		testUrl:        option.URL,

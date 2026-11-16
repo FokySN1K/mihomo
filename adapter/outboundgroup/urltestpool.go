@@ -850,6 +850,42 @@ func (u *URLTestPool) UsableMembers() int {
 	return usable
 }
 
+// hasUsableNode reports whether the members a check is about to probe already
+// contain one that answered on the test URL and is not marked as out of play.
+// A pool that has none is cold: it has nothing measured to route a dial by, so
+// its sweep must not queue behind the sweeps of the groups that do.
+//
+// AliveForTestUrl is not the signal here: a proxy starts alive, so a group that
+// never measured anything would look warm. A per-URL delay exists only after a
+// measurement, and LastDelayForTestUrl reports measuredURLDelay when there is
+// none. The member the profile fixed counts as found without a measurement:
+// pinning a name is a decision, not a cold guess.
+func (u *URLTestPool) hasUsableNode(proxies []C.Proxy) bool {
+	now := time.Now()
+	u.mu.RLock()
+	selected := u.selected
+	marks := make(map[string]struct{}, len(proxies))
+	for _, proxy := range proxies {
+		if !u.markUntilLocked(proxy.Name(), now).IsZero() {
+			marks[proxy.Name()] = struct{}{}
+		}
+	}
+	u.mu.RUnlock()
+
+	for _, proxy := range proxies {
+		if _, marked := marks[proxy.Name()]; marked {
+			continue
+		}
+		if selected != "" && proxy.Name() == selected {
+			return true
+		}
+		if proxy.LastDelayForTestUrl(u.testUrl) != measuredURLDelay {
+			return true
+		}
+	}
+	return false
+}
+
 // SelfTestTarget implements SelfTester: the URL and status the pool measures
 // its members against.
 func (u *URLTestPool) SelfTestTarget() (string, utils.IntRanges[uint16]) {
@@ -957,7 +993,7 @@ func (u *URLTestPool) fastForTraffic(touch bool, usable func([]C.Proxy) []C.Prox
 		return u.EmptyFallback(), false
 	}
 
-	proxy, exhausted := u.pickFast(proxies)
+	proxy, exhausted := u.pickFast(proxies, touch)
 	if !exhausted {
 		return proxy, false
 	}
@@ -972,20 +1008,7 @@ func (u *URLTestPool) fastForTraffic(touch bool, usable func([]C.Proxy) []C.Prox
 		return fallback, true
 	}
 
-	// the emergency test belongs to traffic as well: a read of an empty lazy
-	// pool reports the state and leaves the checks to the dial
-	if touch || !u.lazy {
-		u.requestFullCheckOnExhaustion()
-	}
 	return proxy, true
-}
-
-// lastGoodProxy returns the proxy that carried the last successful dial, if it
-// still exists in the current proxy list.
-func (u *URLTestPool) lastGoodProxy(proxies []C.Proxy) C.Proxy {
-	u.mu.RLock()
-	defer u.mu.RUnlock()
-	return u.lastGoodLocked(proxies)
 }
 
 func (u *URLTestPool) lastGoodLocked(proxies []C.Proxy) C.Proxy {
@@ -1076,12 +1099,14 @@ func (u *URLTestPool) failedUntilLocked(name string, now time.Time) time.Time {
 	return until
 }
 
-func (u *URLTestPool) pickFast(proxies []C.Proxy) (C.Proxy, bool) {
+func (u *URLTestPool) pickFast(proxies []C.Proxy, touch bool) (C.Proxy, bool) {
 	proxy, exhausted, verify := u.pickFastLocked(proxies)
-	if verify != nil {
+	if verify != nil && touch {
 		// The pool held the promotion back: the candidate is measured by one
 		// background probe, and the next dial promotes it once the answer
-		// stamps the measurement. The probe runs outside the pool lock.
+		// stamps the measurement. The probe runs outside the pool lock. A read
+		// of the group state (Now/MarshalJSON) must not start it: reading a
+		// group is not traffic, and a lazy group must stay silent without it.
 		u.startPromotionProbe(verify)
 	}
 	return proxy, exhausted
@@ -1460,6 +1485,11 @@ func (u *URLTestPool) dropBackoffOnNetworkChange() bool {
 	// a member that stayed silent on the old route is not a verdict on the
 	// new one either: the same node often works fine after the device moves
 	u.dataMarks = nil
+	// the freshness of a promotion measures the old route too: a member
+	// measured a minute ago on another network is not proven on this one, and
+	// promoting it straight from memory is the same blind switch the marks are
+	// cleared to avoid
+	u.measuredAt = nil
 	u.mu.Unlock()
 	u.exitBackoff("the network changed")
 	return true
@@ -2515,16 +2545,23 @@ func (u *URLTestPool) fullCheck() {
 	u.applyResults(results)
 }
 
-// orderForCheck puts the members that answered last time first, ordered by
-// their measured delay, so the first wave of a sweep is the one likeliest to
-// find an alive member. A pool that lost its route is then refilled from the
-// first results instead of after every candidate of a large provider was
-// probed, which is what made an outage look like a long search for a node.
-// The members the pool marked as out of play go behind the rest, because those
-// marks are what a route that just died leaves behind: a sweep that starts
-// with them spends its first wave on the nodes the previous one already
-// measured dead, and the transport coverage keeps the wave from being filled
-// by one transport of a mixed subscription.
+// orderForCheck puts the members that proved reliable first, ordered by their
+// measured delay inside a tier, so the first wave of a sweep is the one
+// likeliest to find an alive member. A pool that lost its route is then
+// refilled from the first results instead of after every candidate of a large
+// provider was probed, which is what made an outage look like a long search
+// for a node. The members the pool marked as out of play go behind the rest,
+// because those marks are what a route that just died leaves behind: a sweep
+// that starts with them spends its first wave on the nodes the previous one
+// already measured dead, and the transport coverage keeps the wave from being
+// filled by one transport of a mixed subscription.
+//
+// The reputation orders the tiers before the delay: a node that carried
+// traffic recently is likelier to answer than one that keeps failing, and a
+// cold sweep has one budget to spend on the nodes worth a probe. A fast but
+// unreliable node is still measured in the same sweep; it only may wait one
+// wave behind the trusted ones, and once the pool is rebuilt the delay decides
+// the routing again.
 func (u *URLTestPool) orderForCheck(proxies []C.Proxy) []C.Proxy {
 	ordered := append([]C.Proxy(nil), proxies...)
 	if u.shouldPruneSuspects() {
@@ -2549,6 +2586,7 @@ func (u *URLTestPool) orderForCheck(proxies []C.Proxy) []C.Proxy {
 	type checkOrder struct {
 		proxy  C.Proxy
 		marked bool
+		tier   int
 		delay  uint16
 		score  int
 	}
@@ -2565,10 +2603,21 @@ func (u *URLTestPool) orderForCheck(proxies []C.Proxy) []C.Proxy {
 	for i := range items {
 		items[i].delay = items[i].proxy.LastDelayForTestUrl(u.testUrl)
 		items[i].score = u.reputation.Score(items[i].proxy.Name())
+		switch {
+		case items[i].score >= reputation.Trusted:
+			items[i].tier = 0
+		case items[i].score >= reputation.Suspect:
+			items[i].tier = 1
+		default:
+			items[i].tier = 2
+		}
 	}
 	sort.SliceStable(items, func(i, j int) bool {
 		if items[i].marked != items[j].marked {
 			return !items[i].marked
+		}
+		if items[i].tier != items[j].tier {
+			return items[i].tier < items[j].tier
 		}
 		if items[i].delay != items[j].delay {
 			return items[i].delay < items[j].delay
@@ -2585,7 +2634,18 @@ func (u *URLTestPool) orderForCheck(proxies []C.Proxy) []C.Proxy {
 	for i := range items {
 		ordered[i] = items[i].proxy
 	}
-	return u.coverTransports(ordered)
+	// The transport coverage only looks at the members a sweep may move into
+	// its first wave: the unmarked nodes of the trusted and the ordinary
+	// tiers. A marked node or one below the suspect band stays where the sort
+	// put it, however unique its transport is.
+	eligible := 0
+	for _, item := range items {
+		if item.marked || item.tier > 1 {
+			break
+		}
+		eligible++
+	}
+	return u.coverTransports(ordered, eligible)
 }
 
 // coverTransports moves one member of every transport the head of a sweep does
@@ -2595,9 +2655,15 @@ func (u *URLTestPool) orderForCheck(proxies []C.Proxy) []C.Proxy {
 // that answers is still queued. The promoted members keep their relative
 // order and the rest of the sweep keeps its own, so a sweep that already covers
 // every transport of its head is left untouched.
-func (u *URLTestPool) coverTransports(ordered []C.Proxy) []C.Proxy {
+//
+// Only the first `eligible` members are candidates for promotion: those are the
+// unmarked nodes of the trusted and ordinary tiers. A marked node, or one the
+// reputation already sunk, is never pulled into the first wave by its transport
+// type alone — the wave would spend its budget on the same nodes the sort just
+// moved to the back.
+func (u *URLTestPool) coverTransports(ordered []C.Proxy, eligible int) []C.Proxy {
 	wave := probequeue.GetConcurrency()
-	if wave <= 0 || len(ordered) <= wave {
+	if wave <= 0 || len(ordered) <= wave || eligible <= wave {
 		return ordered
 	}
 
@@ -2620,7 +2686,7 @@ func (u *URLTestPool) coverTransports(ordered []C.Proxy) []C.Proxy {
 
 	var promoted [urlTestPoolFirstWaveCoverage]C.Proxy
 	count := 0
-	for _, proxy := range ordered[wave:] {
+	for _, proxy := range ordered[wave:eligible] {
 		if count == urlTestPoolFirstWaveCoverage {
 			break
 		}
@@ -2826,6 +2892,32 @@ func (u *URLTestPool) testProxiesStreaming(ctx context.Context, proxies []C.Prox
 	return u.probeProxies(ctx, proxies, time.Duration(u.testTimeout)*time.Millisecond, true, false, retry)
 }
 
+// probeSubmit chooses the lane of one wave. A probe a caller waits on carries
+// Priority itself, which is what puts it in the priority lane, so the batch is
+// submitted as usual. A cold pool goes to the urgent lane: nothing is measured
+// yet, so a dial waits for the first answer, and the wave must not queue behind
+// the sweeps of the groups that already route. A warm pool keeps checking by
+// its `lazy`: a group the profile routes by its own answers runs in the
+// foreground lane, a lazy one takes the background ring.
+//
+// The retry wave asks this again: the first wave may have measured the member
+// that makes the pool warm, and its failures then belong in the warm lane.
+func (u *URLTestPool) probeSubmit(proxies []C.Proxy, priority bool) func(string, []probequeue.Probe, func(probequeue.Result)) *probequeue.Check {
+	if priority {
+		return probequeue.Submit
+	}
+	if !u.hasUsableNode(proxies) {
+		foreground := !u.lazy
+		return func(source string, probes []probequeue.Probe, onResult func(probequeue.Result)) *probequeue.Check {
+			return probequeue.SubmitUrgent(source, foreground, probes, onResult)
+		}
+	}
+	if !u.lazy {
+		return probequeue.SubmitForeground
+	}
+	return probequeue.Submit
+}
+
 // probeProxies tests proxies through the shared probe queue and returns the
 // delay (ms) of the alive proxies together with every proxy that was actually
 // measured, alive or not, so the pool can tell a failed member from one the
@@ -2854,16 +2946,7 @@ func (u *URLTestPool) probeProxies(ctx context.Context, proxies []C.Proxy, timeo
 	var mu sync.Mutex
 
 	probes := u.probesFor(proxies, timeout, priority)
-
-	// The queue decides when the probe runs; the pool's only limit is the
-	// timeout of the member itself. A group that checks without `lazy` routes
-	// the profile's traffic by its own answers, so its check runs in the
-	// foreground lane; a lazy group checks only when traffic wakes it and
-	// takes the background ring.
-	submit := probequeue.Submit
-	if !u.lazy {
-		submit = probequeue.SubmitForeground
-	}
+	submit := u.probeSubmit(proxies, priority)
 	deliver := func(result probequeue.Result, recordFailure bool) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -2904,7 +2987,10 @@ func (u *URLTestPool) probeProxies(ctx context.Context, proxies []C.Proxy, timeo
 			pause := time.NewTimer(urlTestPoolNetworkRetryPause)
 			select {
 			case <-pause.C:
-				retryCheck := submit(u.Name(), u.probesFor(failed, timeout, priority), func(result probequeue.Result) {
+				// The second wave decides its lane again: the first one may
+				// have measured the member that made the pool warm.
+				retrySubmit := u.probeSubmit(failed, priority)
+				retryCheck := retrySubmit(u.Name(), u.probesFor(failed, timeout, priority), func(result probequeue.Result) {
 					deliver(result, true)
 				})
 				retryCheck.Wait(ctx)
@@ -3197,7 +3283,7 @@ func NewURLTestPool(option GroupCommonOption, poolOption URLTestPoolOption, empt
 		testUrl = C.DefaultTestURL
 	}
 
-	base := NewGroupBase(GroupBaseOption{
+	base, err := NewGroupBase(GroupBaseOption{
 		Name:           option.Name,
 		Type:           C.URLTestPool,
 		Hidden:         option.Hidden,
@@ -3210,6 +3296,9 @@ func NewURLTestPool(option GroupCommonOption, poolOption URLTestPoolOption, empt
 		EmptyFallback:  emptyFallback,
 		Providers:      providers,
 	})
+	if err != nil {
+		return nil, err
+	}
 
 	// A result cannot be published before one probe finishes, so the probe
 	// timeout is the meaningful cap on the wait of a cold start.

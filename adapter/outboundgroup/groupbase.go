@@ -69,7 +69,7 @@ type GroupBaseOption struct {
 	UsePosition    map[string]int
 }
 
-func NewGroupBase(opt GroupBaseOption) *GroupBase {
+func NewGroupBase(opt GroupBaseOption) (*GroupBase, error) {
 	var excludeTypeArray []string
 	if opt.ExcludeType != "" {
 		excludeTypeArray = strings.Split(opt.ExcludeType, "|")
@@ -78,7 +78,12 @@ func NewGroupBase(opt GroupBaseOption) *GroupBase {
 	var excludeFilterRegs []*regexp2.Regexp
 	if opt.ExcludeFilter != "" {
 		for _, excludeFilter := range strings.Split(opt.ExcludeFilter, "`") {
-			excludeFilterReg := regexp2.MustCompile(excludeFilter, regexp2.None)
+			// A malformed filter is a config error the caller reports, not a
+			// panic that takes the process down while the config is applied.
+			excludeFilterReg, err := regexp2.Compile(excludeFilter, regexp2.None)
+			if err != nil {
+				return nil, fmt.Errorf("invalid exclude-filter %q: %w", excludeFilter, err)
+			}
 			excludeFilterRegs = append(excludeFilterRegs, excludeFilterReg)
 		}
 	}
@@ -86,7 +91,10 @@ func NewGroupBase(opt GroupBaseOption) *GroupBase {
 	var filterRegs []*regexp2.Regexp
 	if opt.Filter != "" {
 		for _, filter := range strings.Split(opt.Filter, "`") {
-			filterReg := regexp2.MustCompile(filter, regexp2.None)
+			filterReg, err := regexp2.Compile(filter, regexp2.None)
+			if err != nil {
+				return nil, fmt.Errorf("invalid filter %q: %w", filter, err)
+			}
 			filterRegs = append(filterRegs, filterReg)
 		}
 	}
@@ -113,7 +121,7 @@ func NewGroupBase(opt GroupBaseOption) *GroupBase {
 		gb.maxFailedTimes = 5
 	}
 
-	return gb
+	return gb, nil
 }
 
 func (gb *GroupBase) Hidden() bool {
@@ -290,14 +298,25 @@ func (gb *GroupBase) URLTest(ctx context.Context, url string, expectedStatus uti
 
 	var lock sync.Mutex
 	mp := map[string]uint16{}
-	check := probequeue.Submit(gb.Name(), probes, func(result probequeue.Result) {
+	onResult := func(result probequeue.Result) {
 		if result.Err != nil {
 			return
 		}
 		lock.Lock()
 		mp[result.Name] = result.Delay
 		lock.Unlock()
-	})
+	}
+
+	// A group with no member measured for this URL has nothing the next
+	// connection could route by: its test goes ahead of the background sweeps,
+	// so a dial waiting for a first answer is not queued behind them. Once a
+	// member answers, the remaining probes drop back to the foreground lane.
+	var check *probequeue.Check
+	if hasMeasuredMember(proxies, url) {
+		check = probequeue.SubmitForeground(gb.Name(), probes, onResult)
+	} else {
+		check = probequeue.SubmitUrgent(gb.Name(), true, probes, onResult)
+	}
 	check.Wait(ctx)
 
 	// Copy the measured members: a check the caller left behind keeps probing
@@ -370,11 +389,15 @@ func (gb *GroupBase) healthCheck() {
 
 	wg.Wait()
 	gb.failedTesting.Store(false)
+	gb.failedTestMux.Lock()
 	gb.failedTimes = 0
+	gb.failedTestMux.Unlock()
 }
 
 func (gb *GroupBase) onDialSuccess() {
 	if !gb.failedTesting.Load() {
+		gb.failedTestMux.Lock()
 		gb.failedTimes = 0
+		gb.failedTestMux.Unlock()
 	}
 }

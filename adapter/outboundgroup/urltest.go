@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/common/callback"
@@ -33,8 +34,11 @@ type URLTest struct {
 	expectedStatus string
 	tolerance      uint16
 	disableUDP     bool
-	fastNode       C.Proxy
-	fastSingle     *singledo.Single[C.Proxy]
+	// stateMux guards the fixed selection and the member it resolved to: a
+	// user selection can arrive while a choice is being made.
+	stateMux   sync.Mutex
+	fastNode   C.Proxy
+	fastSingle *singledo.Single[C.Proxy]
 }
 
 func (u *URLTest) Now() string {
@@ -57,7 +61,9 @@ func (u *URLTest) Set(name string) error {
 }
 
 func (u *URLTest) ForceSet(name string) {
+	u.stateMux.Lock()
 	u.selected = name
+	u.stateMux.Unlock()
 	u.fastSingle.Reset()
 }
 
@@ -114,55 +120,64 @@ func (u *URLTest) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 func (u *URLTest) healthCheck() {
 	u.fastSingle.Reset()
 	u.GroupBase.healthCheck()
-	u.fastSingle.Reset()
 }
 
 func (u *URLTest) fast(touch bool) C.Proxy {
 	elm, _, shared := u.fastSingle.Do(func() (C.Proxy, error) {
 		proxies := u.GetProxies(touch)
-		if u.selected != "" {
-			for _, proxy := range proxies {
-				if !proxy.AliveForTestUrl(u.testUrl) {
-					continue
-				}
-				if proxy.Name() == u.selected {
-					u.fastNode = proxy
-					return proxy, nil
-				}
-			}
-		}
-
-		fast := proxies[0]
-		minDelay := fast.LastDelayForTestUrl(u.testUrl)
-		fastNotExist := true
-
-		for _, proxy := range proxies[1:] {
-			if u.fastNode != nil && proxy.Name() == u.fastNode.Name() {
-				fastNotExist = false
-			}
-
-			if !proxy.AliveForTestUrl(u.testUrl) {
-				continue
-			}
-
-			delay := proxy.LastDelayForTestUrl(u.testUrl)
-			if delay < minDelay {
-				fast = proxy
-				minDelay = delay
-			}
-
-		}
-		// tolerance
-		if u.fastNode == nil || fastNotExist || !u.fastNode.AliveForTestUrl(u.testUrl) || u.fastNode.LastDelayForTestUrl(u.testUrl) > fast.LastDelayForTestUrl(u.testUrl)+u.tolerance {
-			u.fastNode = fast
-		}
-		return u.fastNode, nil
+		return u.pickFastest(proxies), nil
 	})
 	if shared && touch { // a shared fastSingle.Do() may cause providers untouched, so we touch them again
 		u.Touch()
 	}
 
 	return elm
+}
+
+// pickFastest applies the fixed selection and the tolerance to the current
+// member list. The state it reads is guarded: a selection can arrive while a
+// connection is being routed.
+func (u *URLTest) pickFastest(proxies []C.Proxy) C.Proxy {
+	u.stateMux.Lock()
+	defer u.stateMux.Unlock()
+
+	if u.selected != "" {
+		for _, proxy := range proxies {
+			if !proxy.AliveForTestUrl(u.testUrl) {
+				continue
+			}
+			if proxy.Name() == u.selected {
+				u.fastNode = proxy
+				return proxy
+			}
+		}
+	}
+
+	fast := proxies[0]
+	minDelay := fast.LastDelayForTestUrl(u.testUrl)
+	fastNotExist := true
+
+	for _, proxy := range proxies[1:] {
+		if u.fastNode != nil && proxy.Name() == u.fastNode.Name() {
+			fastNotExist = false
+		}
+
+		if !proxy.AliveForTestUrl(u.testUrl) {
+			continue
+		}
+
+		delay := proxy.LastDelayForTestUrl(u.testUrl)
+		if delay < minDelay {
+			fast = proxy
+			minDelay = delay
+		}
+
+	}
+	// tolerance
+	if u.fastNode == nil || fastNotExist || !u.fastNode.AliveForTestUrl(u.testUrl) || u.fastNode.LastDelayForTestUrl(u.testUrl) > fast.LastDelayForTestUrl(u.testUrl)+u.tolerance {
+		u.fastNode = fast
+	}
+	return u.fastNode
 }
 
 // SupportUDP implements C.ProxyAdapter
@@ -190,7 +205,7 @@ func (u *URLTest) MarshalJSON() ([]byte, error) {
 		"all":            all,
 		"testUrl":        u.testUrl,
 		"expectedStatus": u.expectedStatus,
-		"fixed":          u.selected,
+		"fixed":          u.fixedSelection(),
 		"hidden":         u.Hidden(),
 		"icon":           u.Icon(),
 		"emptyFallback":  u.EmptyFallback().Name(),
@@ -199,6 +214,13 @@ func (u *URLTest) MarshalJSON() ([]byte, error) {
 
 func (u *URLTest) Providers() []P.ProxyProvider {
 	return u.providers
+}
+
+// fixedSelection returns the member the user fixed, if any.
+func (u *URLTest) fixedSelection() string {
+	u.stateMux.Lock()
+	defer u.stateMux.Unlock()
+	return u.selected
 }
 
 func (u *URLTest) Proxies() []C.Proxy {
@@ -218,21 +240,26 @@ func NewURLTest(option GroupCommonOption, urlTestOption URLTestOption, emptyFall
 		tolerance = *urlTestOption.Tolerance
 	}
 
+	base, err := NewGroupBase(GroupBaseOption{
+		Name:           option.Name,
+		Type:           C.URLTest,
+		Hidden:         option.Hidden,
+		Icon:           option.Icon,
+		Filter:         option.Filter,
+		ExcludeFilter:  option.ExcludeFilter,
+		ExcludeType:    option.ExcludeType,
+		TestTimeout:    option.TestTimeout,
+		MaxFailedTimes: option.MaxFailedTimes,
+		EmptyFallback:  emptyFallback,
+		Providers:      providers,
+		UsePosition:    option.UsePosition,
+	})
+	if err != nil {
+		return nil, err
+	}
+
 	urlTest := &URLTest{
-		GroupBase: NewGroupBase(GroupBaseOption{
-			Name:           option.Name,
-			Type:           C.URLTest,
-			Hidden:         option.Hidden,
-			Icon:           option.Icon,
-			Filter:         option.Filter,
-			ExcludeFilter:  option.ExcludeFilter,
-			ExcludeType:    option.ExcludeType,
-			TestTimeout:    option.TestTimeout,
-			MaxFailedTimes: option.MaxFailedTimes,
-			EmptyFallback:  emptyFallback,
-			Providers:      providers,
-			UsePosition:    option.UsePosition,
-		}),
+		GroupBase:      base,
 		fastSingle:     singledo.NewSingle[C.Proxy](time.Second * 10),
 		disableUDP:     option.DisableUDP,
 		testUrl:        option.URL,

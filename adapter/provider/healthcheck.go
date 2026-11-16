@@ -43,14 +43,18 @@ type HealthCheck struct {
 }
 
 func (hc *HealthCheck) process() {
-	ticker := time.NewTicker(hc.interval)
+	hc.mu.Lock()
+	interval := hc.interval
+	hc.mu.Unlock()
+
+	ticker := time.NewTicker(interval)
 	go hc.check()
 	for {
 		select {
 		case <-ticker.C:
 			lastTouch := hc.lastTouch.Load()
 			since := time.Since(lastTouch)
-			if !hc.lazy || since < hc.interval {
+			if !hc.lazy || since < interval {
 				hc.check()
 			} else {
 				log.Debugln("Skip once health check because we are lazy")
@@ -63,7 +67,9 @@ func (hc *HealthCheck) process() {
 }
 
 func (hc *HealthCheck) setProxies(proxies []C.Proxy) {
+	hc.mu.Lock()
 	hc.proxies = proxies
+	hc.mu.Unlock()
 }
 
 func (hc *HealthCheck) registerHealthCheckTask(url string, expectedStatus utils.IntRanges[uint16], filter string, interval uint) {
@@ -86,10 +92,21 @@ func (hc *HealthCheck) registerHealthCheckTask(url string, expectedStatus utils.
 	}
 
 	// prioritize the use of previously registered configurations, especially those from provider
-	if _, ok := hc.extra[url]; ok {
+	if existing, ok := hc.extra[url]; ok {
 		// provider default health check does not set filter
 		if url != hc.url && len(filter) != 0 {
-			splitAndAddFiltersToExtra(filter, hc.extra[url])
+			// The option is replaced instead of mutated: a check that already
+			// took the map reads the filters without the lock, so a published
+			// option must not change under it.
+			merged := &extraOption{
+				expectedStatus: existing.expectedStatus,
+				filters:        make(map[string]struct{}, len(existing.filters)+1),
+			}
+			for name := range existing.filters {
+				merged.filters[name] = struct{}{}
+			}
+			splitAndAddFiltersToExtra(filter, merged)
+			hc.extra[url] = merged
 		}
 
 		log.Debugln("health check url: %s exists", url)
@@ -114,6 +131,8 @@ func splitAndAddFiltersToExtra(filter string, option *extraOption) {
 }
 
 func (hc *HealthCheck) auto() bool {
+	hc.mu.Lock()
+	defer hc.mu.Unlock()
 	return hc.interval != 0
 }
 
@@ -122,7 +141,15 @@ func (hc *HealthCheck) touch() {
 }
 
 func (hc *HealthCheck) check() {
-	if len(hc.proxies) == 0 {
+	hc.mu.Lock()
+	proxies := hc.proxies
+	extra := make(map[string]*extraOption, len(hc.extra))
+	for url, option := range hc.extra {
+		extra[url] = option
+	}
+	hc.mu.Unlock()
+
+	if len(proxies) == 0 {
 		return
 	}
 
@@ -133,12 +160,12 @@ func (hc *HealthCheck) check() {
 
 		// execute default health check
 		option := &extraOption{filters: nil, expectedStatus: hc.expectedStatus}
-		hc.execute(b, hc.url, id, option)
+		hc.execute(b, proxies, hc.url, id, option)
 
 		// execute extra health check
-		if len(hc.extra) != 0 {
-			for url, option := range hc.extra {
-				hc.execute(b, url, id, option)
+		if len(extra) != 0 {
+			for url, option := range extra {
+				hc.execute(b, proxies, url, id, option)
 			}
 		}
 		_ = b.Wait()
@@ -147,7 +174,7 @@ func (hc *HealthCheck) check() {
 	})
 }
 
-func (hc *HealthCheck) execute(b *errgroup.Group, url, uid string, option *extraOption) {
+func (hc *HealthCheck) execute(b *errgroup.Group, proxies []C.Proxy, url, uid string, option *extraOption) {
 	url = strings.TrimSpace(url)
 	if len(url) == 0 {
 		log.Debugln("Health Check has been skipped due to testUrl is empty, {%s}", uid)
@@ -164,12 +191,19 @@ func (hc *HealthCheck) execute(b *errgroup.Group, url, uid string, option *extra
 				filters = append(filters, filter)
 			}
 
-			filterReg = regexp2.MustCompile(strings.Join(filters, "|"), regexp2.None)
+			reg, err := regexp2.Compile(strings.Join(filters, "|"), regexp2.None)
+			if err != nil {
+				// a broken filter is a config error, not a reason to take the
+				// process down: the check runs without it
+				log.Errorln("health check filter %q is invalid: %v", strings.Join(filters, "|"), err)
+			} else {
+				filterReg = reg
+			}
 		}
 	}
 
-	probes := make([]probequeue.Probe, 0, len(hc.proxies))
-	for _, proxy := range hc.proxies {
+	probes := make([]probequeue.Probe, 0, len(proxies))
+	for _, proxy := range proxies {
 		// skip proxies that do not require health check
 		if filterReg != nil {
 			if match, _ := filterReg.MatchString(proxy.Name()); !match {

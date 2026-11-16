@@ -120,21 +120,26 @@ func (s *Selector) Proxies() []C.Proxy {
 }
 
 func NewSelector(option GroupCommonOption, selectorOption SelectorOption, emptyFallback C.Proxy, providers []P.ProxyProvider) (*Selector, error) {
+	base, err := NewGroupBase(GroupBaseOption{
+		Name:           option.Name,
+		Type:           C.Selector,
+		Hidden:         option.Hidden,
+		Icon:           option.Icon,
+		Filter:         option.Filter,
+		ExcludeFilter:  option.ExcludeFilter,
+		ExcludeType:    option.ExcludeType,
+		TestTimeout:    option.TestTimeout,
+		MaxFailedTimes: option.MaxFailedTimes,
+		EmptyFallback:  emptyFallback,
+		Providers:      providers,
+		UsePosition:    option.UsePosition,
+	})
+	if err != nil {
+		return nil, err
+	}
+
 	return &Selector{
-		GroupBase: NewGroupBase(GroupBaseOption{
-			Name:           option.Name,
-			Type:           C.Selector,
-			Hidden:         option.Hidden,
-			Icon:           option.Icon,
-			Filter:         option.Filter,
-			ExcludeFilter:  option.ExcludeFilter,
-			ExcludeType:    option.ExcludeType,
-			TestTimeout:    option.TestTimeout,
-			MaxFailedTimes: option.MaxFailedTimes,
-			EmptyFallback:  emptyFallback,
-			Providers:      providers,
-			UsePosition:    option.UsePosition,
-		}),
+		GroupBase:  base,
 		selected:   selectorOption.DefaultSelected,
 		disableUDP: option.DisableUDP,
 		testUrl:    option.URL,

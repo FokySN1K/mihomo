@@ -23,26 +23,28 @@ func (q *Queue[T]) Put(items ...T) {
 
 // Pop returns the head of items.
 func (q *Queue[T]) Pop() (head T) {
+	q.lock.Lock()
+	defer q.lock.Unlock()
+
 	if len(q.items) == 0 {
 		return
 	}
 
-	q.lock.Lock()
 	head = q.items[0]
 	q.items = q.items[1:]
-	q.lock.Unlock()
 	return head
 }
 
 // Last returns the last of item.
 func (q *Queue[T]) Last() (last T) {
+	q.lock.RLock()
+	defer q.lock.RUnlock()
+
 	if len(q.items) == 0 {
 		return
 	}
 
-	q.lock.RLock()
 	last = q.items[len(q.items)-1]
-	q.lock.RUnlock()
 	return last
 }
 

@@ -61,3 +61,19 @@ var _ SelectAble = (*URLTest)(nil)
 var _ SelectAble = (*URLTestPool)(nil)
 var _ SelectAble = (*Cascade)(nil)
 var _ SelectAble = (*Selector)(nil)
+
+// measuredURLDelay is the delay a proxy reports for a URL it was never measured
+// on. It is the absence of a measurement, not a very slow one.
+const measuredURLDelay = 0xffff
+
+// hasMeasuredMember reports whether the group holds a member that was measured
+// for this URL. AliveForTestUrl cannot answer it: a proxy that was never tested
+// reports itself alive, so the delay of the URL is the evidence.
+func hasMeasuredMember(proxies []C.Proxy, url string) bool {
+	for _, proxy := range proxies {
+		if proxy.LastDelayForTestUrl(url) != measuredURLDelay {
+			return true
+		}
+	}
+	return false
+}

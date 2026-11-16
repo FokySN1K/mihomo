@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/adapter/outboundgroup/probequeue"
@@ -21,6 +22,7 @@ type Fallback struct {
 	disableUDP     bool
 	testUrl        string
 	selected       string
+	selectedMux    sync.RWMutex
 	expectedStatus string
 }
 
@@ -99,11 +101,18 @@ func (f *Fallback) MarshalJSON() ([]byte, error) {
 		"all":            all,
 		"testUrl":        f.testUrl,
 		"expectedStatus": f.expectedStatus,
-		"fixed":          f.selected,
+		"fixed":          f.fixedSelection(),
 		"hidden":         f.Hidden(),
 		"icon":           f.Icon(),
 		"emptyFallback":  f.EmptyFallback().Name(),
 	})
+}
+
+// fixedSelection returns the member the user fixed, if any.
+func (f *Fallback) fixedSelection() string {
+	f.selectedMux.RLock()
+	defer f.selectedMux.RUnlock()
+	return f.selected
 }
 
 // Unwrap implements C.ProxyAdapter
@@ -114,19 +123,25 @@ func (f *Fallback) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 
 func (f *Fallback) findAliveProxy(touch bool) C.Proxy {
 	proxies := f.GetProxies(touch)
-	for _, proxy := range proxies {
-		if len(f.selected) == 0 {
-			if proxy.AliveForTestUrl(f.testUrl) {
-				return proxy
-			}
-		} else {
-			if proxy.Name() == f.selected {
+	selected := f.fixedSelection()
+
+	// A fixed member that died is skipped for this choice, but the selection is
+	// not cleared: a read of the group must not write its state, and a member
+	// that comes back keeps the place the user gave it.
+	if len(selected) != 0 {
+		for _, proxy := range proxies {
+			if proxy.Name() == selected {
 				if proxy.AliveForTestUrl(f.testUrl) {
 					return proxy
-				} else {
-					f.selected = ""
 				}
+				break
 			}
+		}
+	}
+
+	for _, proxy := range proxies {
+		if proxy.AliveForTestUrl(f.testUrl) {
+			return proxy
 		}
 	}
 
@@ -146,7 +161,9 @@ func (f *Fallback) Set(name string) error {
 		return errors.New("proxy not exist")
 	}
 
+	f.selectedMux.Lock()
 	f.selected = name
+	f.selectedMux.Unlock()
 	if !p.AliveForTestUrl(f.testUrl) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(5000))
 		defer cancel()
@@ -158,7 +175,9 @@ func (f *Fallback) Set(name string) error {
 }
 
 func (f *Fallback) ForceSet(name string) {
+	f.selectedMux.Lock()
 	f.selected = name
+	f.selectedMux.Unlock()
 }
 
 func (f *Fallback) Providers() []P.ProxyProvider {
@@ -170,21 +189,26 @@ func (f *Fallback) Proxies() []C.Proxy {
 }
 
 func NewFallback(option GroupCommonOption, fallbackOption FallbackOption, emptyFallback C.Proxy, providers []P.ProxyProvider) (*Fallback, error) {
+	base, err := NewGroupBase(GroupBaseOption{
+		Name:           option.Name,
+		Type:           C.Fallback,
+		Hidden:         option.Hidden,
+		Icon:           option.Icon,
+		Filter:         option.Filter,
+		ExcludeFilter:  option.ExcludeFilter,
+		ExcludeType:    option.ExcludeType,
+		TestTimeout:    option.TestTimeout,
+		MaxFailedTimes: option.MaxFailedTimes,
+		EmptyFallback:  emptyFallback,
+		Providers:      providers,
+		UsePosition:    option.UsePosition,
+	})
+	if err != nil {
+		return nil, err
+	}
+
 	return &Fallback{
-		GroupBase: NewGroupBase(GroupBaseOption{
-			Name:           option.Name,
-			Type:           C.Fallback,
-			Hidden:         option.Hidden,
-			Icon:           option.Icon,
-			Filter:         option.Filter,
-			ExcludeFilter:  option.ExcludeFilter,
-			ExcludeType:    option.ExcludeType,
-			TestTimeout:    option.TestTimeout,
-			MaxFailedTimes: option.MaxFailedTimes,
-			EmptyFallback:  emptyFallback,
-			Providers:      providers,
-			UsePosition:    option.UsePosition,
-		}),
+		GroupBase:      base,
 		disableUDP:     option.DisableUDP,
 		testUrl:        option.URL,
 		expectedStatus: option.ExpectedStatus,

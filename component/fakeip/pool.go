@@ -88,17 +88,23 @@ func (p *Pool) IPNet() netip.Prefix {
 
 // CloneFrom clone cache from old pool
 func (p *Pool) CloneFrom(o *Pool) {
+	// The two locks are never held together: two pools that clone each other
+	// at the same time would deadlock. The store of a pool is fixed at
+	// construction, so reading it without the lock is safe; only the
+	// allocation state it is cloned with needs the old pool's lock.
+	o.mux.Lock()
+	sameRange := o.first == p.first && o.last == p.last
+	offset, cycle := o.offset, o.cycle
+	o.mux.Unlock()
+
 	p.mux.Lock()
 	defer p.mux.Unlock()
-
-	o.mux.Lock()
-	defer o.mux.Unlock()
 
 	o.store.CloneTo(p.store)
 
 	// the allocation state only matches the cloned entries if both pools cover the same range
-	if o.first == p.first && o.last == p.last {
-		p.offset, p.cycle = o.offset, o.cycle
+	if sameRange {
+		p.offset, p.cycle = offset, cycle
 	}
 }
 
@@ -119,6 +125,9 @@ func (p *Pool) get(host string) netip.Addr {
 }
 
 func (p *Pool) FlushFakeIP() error {
+	p.mux.Lock()
+	defer p.mux.Unlock()
+
 	err := p.store.FlushFakeIP()
 	if err == nil {
 		p.cycle = false

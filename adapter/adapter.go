@@ -169,8 +169,25 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 	}
 
 	var satisfied bool
+	// resp is declared before the deferred bookkeeping so the closure sees the
+	// response a test that completed without an accepted status answered with
+	var resp *http.Response
 
 	defer func() {
+		if err == nil && !satisfied {
+			// The endpoint answered, but not with a status the caller accepts:
+			// a 403 from a captive portal or a redirect page is not a working
+			// proxy. The per-URL state below already says dead, so reporting
+			// the measurement as a success would leave the global alive flag
+			// and the delay history saying the opposite of what the queue reads.
+			status := 0
+			if resp != nil {
+				status = resp.StatusCode
+			}
+			err = fmt.Errorf("unexpected status: %d", status)
+			t = 0
+		}
+
 		if UrlTestHook != nil {
 			UrlTestHook(url, p.Name(), t, ctx.Err() != nil)
 		}
@@ -193,11 +210,6 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 				alive:   atomic.NewBool(true),
 			}
 		})
-
-		if !satisfied {
-			record.Delay = 0
-			alive = false
-		}
 
 		state.alive.Store(alive)
 		state.history.Put(record)
@@ -256,7 +268,7 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 
 	defer client.CloseIdleConnections()
 
-	resp, err := client.Do(req)
+	resp, err = client.Do(req)
 
 	if err != nil {
 		return

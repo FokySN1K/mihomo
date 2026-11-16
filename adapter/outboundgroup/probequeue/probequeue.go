@@ -87,6 +87,26 @@ type probeItem struct {
 	entry *probeEntry
 }
 
+// lane orders the work of the queue. A probe a dial is waiting on outranks the
+// probes of a group that has nothing to route by, those outrank the checks of a
+// group that feeds routing decisions, and the background sweeps come last.
+// A higher value is served sooner.
+type lane int
+
+const (
+	// laneRing is the background sweep: a lazy group that woke up for traffic,
+	// or a provider tick.
+	laneRing lane = iota
+	// laneForeground is a check whose answers the next connections route by.
+	laneForeground
+	// laneUrgent is a check of a group that has nothing to route by at all: a
+	// dial waits for its first result, so it must not queue behind the sweeps.
+	laneUrgent
+	// lanePriority is a single probe a caller is waiting on: the UI test
+	// button, a recovery probe on the dial path.
+	lanePriority
+)
+
 // probeKey identifies one measurement. The same proxy, URL, accepted statuses
 // and budget is the same question, whatever check asks it.
 type probeKey struct {
@@ -104,25 +124,34 @@ type probeEntry struct {
 	probe   Probe
 	waiters []*batch
 	running bool
-	// priority marks an entry that waits in the priority lane: joining it is
-	// as good as running it, because the lane is served before the rings.
-	priority bool
+	// lane is the lane the entry waits in: joining it is as good as running it
+	// only when its lane is served no later than the caller's.
+	lane lane
 }
 
 // joinable reports whether a check that submitted the same probe can wait on
 // this entry. A priority probe only joins a measurement that already runs or
 // one that waits in the priority lane itself: joining an entry of the ring
 // would make the dial wait behind the ring, which is exactly what the priority
-// lane exists to prevent.
-func (e *probeEntry) joinable(probe Probe) bool {
-	return !probe.Priority || e.running || e.priority
+// lane exists to prevent. An urgent probe follows the same rule against the
+// background rings: joining a sweep that has not started would make a group
+// with nothing to route by wait for the whole sweep.
+func (e *probeEntry) joinable(probe Probe, lane lane) bool {
+	switch {
+	case probe.Priority:
+		return e.running || e.lane == lanePriority
+	case lane == laneUrgent:
+		return e.running || e.lane >= laneUrgent
+	default:
+		return true
+	}
 }
 
 type batch struct {
 	q         *queue
 	source    string
 	onResult  func(Result)
-	probes    []*probeEntry // probes that go through the ring
+	probes    []*probeEntry // probes that go through a ring
 	priority  []*probeEntry // probes that go through the priority lane
 	next      int           // index of the next probe the ring hands out
 	remaining int           // probes that have not reported yet, inline ones included
@@ -130,6 +159,11 @@ type batch struct {
 	failed    int
 	started   time.Time
 	done      chan struct{}
+	// lane is the lane the batch waits in, rest is the lane the remaining
+	// probes drop to once the batch measured a member: an urgent check stops
+	// delaying the groups that are still looking for one.
+	lane lane
+	rest lane
 }
 
 type queue struct {
@@ -137,6 +171,10 @@ type queue struct {
 	cond    *sync.Cond
 	limit   int
 	running int
+	// urgent holds the checks of groups that have nothing to route by; a dial
+	// waits for their first answer, so they are served before both rings.
+	urgent       []*batch
+	urgentCursor int
 	// foreground holds the checks of groups that do not wait for traffic
 	// (lazy: false): their answers are what the next connections route by, so
 	// they are served before the background sweeps.
@@ -165,6 +203,19 @@ func Submit(source string, probes []Probe, onResult func(Result)) *Check {
 // groups that wait for traffic; the two lanes still keep their own round-robin.
 func SubmitForeground(source string, probes []Probe, onResult func(Result)) *Check {
 	return defaultQueue.submit(source, true, probes, onResult)
+}
+
+// SubmitUrgent hands the probes of a group that has nothing to route by to the
+// urgent lane: a dial waits for its first result, so it goes ahead of both
+// rings. Once a probe reports a member, the remaining ones drop to the
+// foreground lane (or the background ring when `foreground` is false), so the
+// check stops delaying the groups that are still looking for a member.
+func SubmitUrgent(source string, foreground bool, probes []Probe, onResult func(Result)) *Check {
+	rest := laneRing
+	if foreground {
+		rest = laneForeground
+	}
+	return defaultQueue.submitInLane(source, laneUrgent, rest, probes, onResult)
 }
 
 // TestProxy measures one proxy for a caller that is waiting on the answer: the
@@ -209,7 +260,15 @@ func TestProxyWithBudget(ctx context.Context, proxy C.Proxy, url string, expecte
 }
 
 func (q *queue) submit(source string, foreground bool, probes []Probe, onResult func(Result)) *Check {
-	b := &batch{q: q, source: source, onResult: onResult, started: time.Now(), done: make(chan struct{})}
+	lane := laneRing
+	if foreground {
+		lane = laneForeground
+	}
+	return q.submitInLane(source, lane, lane, probes, onResult)
+}
+
+func (q *queue) submitInLane(source string, lane, rest lane, probes []Probe, onResult func(Result)) *Check {
+	b := &batch{q: q, source: source, onResult: onResult, started: time.Now(), done: make(chan struct{}), lane: lane, rest: rest}
 	b.remaining = len(probes)
 	if len(probes) == 0 {
 		close(b.done)
@@ -231,23 +290,33 @@ func (q *queue) submit(source string, foreground bool, probes []Probe, onResult 
 			continue
 		}
 
+		probeLane := lane
+		if probe.Priority {
+			probeLane = lanePriority
+		}
+
 		key, keyed := probeKeyOf(probe)
 		if keyed {
-			if entry, ok := q.inflight[key]; ok && entry.joinable(probe) {
+			if entry, ok := q.inflight[key]; ok && entry.joinable(probe, lane) {
 				entry.waiters = append(entry.waiters, b)
 				shared++
 				continue
 			}
 		}
 
-		entry := &probeEntry{key: key, probe: probe, waiters: []*batch{b}, priority: probe.Priority}
+		entry := &probeEntry{key: key, probe: probe, waiters: []*batch{b}, lane: probeLane}
 		if probe.Priority {
 			b.priority = append(b.priority, entry)
 		} else {
 			b.probes = append(b.probes, entry)
 		}
 		if keyed {
-			q.inflight[key] = entry
+			// The map keeps the most urgent measurement of a key: a probe that
+			// could not join the queued ring twin takes the key over, so the
+			// next urgent ask joins the urgent one instead of the sweep.
+			if current, ok := q.inflight[key]; !ok || probeLane > current.lane {
+				q.inflight[key] = entry
+			}
 		}
 	}
 
@@ -255,9 +324,12 @@ func (q *queue) submit(source string, foreground bool, probes []Probe, onResult 
 		q.priority = append(q.priority, probeItem{batch: b, entry: entry})
 	}
 	if len(b.probes) > 0 {
-		if foreground {
+		switch lane {
+		case laneUrgent:
+			q.urgent = append(q.urgent, b)
+		case laneForeground:
 			q.foreground = append(q.foreground, b)
-		} else {
+		default:
 			q.ring = append(q.ring, b)
 		}
 	}
@@ -329,14 +401,14 @@ func (q *queue) dispatch() {
 }
 
 func (q *queue) hasWorkLocked() bool {
-	return len(q.priority) > 0 || len(q.foreground) > 0 || len(q.ring) > 0
+	return len(q.priority) > 0 || len(q.urgent) > 0 || len(q.foreground) > 0 || len(q.ring) > 0
 }
 
-// popLocked takes the next probe: the priority lane first, then the ring of
-// foreground checks, then the ring of background ones, one probe per check in
-// turn inside each ring, so every group starts getting answers in the first
-// wave instead of after the check ahead of it. A check leaves its ring once its
-// last probe is handed out, not when it finishes.
+// popLocked takes the next probe: the priority lane first, then the rings of
+// urgent, foreground and background checks, one probe per check in turn inside
+// each ring, so every group starts getting answers in the first wave instead of
+// after the check ahead of it. A check leaves its ring once its last probe is
+// handed out, not when it finishes.
 func (q *queue) popLocked() probeItem {
 	if len(q.priority) > 0 {
 		item := q.priority[0]
@@ -345,6 +417,9 @@ func (q *queue) popLocked() probeItem {
 		return item
 	}
 
+	if item, ok := q.popRingLocked(&q.urgent, &q.urgentCursor); ok {
+		return item
+	}
 	if item, ok := q.popRingLocked(&q.foreground, &q.fgCursor); ok {
 		return item
 	}
@@ -441,6 +516,11 @@ func finish(b *batch, result Result) {
 		b.failed++
 	} else {
 		b.alive++
+		if b.alive == 1 && b.lane == laneUrgent {
+			// The group has a member now: the rest of its check is ordinary
+			// work and must stop delaying the groups that are still looking.
+			b.q.demoteLocked(b)
+		}
 	}
 	b.remaining--
 	last := b.remaining == 0
@@ -451,6 +531,40 @@ func finish(b *batch, result Result) {
 
 	if last {
 		log.Debugln("Probe queue: %s done: %d alive, %d failed in %s", b.source, b.alive, b.failed, time.Since(b.started).Round(time.Millisecond))
+	}
+}
+
+// demoteLocked moves the remaining probes of an urgent check to its home lane
+// once the check measured a member. The batch may already have left the urgent
+// ring (its last probe was handed out), in which case only the lane is stamped:
+// the probes still running keep their slot.
+func (q *queue) demoteLocked(b *batch) {
+	for i, queued := range q.urgent {
+		if queued != b {
+			continue
+		}
+		q.urgent = append(q.urgent[:i], q.urgent[i+1:]...)
+		if q.urgentCursor > i {
+			q.urgentCursor--
+		}
+		break
+	}
+	if q.urgentCursor >= len(q.urgent) {
+		q.urgentCursor = 0
+	}
+
+	b.lane = b.rest
+	if b.next >= len(b.probes) {
+		// every probe was handed out already: nothing is left to requeue
+		return
+	}
+	for _, entry := range b.probes[b.next:] {
+		entry.lane = b.rest
+	}
+	if b.rest == laneForeground {
+		q.foreground = append(q.foreground, b)
+	} else {
+		q.ring = append(q.ring, b)
 	}
 }
 
