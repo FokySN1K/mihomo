@@ -2,6 +2,7 @@ package outboundgroup
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -117,4 +118,46 @@ func TestGroupBaseURLTestColdGroupOvertakesWarmSweep(t *testing.T) {
 
 	require.Equal(t, []string{"cold", "warm"}, order.list(),
 		"a cold group's check must take the free slot before a warm group's sweep")
+}
+
+// A group that fails as many times as its health check is armed for must not
+// deadlock the check against the failure counter: both share failedTestMux,
+// and onDialSuccess (the read path of every new flow) takes it too. A check
+// invoked while the mutex is held would wait on itself and stall the traffic
+// of the group behind it.
+func TestGroupBaseFailedDialDoesNotDeadlockHealthCheck(t *testing.T) {
+	base, err := NewGroupBase(GroupBaseOption{
+		Name:           "deadlock",
+		Type:           C.URLTest,
+		TestTimeout:    5000,
+		MaxFailedTimes: 2,
+	})
+	require.NoError(t, err)
+
+	for i := 0; i < 5; i++ {
+		base.onDialFailed(C.Shadowsocks, errors.New("i/o timeout"), base.healthCheck)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if base.failedTestMux.TryLock() {
+			base.failedTestMux.Unlock()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the failure path deadlocked its own health check: failedTestMux stayed locked")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		base.onDialSuccess()
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("onDialSuccess blocked on failedTestMux")
+	}
 }

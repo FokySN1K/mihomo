@@ -349,24 +349,27 @@ func (gb *GroupBase) onDialFailed(adapterType C.AdapterType, err error, fn func(
 			return
 		}
 
+		// The counter is decided under the mutex and the check runs after it is
+		// released: healthCheck and onDialSuccess take the same mutex, so a
+		// check called while it is held waits on itself and blocks every dial
+		// of the group behind it.
+		activate := false
 		gb.failedTestMux.Lock()
-		defer gb.failedTestMux.Unlock()
-
 		gb.failedTimes++
 		if gb.failedTimes == 1 {
 			log.Debugln("ProxyGroup: %s first failed", gb.Name())
 			gb.failedTime = time.Now()
+		} else if time.Since(gb.failedTime) > time.Duration(gb.testTimeout)*time.Millisecond {
+			gb.failedTimes = 0
 		} else {
-			if time.Since(gb.failedTime) > time.Duration(gb.testTimeout)*time.Millisecond {
-				gb.failedTimes = 0
-				return
-			}
-
 			log.Debugln("ProxyGroup: %s failed count: %d", gb.Name(), gb.failedTimes)
-			if gb.failedTimes >= gb.maxFailedTimes {
-				log.Warnln("because %s failed multiple times, activate health check", gb.Name())
-				fn()
-			}
+			activate = gb.failedTimes >= gb.maxFailedTimes
+		}
+		gb.failedTestMux.Unlock()
+
+		if activate {
+			log.Warnln("because %s failed multiple times, activate health check", gb.Name())
+			fn()
 		}
 	}()
 }
