@@ -174,6 +174,7 @@ func GetGeneral() *config.General {
 		GeositeMatcher:    geodata.SiteMatcherName(),
 		TCPConcurrent:     dialer.GetTcpConcurrent(),
 		ProbeConcurrency:  probequeue.GetConcurrency(),
+		ProbeOrder:        probequeue.GetProbeOrder().String(),
 		FindProcessMode:   tunnel.FindProcessMode(),
 		Sniffing:          tunnel.IsSniffing(),
 		GlobalUA:          mihomoHttp.UA(),
@@ -444,6 +445,9 @@ func updateGeneral(general *config.General, logging bool) {
 	// sweep to an explicit test, shares this limit instead of holding a
 	// per-group one.
 	probequeue.SetConcurrency(general.ProbeConcurrency)
+	if probeOrder, err := probequeue.ParseProbeOrder(general.ProbeOrder); err == nil {
+		probequeue.SetProbeOrder(probeOrder)
+	}
 
 	inbound.SetTfo(general.InboundTfo)
 	inbound.SetMPTCP(general.InboundMPTCP)

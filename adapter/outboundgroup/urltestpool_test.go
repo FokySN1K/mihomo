@@ -2645,18 +2645,20 @@ func probeSubmitPointer(submit func(string, []probequeue.Probe, func(probequeue.
 	return reflect.ValueOf(submit).Pointer()
 }
 
-// A cold pool must not queue its sweep behind the checks of the groups that
-// already route; a warm one checks in the lane its `lazy` asks for.
-func TestURLTestPoolColdCheckChoosesTheUrgentLane(t *testing.T) {
+// A cold pool takes part in the ordered chain, a warm one checks in the lane
+// its `lazy` asks for, and a wave a dial waits on keeps the priority its probes
+// carry. The chain is the queue's default order for a cold pool; a profile that
+// switches `probe-order` to parallel gets the old urgent lane back inside the
+// queue.
+func TestURLTestPoolColdCheckJoinsTheOrderedChain(t *testing.T) {
 	cold := newPoolOrderedProxy("cold", true, measuredURLDelay)
 	warm := newPoolOrderedProxy("warm", true, 40)
 	pool := newPoolForTest(t, URLTestPoolOption{}, cold, warm)
 
-	require.NotEqual(t, probeSubmitPointer(probequeue.Submit),
-		probeSubmitPointer(pool.probeSubmit([]C.Proxy{cold}, false)),
+	coldSubmit := probeSubmitPointer(pool.probeSubmit([]C.Proxy{cold}, false))
+	require.NotEqual(t, probeSubmitPointer(probequeue.Submit), coldSubmit,
 		"a cold pool must not wait behind the background sweeps")
-	require.NotEqual(t, probeSubmitPointer(probequeue.SubmitForeground),
-		probeSubmitPointer(pool.probeSubmit([]C.Proxy{cold}, false)),
+	require.NotEqual(t, probeSubmitPointer(probequeue.SubmitForeground), coldSubmit,
 		"a cold pool must overtake the warm checks as well")
 	require.Equal(t, probeSubmitPointer(probequeue.SubmitForeground),
 		probeSubmitPointer(pool.probeSubmit([]C.Proxy{cold, warm}, false)),
@@ -2664,6 +2666,122 @@ func TestURLTestPoolColdCheckChoosesTheUrgentLane(t *testing.T) {
 	require.Equal(t, probeSubmitPointer(probequeue.Submit),
 		probeSubmitPointer(pool.probeSubmit([]C.Proxy{cold}, true)),
 		"a wave a dial waits on keeps the priority its probes carry")
+}
+
+// `ordered` is the place of the pool in the profile-wide chain: a number,
+// including 0, or nothing at all. A negative number is a profile mistake, not
+// a way to turn the chain off.
+func TestURLTestPoolOrderedOption(t *testing.T) {
+	pool, err := NewURLTestPool(GroupCommonOption{Name: "pool"},
+		URLTestPoolOption{Ordered: intPtr(3)}, newPoolEmptyFallback(), nil)
+	require.NoError(t, err)
+	require.NotNil(t, pool.ChainOrder())
+	require.Equal(t, 3, *pool.ChainOrder())
+
+	pool, err = NewURLTestPool(GroupCommonOption{Name: "pool"},
+		URLTestPoolOption{Ordered: intPtr(0)}, newPoolEmptyFallback(), nil)
+	require.NoError(t, err)
+	require.Equal(t, 0, *pool.ChainOrder(), "0 is a real number: the pool is ordered first")
+
+	pool, err = NewURLTestPool(GroupCommonOption{Name: "pool"},
+		URLTestPoolOption{}, newPoolEmptyFallback(), nil)
+	require.NoError(t, err)
+	require.Nil(t, pool.ChainOrder(),
+		"a pool without ordered takes its place from the declaration order")
+}
+
+func TestURLTestPoolRejectsNegativeOrdered(t *testing.T) {
+	_, err := NewURLTestPool(GroupCommonOption{Name: "pool"},
+		URLTestPoolOption{Ordered: intPtr(-1)}, newPoolEmptyFallback(), nil)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "ordered")
+}
+
+// dialLogIndex reports where a probe name was recorded, or -1.
+func dialLogIndex(names []string, want string) int {
+	for i, name := range names {
+		if name == want {
+			return i
+		}
+	}
+	return -1
+}
+
+// A dial that arrives for a cold pool promotes its scheduled check to the head
+// of the ordered chain: the dial is the reason the check runs at all, so the
+// waves the profile put ahead of the pool must not delay it.
+func TestURLTestPoolDialPromotesItsChainCheck(t *testing.T) {
+	original := probequeue.GetConcurrency()
+	probequeue.SetConcurrency(1)
+	probequeue.SetProbeOrder(probequeue.OrderSequential)
+	probequeue.BeginChain()
+	probequeue.RegisterChain("promo-blocker", nil, 0)
+	probequeue.RegisterChain("pool", nil, 1)
+	probequeue.CommitChain()
+	t.Cleanup(func() {
+		probequeue.SetProbeOrder(probequeue.OrderSequential)
+		probequeue.SetConcurrency(original)
+		probequeue.ResetChain()
+	})
+
+	// The blocker owns the only slot, so both chain checks stay queued.
+	started := make(chan struct{})
+	gate := make(chan struct{})
+	slot := newPoolControlledProxy("slot", nil, func(context.Context) (uint16, error) {
+		close(started)
+		<-gate
+		return 10, nil
+	})
+	block := probequeue.Submit("slot", []probequeue.Probe{{Proxy: slot, Timeout: time.Second}}, nil)
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the blocker must own the only slot")
+	}
+
+	recorder := &dialLog{}
+	chainProbes := func(prefix string) []probequeue.Probe {
+		probes := make([]probequeue.Probe, 0, 2)
+		for i := 0; i < 2; i++ {
+			name := fmt.Sprintf("%s%d", prefix, i)
+			probes = append(probes, probequeue.Probe{
+				Proxy: newPoolControlledProxy(name, nil, func(context.Context) (uint16, error) {
+					recorder.record(name)
+					return 10, nil
+				}),
+				URL:     poolTestUrl,
+				Timeout: time.Second,
+			})
+		}
+		return probes
+	}
+	ahead := probequeue.SubmitChain("promo-blocker", false, chainProbes("blocker-"), nil)
+
+	pool := newPoolForTest(t, URLTestPoolOption{}, newPoolOrderedProxy("cold", true, measuredURLDelay))
+	behind := probequeue.SubmitChain("pool", false, chainProbes("pool-"), nil)
+
+	// A dial arrives: the pool is cold and its check has begun, but the queue
+	// still holds it behind the wave of the group ordered first.
+	pool.mu.Lock()
+	pool.pool = nil
+	pool.warmCh = make(chan struct{})
+	pool.checkStart = time.Now()
+	pool.firstResultWait = 10 * time.Millisecond
+	pool.mu.Unlock()
+	t.Cleanup(pool.markWarm)
+
+	pool.waitWarm(context.Background())
+
+	close(gate)
+	require.True(t, block.Wait(context.Background()))
+	require.True(t, ahead.Wait(context.Background()))
+	require.True(t, behind.Wait(context.Background()))
+
+	names := recorder.list()
+	require.GreaterOrEqual(t, dialLogIndex(names, "pool-0"), 0)
+	require.GreaterOrEqual(t, dialLogIndex(names, "blocker-0"), 0)
+	require.Less(t, dialLogIndex(names, "pool-0"), dialLogIndex(names, "blocker-0"),
+		"the dial's check must take the head of the chain")
 }
 
 // A subscription that lists dozens of one transport must not fill the whole

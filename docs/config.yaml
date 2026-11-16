@@ -91,6 +91,10 @@ external-controller-routing-mark: 0
 # 全局健康检查并发数，所有代理组共用这一条队列，默认 40，超过 64 按 64 处理
 # probe-concurrency: 40
 
+# 冷启动检查的排队方式：sequential（默认）按代理组的 ordered 编号分波依次测试，
+# 连接正在等待的组会插到队头；parallel 让所有组按原有方式一起测试
+# probe-order: sequential
+
 # 配置 WEB UI 目录，使用 http://{{external-controller}}/ui 访问
 external-ui: /path/to/ui/folder/
 external-ui-name: xd
@@ -1791,6 +1795,8 @@ proxy-groups:
     interval: 300
 
   # url-test-pool 只按 interval 测试延迟最低的 pool-size 个节点，并按 full-interval 全量测试后重建节点池
+  # 多个池设置了 ordered 时，冷启动检查按编号从小到大分波进行：编号相同的一组轮流共用一个并发窗口，
+  # 一波中任一池测出可用成员就放行后面的波次；未配置 ordered 的池排在所有编号池之后
   # 池内节点不全且连续 degraded-checks 次快速检查仍未恢复时，会提前触发全量检查
   # 节点拨号失败时会被标记并在下一次连接时跳过，全部节点不可用时立即触发全量测试
   # 全量检查按上次测得的延迟排序：可用且最快的节点先测，故障后第一波结果就能重建池
@@ -1812,6 +1818,7 @@ proxy-groups:
     interval: 300 # 快速检查：只测试池内节点
     full-interval: 1800 # 全量检查：测试所有节点并重建池
     # pool-size: 5 # 节点池大小
+    # ordered: 1 # 冷启动检查的分波编号，数字小的池先测；连接正在等待的池会跳到队头
     # degraded-checks: 2 # 连续多少次快速检查发现池内节点不全后触发全量检查，0 表示关闭
     # tolerance: 150 # 只有比当前节点快超过该值(毫秒)才切换，默认 150，0 表示关闭
     # lazy: true

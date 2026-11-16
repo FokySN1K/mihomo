@@ -12,12 +12,20 @@
 // Two checks that ask for the same proxy, URL, accepted statuses and budget ask
 // for the same answer: the second one waits on the probe already in flight
 // instead of loading the path a second time.
+//
+// A scheduled cold check of a url-test-pool can also join the ordered chain:
+// the profile numbers its groups with `ordered`, the queue serves one wave of
+// numbers at a time, and a dial that arrives for a group promotes its check to
+// the head instead of waiting behind the waves ahead of it.
 package probequeue
 
 import (
 	"context"
+	"fmt"
 	"reflect"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/metacubex/mihomo/common/utils"
@@ -102,10 +110,174 @@ const (
 	// laneUrgent is a check of a group that has nothing to route by at all: a
 	// dial waits for its first result, so it must not queue behind the sweeps.
 	laneUrgent
+	// laneChain is a scheduled cold check that takes part in the ordered
+	// chain: only one wave of the chain is served at a time, so the profile
+	// decides which group finds its member first. A dial that arrives for the
+	// group promotes its check to the head of the chain.
+	laneChain
 	// lanePriority is a single probe a caller is waiting on: the UI test
 	// button, a recovery probe on the dial path.
 	lanePriority
 )
+
+// chainPlace is where a group stands in the ordered chain: its explicit
+// `ordered` number, or its index in `proxy-groups` when it set none. Groups
+// with equal numbers share a wave; the groups without a number follow all the
+// explicit ones in declaration order and each stands alone, so the chain
+// never interleaves them with the numbers.
+type chainPlace struct {
+	explicit bool
+	value    int
+	declared int
+}
+
+// sameWave reports whether two places are served together: equal explicit
+// numbers are one wave, and a tail place is a wave of its own.
+func (p chainPlace) sameWave(other chainPlace) bool {
+	if p.explicit != other.explicit {
+		return false
+	}
+	if p.explicit {
+		return p.value == other.value
+	}
+	return p.declared == other.declared
+}
+
+// before orders the places of the chain: explicit numbers ascending, then the
+// groups that set none in declaration order.
+func (p chainPlace) before(other chainPlace) bool {
+	if p.explicit != other.explicit {
+		return p.explicit
+	}
+	if p.explicit && p.value != other.value {
+		return p.value < other.value
+	}
+	return p.declared < other.declared
+}
+
+// maxDeclaredChain bounds the implicit places: a declaration index never comes
+// close to it, so an unregistered source always sorts behind a profile group.
+const maxDeclaredChain = 1 << 30
+
+// The chain registry is rebuilt by the config parser on every profile load.
+// The active order keeps serving the running profile until the new profile
+// parsed, so a config that fails to parse cannot leave the queue without one.
+var (
+	chainMu      sync.RWMutex
+	chainPlaces  map[string]chainPlace
+	chainPending map[string]chainPlace
+	chainUnknown atomic.Int64
+)
+
+// ProbeOrder is how the queue runs the scheduled cold checks of the groups
+// that take part in the ordered chain.
+type ProbeOrder int32
+
+const (
+	// OrderSequential runs one wave of the chain at a time: the explicit
+	// numbers ascending, then the groups that set none in declaration order.
+	OrderSequential ProbeOrder = iota
+	// OrderParallel keeps the pre-chain behavior: every cold check shares the
+	// urgent lane in round-robin.
+	OrderParallel
+)
+
+func (o ProbeOrder) String() string {
+	if o == OrderParallel {
+		return "parallel"
+	}
+	return "sequential"
+}
+
+// ParseProbeOrder reads the `probe-order` option.
+func ParseProbeOrder(value string) (ProbeOrder, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "sequential":
+		return OrderSequential, nil
+	case "parallel":
+		return OrderParallel, nil
+	}
+	return OrderSequential, fmt.Errorf("unsupported probe-order %q, want sequential or parallel", value)
+}
+
+var probeOrder atomic.Int32
+
+// SetProbeOrder applies the `probe-order` option. Switching to parallel drains
+// the chain into the urgent lane: no check may be left waiting in a lane the
+// queue no longer serves.
+func SetProbeOrder(order ProbeOrder) {
+	if order != OrderParallel {
+		order = OrderSequential
+	}
+	if ProbeOrder(probeOrder.Swap(int32(order))) == order {
+		return
+	}
+	if order == OrderParallel {
+		defaultQueue.drainChain()
+	}
+	log.Debugln("Probe queue: probe order %s", order)
+}
+
+// GetProbeOrder reports the order the queue is running with.
+func GetProbeOrder() ProbeOrder {
+	return ProbeOrder(probeOrder.Load())
+}
+
+// BeginChain opens a new order registry for the profile that is being parsed.
+// The active order keeps serving the running profile until CommitChain swaps
+// the new one in.
+func BeginChain() {
+	chainMu.Lock()
+	chainPending = make(map[string]chainPlace)
+	chainMu.Unlock()
+}
+
+// RegisterChain places a url-test-pool group in the chain. ordered is the
+// group's `ordered` option (nil when it set none), declared is the index of
+// the group in `proxy-groups`.
+func RegisterChain(name string, ordered *int, declared int) {
+	place := chainPlace{declared: declared}
+	if ordered != nil {
+		place.explicit = true
+		place.value = *ordered
+	}
+	chainMu.Lock()
+	if chainPending == nil {
+		chainPending = make(map[string]chainPlace)
+	}
+	chainPending[name] = place
+	chainMu.Unlock()
+}
+
+// CommitChain makes the registry built since BeginChain the active one.
+func CommitChain() {
+	chainMu.Lock()
+	if chainPending != nil {
+		chainPlaces = chainPending
+		chainPending = nil
+	}
+	chainMu.Unlock()
+}
+
+// ResetChain forgets every registered group.
+func ResetChain() {
+	chainMu.Lock()
+	chainPlaces = nil
+	chainPending = nil
+	chainMu.Unlock()
+}
+
+// chainPlaceOf looks a group up. A source the profile did not register (a
+// group a host built itself, a test) takes its own place at the tail.
+func chainPlaceOf(source string) chainPlace {
+	chainMu.RLock()
+	place, ok := chainPlaces[source]
+	chainMu.RUnlock()
+	if ok {
+		return place
+	}
+	return chainPlace{declared: maxDeclaredChain + int(chainUnknown.Add(1))}
+}
 
 // probeKey identifies one measurement. The same proxy, URL, accepted statuses
 // and budget is the same question, whatever check asks it.
@@ -133,17 +305,41 @@ type probeEntry struct {
 // this entry. A priority probe only joins a measurement that already runs or
 // one that waits in the priority lane itself: joining an entry of the ring
 // would make the dial wait behind the ring, which is exactly what the priority
-// lane exists to prevent. An urgent probe follows the same rule against the
-// background rings: joining a sweep that has not started would make a group
-// with nothing to route by wait for the whole sweep.
+// lane exists to prevent. An urgent or chained probe follows the same rule
+// against the lanes the queue serves later: joining a sweep that has not
+// started would make a group with nothing to route by wait for the whole
+// sweep, and joining an urgent entry would make an ordered wave wait behind
+// work that comes after it.
 func (e *probeEntry) joinable(probe Probe, lane lane) bool {
 	switch {
 	case probe.Priority:
 		return e.running || e.lane == lanePriority
-	case lane == laneUrgent:
-		return e.running || e.lane >= laneUrgent
+	case lane >= laneUrgent:
+		return e.running || e.lane.servedNoLaterThan(lane)
 	default:
 		return true
+	}
+}
+
+// servedNoLaterThan reports whether the queue serves this lane no later than
+// the other one. The serving order is priority, chain, urgent, foreground and
+// the background ring.
+func (l lane) servedNoLaterThan(other lane) bool {
+	return laneServingRank(l) >= laneServingRank(other)
+}
+
+func laneServingRank(l lane) int {
+	switch l {
+	case lanePriority:
+		return 4
+	case laneChain:
+		return 3
+	case laneUrgent:
+		return 2
+	case laneForeground:
+		return 1
+	default:
+		return 0
 	}
 }
 
@@ -164,6 +360,11 @@ type batch struct {
 	// delaying the groups that are still looking for one.
 	lane lane
 	rest lane
+	// place is where the group stands in the ordered chain, and promoted
+	// marks a check a dial has arrived for: it goes ahead of the waves that
+	// were ahead of it.
+	place    chainPlace
+	promoted bool
 }
 
 type queue struct {
@@ -183,7 +384,14 @@ type queue struct {
 	ring       []*batch
 	cursor     int
 	priority   []probeItem
-	inflight   map[probeKey]*probeEntry
+	// chain holds the scheduled cold checks of the ordered groups. One wave of
+	// equal places is served at a time: a check stays here until its last probe
+	// is handed out or its wave found a member.
+	chain []*batch
+	// promoted remembers the groups a dial has arrived for before their check
+	// reached the queue: the batch picks the request up when it is submitted.
+	promoted map[string]struct{}
+	inflight map[probeKey]*probeEntry
 }
 
 // defaultQueue is the process-wide queue. Groups share it: a per-group queue
@@ -216,6 +424,34 @@ func SubmitUrgent(source string, foreground bool, probes []Probe, onResult func(
 		rest = laneForeground
 	}
 	return defaultQueue.submitInLane(source, laneUrgent, rest, probes, onResult)
+}
+
+// SubmitChain hands a scheduled cold check of a url-test-pool to the ordered
+// chain: the profile numbers its groups with `ordered`, one wave of the chain
+// is served at a time, so the groups it named first find their members first.
+// With `probe-order: parallel` the check goes to the urgent lane as before and
+// the chain plays no part.
+func SubmitChain(source string, foreground bool, probes []Probe, onResult func(Result)) *Check {
+	if GetProbeOrder() == OrderParallel {
+		return SubmitUrgent(source, foreground, probes, onResult)
+	}
+	return defaultQueue.submitChain(source, foreground, probes, onResult)
+}
+
+func (q *queue) submitChain(source string, foreground bool, probes []Probe, onResult func(Result)) *Check {
+	rest := laneRing
+	if foreground {
+		rest = laneForeground
+	}
+	return q.submitInLane(source, laneChain, rest, probes, onResult)
+}
+
+// Promote moves the scheduled check of a group to the head of the ordered
+// chain: a dial has arrived for the group, so its answers are needed now and
+// not after the waves ahead of it. A check that already runs or does not take
+// part in the chain is left alone.
+func Promote(source string) {
+	defaultQueue.promote(source)
 }
 
 // TestProxy measures one proxy for a caller that is waiting on the answer: the
@@ -269,6 +505,9 @@ func (q *queue) submit(source string, foreground bool, probes []Probe, onResult 
 
 func (q *queue) submitInLane(source string, lane, rest lane, probes []Probe, onResult func(Result)) *Check {
 	b := &batch{q: q, source: source, onResult: onResult, started: time.Now(), done: make(chan struct{}), lane: lane, rest: rest}
+	if lane == laneChain {
+		b.place = chainPlaceOf(source)
+	}
 	b.remaining = len(probes)
 	if len(probes) == 0 {
 		close(b.done)
@@ -327,6 +566,9 @@ func (q *queue) submitInLane(source string, lane, rest lane, probes []Probe, onR
 		switch lane {
 		case laneUrgent:
 			q.urgent = append(q.urgent, b)
+		case laneChain:
+			b.promoted = q.takePromotionLocked(b.source)
+			q.insertChainLocked(b)
 		case laneForeground:
 			q.foreground = append(q.foreground, b)
 		default:
@@ -401,14 +643,14 @@ func (q *queue) dispatch() {
 }
 
 func (q *queue) hasWorkLocked() bool {
-	return len(q.priority) > 0 || len(q.urgent) > 0 || len(q.foreground) > 0 || len(q.ring) > 0
+	return len(q.priority) > 0 || len(q.chain) > 0 || len(q.urgent) > 0 || len(q.foreground) > 0 || len(q.ring) > 0
 }
 
-// popLocked takes the next probe: the priority lane first, then the rings of
-// urgent, foreground and background checks, one probe per check in turn inside
-// each ring, so every group starts getting answers in the first wave instead of
-// after the check ahead of it. A check leaves its ring once its last probe is
-// handed out, not when it finishes.
+// popLocked takes the next probe: the priority lane first, then the ordered
+// chain, then the rings of urgent, foreground and background checks, one probe
+// per check in turn inside each ring, so every group starts getting answers in
+// the first wave instead of after the check ahead of it. A check leaves its
+// ring once its last probe is handed out, not when it finishes.
 func (q *queue) popLocked() probeItem {
 	if len(q.priority) > 0 {
 		item := q.priority[0]
@@ -417,6 +659,9 @@ func (q *queue) popLocked() probeItem {
 		return item
 	}
 
+	if item, ok := q.popChainLocked(); ok {
+		return item
+	}
 	if item, ok := q.popRingLocked(&q.urgent, &q.urgentCursor); ok {
 		return item
 	}
@@ -516,10 +761,18 @@ func finish(b *batch, result Result) {
 		b.failed++
 	} else {
 		b.alive++
-		if b.alive == 1 && b.lane == laneUrgent {
-			// The group has a member now: the rest of its check is ordinary
-			// work and must stop delaying the groups that are still looking.
-			b.q.demoteLocked(b)
+		if b.alive == 1 {
+			switch b.lane {
+			case laneUrgent:
+				// The group has a member now: the rest of its check is
+				// ordinary work and must stop delaying the groups that are
+				// still looking.
+				b.q.demoteLocked(b)
+			case laneChain:
+				// The wave found its member: the rest of its probes and the
+				// checks behind it in the chain are ordinary work now.
+				b.q.demoteChainWaveLocked(b)
+			}
 		}
 	}
 	b.remaining--
@@ -553,6 +806,14 @@ func (q *queue) demoteLocked(b *batch) {
 		q.urgentCursor = 0
 	}
 
+	q.requeueRestLocked(b)
+}
+
+// requeueRestLocked moves a check that leaves the urgent or chain lane to its
+// rest lane. The probes that were not handed out yet drop along, so the check
+// stops delaying the groups that are still looking; a check that already gave
+// every probe away only has its lane stamped.
+func (q *queue) requeueRestLocked(b *batch) {
 	b.lane = b.rest
 	if b.next >= len(b.probes) {
 		// every probe was handed out already: nothing is left to requeue
@@ -566,6 +827,161 @@ func (q *queue) demoteLocked(b *batch) {
 	} else {
 		q.ring = append(q.ring, b)
 	}
+}
+
+// insertChainLocked puts a scheduled check in the chain behind the places that
+// come before it. Equal places keep the order they arrived in; the wave itself
+// is served round-robin.
+func (q *queue) insertChainLocked(b *batch) {
+	at := len(q.chain)
+	for i, queued := range q.chain {
+		if b.place.before(queued.place) {
+			at = i
+			break
+		}
+	}
+	q.chain = append(q.chain, nil)
+	copy(q.chain[at+1:], q.chain[at:])
+	q.chain[at] = b
+}
+
+// removeChainLocked takes a check out of the chain.
+func (q *queue) removeChainLocked(b *batch) {
+	for i, queued := range q.chain {
+		if queued == b {
+			q.chain = append(q.chain[:i], q.chain[i+1:]...)
+			return
+		}
+	}
+}
+
+// chainHeadLocked reports the check the chain serves now: a promoted check
+// first, then the earliest place. A promoted check goes ahead of the waves
+// still ahead of it for the same reason a dial outranks the schedule.
+func (q *queue) chainHeadLocked() *batch {
+	var head *batch
+	for _, b := range q.chain {
+		if head == nil || chainBeats(b, head) {
+			head = b
+		}
+	}
+	return head
+}
+
+// chainBeats reports whether candidate is served before current. Two checks of
+// one wave keep the order they have, so the lookup sees the first one and the
+// served check rotates to the tail.
+func chainBeats(candidate, current *batch) bool {
+	if candidate.promoted != current.promoted {
+		return candidate.promoted
+	}
+	if candidate.place.sameWave(current.place) {
+		return false
+	}
+	return candidate.place.before(current.place)
+}
+
+// popChainLocked hands out one probe of the wave the chain serves now: one
+// probe per check of the wave in turn, and a check leaves the chain once its
+// last probe is handed out. The next wave is served only when this one is
+// empty, so the groups the profile ordered first get their answers first.
+func (q *queue) popChainLocked() (probeItem, bool) {
+	b := q.chainHeadLocked()
+	if b == nil {
+		return probeItem{}, false
+	}
+
+	entry := b.probes[b.next]
+	entry.running = true
+	item := probeItem{batch: b, entry: entry}
+	b.next++
+	// A check whose last probe is handed out leaves the chain now; the one
+	// that still has probes to hand out goes to the tail, so the other checks
+	// of its wave are served in turn.
+	q.removeChainLocked(b)
+	if b.next < len(b.probes) {
+		q.chain = append(q.chain, b)
+	}
+	return item, true
+}
+
+// demoteChainWaveLocked moves the rest of a wave to the rest lane once one of
+// its checks measured a member: the wave has something to route by, and the
+// waves behind it must not wait for its remaining probes.
+func (q *queue) demoteChainWaveLocked(b *batch) {
+	demoted := false
+	for _, queued := range append([]*batch(nil), q.chain...) {
+		if !queued.place.sameWave(b.place) {
+			continue
+		}
+		q.removeChainLocked(queued)
+		q.requeueRestLocked(queued)
+		if queued == b {
+			demoted = true
+		}
+	}
+	if !demoted {
+		// The check gave every probe away already; only its lane is stamped.
+		q.requeueRestLocked(b)
+	}
+}
+
+// drainChain moves every check still waiting in the chain to the urgent ring.
+// It runs when the profile switches `probe-order` to parallel: the chain lane
+// is no longer served, and no check may be left waiting in it.
+func (q *queue) drainChain() {
+	q.mu.Lock()
+	if len(q.chain) > 0 {
+		for _, b := range q.chain {
+			b.lane = laneUrgent
+			for _, entry := range b.probes[b.next:] {
+				entry.lane = laneUrgent
+			}
+			q.urgent = append(q.urgent, b)
+		}
+		q.chain = nil
+		q.cond.Broadcast()
+	}
+	q.mu.Unlock()
+}
+
+// promote moves the check of a group to the head of the chain: a dial has
+// arrived for the group, so its answers are no longer a background question.
+// A check that is not waiting in the chain is left alone: it already runs or
+// already left its lane.
+func (q *queue) promote(source string) {
+	q.mu.Lock()
+	found := false
+	for _, b := range q.chain {
+		if b.source == source {
+			found = true
+			b.promoted = true
+		}
+	}
+	if !found {
+		// The check has not reached the queue yet: the batch picks the request
+		// up when it is submitted.
+		if q.promoted == nil {
+			q.promoted = make(map[string]struct{})
+		}
+		q.promoted[source] = struct{}{}
+	}
+	q.cond.Broadcast()
+	q.mu.Unlock()
+}
+
+// takePromotionLocked reports whether a dial asked for this group before its
+// check reached the queue, and forgets the request: one dial promotes one
+// check.
+func (q *queue) takePromotionLocked(source string) bool {
+	if len(q.promoted) == 0 {
+		return false
+	}
+	if _, ok := q.promoted[source]; !ok {
+		return false
+	}
+	delete(q.promoted, source)
+	return true
 }
 
 // selfTester is implemented by every group adapter: a group answers a probe of

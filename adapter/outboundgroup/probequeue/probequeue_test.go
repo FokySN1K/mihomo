@@ -896,3 +896,282 @@ func TestPriorityProbeJoinsQueuedPriorityTwin(t *testing.T) {
 	require.True(t, second.Wait(context.Background()))
 	require.Equal(t, int32(1), calls.Load(), "the member must be probed once")
 }
+
+// newIdleQueue builds a queue without its dispatcher: the test decides when a
+// probe is taken, so the state of the lanes can be inspected.
+func newIdleQueue() *queue {
+	q := &queue{limit: 1, inflight: make(map[probeKey]*probeEntry)}
+	q.cond = sync.NewCond(&q.mu)
+	return q
+}
+
+// chainProbes builds the probes of a check named prefix0, prefix1, ...
+func chainProbes(prefix string, count int) []Probe {
+	probes := make([]Probe, 0, count)
+	for i := 0; i < count; i++ {
+		probes = append(probes, Probe{Proxy: newTestProxy(fmt.Sprintf("%s%d", prefix, i), okProbe(1))})
+	}
+	return probes
+}
+
+// chainBatch builds a chained batch that goes straight into a lane of the test
+// queue, without the registry deciding its place.
+func chainBatch(q *queue, prefix string, count int, place chainPlace) *batch {
+	probes := make([]*probeEntry, 0, count)
+	for i := 0; i < count; i++ {
+		probes = append(probes, &probeEntry{probe: Probe{Proxy: newTestProxy(fmt.Sprintf("%s%d", prefix, i), okProbe(1))}})
+	}
+	return &batch{q: q, source: prefix, probes: probes, lane: laneChain, rest: laneRing, place: place}
+}
+
+// The ordered chain serves one wave of the profile at a time: the explicit
+// numbers ascending, and the pools that set none after them in declaration
+// order. Equal numbers are one wave and are served round-robin, so the groups
+// the profile put together look for a member together.
+func TestPopLockedChainServesWavesInOrder(t *testing.T) {
+	q := newIdleQueue()
+
+	q.insertChainLocked(chainBatch(q, "d", 2, chainPlace{declared: 3}))
+	q.insertChainLocked(chainBatch(q, "a", 2, chainPlace{explicit: true, value: 1}))
+	q.insertChainLocked(chainBatch(q, "c", 2, chainPlace{explicit: true, value: 2}))
+	q.insertChainLocked(chainBatch(q, "b", 2, chainPlace{explicit: true, value: 1}))
+	q.insertChainLocked(chainBatch(q, "e", 2, chainPlace{declared: 4}))
+
+	var order []string
+	for q.hasWorkLocked() {
+		order = append(order, q.popLocked().entry.probe.Proxy.Name())
+	}
+	require.Equal(t, []string{"a0", "b0", "a1", "b1", "c0", "c1", "d0", "d1", "e0", "e1"}, order,
+		"the waves must go in profile order, one at a time, round-robin inside a wave")
+}
+
+// A check a dial waits on goes ahead of the waves still ahead of it: the dial
+// is the reason the check runs at all.
+func TestPopLockedChainPromotedFirst(t *testing.T) {
+	q := newIdleQueue()
+	q.insertChainLocked(chainBatch(q, "b", 2, chainPlace{explicit: true, value: 2}))
+	q.insertChainLocked(chainBatch(q, "a", 2, chainPlace{explicit: true, value: 1}))
+
+	require.Equal(t, "a", q.chainHeadLocked().source)
+	q.promote("b")
+	require.Equal(t, "b", q.chainHeadLocked().source,
+		"a dial-waiting check must go ahead of the wave the profile put before it")
+
+	var order []string
+	for q.hasWorkLocked() {
+		order = append(order, q.popLocked().entry.probe.Proxy.Name())
+	}
+	require.Equal(t, []string{"b0", "b1", "a0", "a1"}, order)
+}
+
+// The registry follows the profile: explicit numbers first, ascending, and the
+// pools without a number after them in declaration order. A source the profile
+// did not register (a host-built group, a test) takes the tail.
+func TestChainRegistryOrdersNumbersThenDeclaration(t *testing.T) {
+	one, two := 1, 2
+	BeginChain()
+	RegisterChain("plain-a", nil, 0)
+	RegisterChain("two", &two, 1)
+	RegisterChain("one-a", &one, 4)
+	RegisterChain("one-b", &one, 2)
+	CommitChain()
+	defer ResetChain()
+
+	require.True(t, chainPlaceOf("one-a").sameWave(chainPlaceOf("one-b")),
+		"equal numbers must share a wave")
+	require.False(t, chainPlaceOf("two").sameWave(chainPlaceOf("one-a")))
+	require.True(t, chainPlaceOf("one-a").before(chainPlaceOf("two")))
+	require.True(t, chainPlaceOf("two").before(chainPlaceOf("plain-a")),
+		"a pool without a number must follow every explicit one, whatever its declaration index")
+	require.True(t, chainPlaceOf("plain-a").before(chainPlaceOf("unregistered")),
+		"a source the profile did not register must stay at the tail")
+}
+
+// Begin/commit is two-phase: a profile that fails to parse must not take away
+// the order the running profile uses.
+func TestCommitChainKeepsTheRunningOrderOnFailedParse(t *testing.T) {
+	one := 1
+	BeginChain()
+	RegisterChain("kept", &one, 0)
+	CommitChain()
+	defer ResetChain()
+
+	// the next profile starts building its own order and fails before Commit
+	BeginChain()
+	RegisterChain("dropped", nil, 0)
+
+	place := chainPlaceOf("kept")
+	require.True(t, place.explicit)
+	require.Equal(t, 1, place.value)
+	require.False(t, chainPlaceOf("dropped").explicit,
+		"an uncommitted registry must not be visible to the queue")
+}
+
+// The first alive member takes the rest of the wave out of the chain: the
+// groups of the wave have something to route by, and the next wave must not
+// wait for their remaining probes. A wave is the equal number, not one batch:
+// the other group of the wave drops along.
+func TestChainDemotesTheWholeWaveAfterFirstAlive(t *testing.T) {
+	one := 1
+	BeginChain()
+	RegisterChain("a", &one, 0)
+	RegisterChain("b", &one, 1)
+	RegisterChain("c", nil, 2)
+	CommitChain()
+	defer ResetChain()
+
+	q := newIdleQueue()
+	q.submitChain("a", false, chainProbes("a", 3), nil)
+	q.submitChain("b", false, chainProbes("b", 3), nil)
+	q.submitChain("c", false, chainProbes("c", 3), nil)
+
+	find := func(source string) *batch {
+		for _, b := range q.chain {
+			if b.source == source {
+				return b
+			}
+		}
+		return nil
+	}
+
+	q.mu.Lock()
+	first := find("a")
+	require.NotNil(t, first)
+	require.Same(t, first, q.chainHeadLocked(), "the wave of the lowest number must be served first")
+
+	q.demoteChainWaveLocked(first)
+
+	require.Nil(t, find("a"))
+	require.Nil(t, find("b"), "the rest of the wave must leave the chain with the group that answered")
+	require.NotNil(t, find("c"), "the next wave must keep its place after one wave found a member")
+
+	require.Len(t, q.ring, 2, "the rest of the wave must drop to its home lane")
+	for _, b := range q.ring {
+		require.Equal(t, laneRing, b.lane)
+		for _, entry := range b.probes[b.next:] {
+			require.Equal(t, laneRing, entry.lane, "a queued entry must keep the lane it dropped to")
+		}
+	}
+	q.mu.Unlock()
+}
+
+// Switching `probe-order` to parallel must not strand a check in the chain
+// lane: every queued check moves to the urgent ring the parallel order serves.
+func TestDrainChainMovesChecksToTheUrgentRing(t *testing.T) {
+	q := newIdleQueue()
+	BeginChain()
+	RegisterChain("a", nil, 0)
+	RegisterChain("b", nil, 1)
+	CommitChain()
+	defer ResetChain()
+
+	q.submitChain("a", true, chainProbes("a", 2), nil)
+	q.submitChain("b", false, chainProbes("b", 2), nil)
+
+	q.drainChain()
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	require.Empty(t, q.chain)
+	require.Len(t, q.urgent, 2)
+	for _, b := range q.urgent {
+		require.Equal(t, laneUrgent, b.lane)
+		for _, entry := range b.probes[b.next:] {
+			require.Equal(t, laneUrgent, entry.lane)
+		}
+	}
+	require.Equal(t, laneForeground, q.urgent[0].rest, "a foreground check must keep the lane it drops to")
+}
+
+// A dial can win the race against its own check: the promotion must be
+// remembered until the check reaches the queue, and only one check takes it.
+func TestPromoteBeforeSubmitReachesTheCheck(t *testing.T) {
+	q := newIdleQueue()
+	BeginChain()
+	RegisterChain("first", nil, 0)
+	RegisterChain("late", nil, 5)
+	CommitChain()
+	defer ResetChain()
+
+	q.promote("late")
+	q.submitChain("first", false, chainProbes("first", 2), nil)
+	q.submitChain("late", false, chainProbes("late", 2), nil)
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	require.Equal(t, "late", q.chainHeadLocked().source,
+		"a promotion that arrived before the check must still put it at the head")
+	require.Empty(t, q.promoted, "the request must be consumed by the check it promoted")
+}
+
+// `probe-order: parallel` puts a cold check back in the urgent lane, and a
+// check that already waits in the chain moves along with it.
+func TestSubmitChainFollowsProbeOrder(t *testing.T) {
+	originalOrder := GetProbeOrder()
+	originalLimit := GetConcurrency()
+	SetConcurrency(1)
+	SetProbeOrder(OrderSequential)
+	t.Cleanup(func() {
+		SetProbeOrder(originalOrder)
+		SetConcurrency(originalLimit)
+	})
+
+	started := make(chan struct{})
+	gate := make(chan struct{})
+	block := Submit("block", []Probe{{Proxy: newTestProxy("slot", func(context.Context) (uint16, error) {
+		close(started)
+		<-gate
+		return 10, nil
+	}), Timeout: time.Second}}, nil)
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the blocker must own the only slot")
+	}
+
+	probe := Probe{Proxy: newTestProxy("chained", okProbe(5)), URL: "https://example.com/204", Timeout: time.Second}
+	chained := SubmitChain("chained", false, []Probe{probe}, nil)
+
+	defaultQueue.mu.Lock()
+	chainQueued := len(defaultQueue.chain)
+	defaultQueue.mu.Unlock()
+	require.Equal(t, 1, chainQueued, "a sequential profile must run the cold check in the chain")
+
+	SetProbeOrder(OrderParallel)
+
+	defaultQueue.mu.Lock()
+	chainAfter := len(defaultQueue.chain)
+	urgentQueued := len(defaultQueue.urgent)
+	defaultQueue.mu.Unlock()
+	require.Zero(t, chainAfter)
+	require.Equal(t, 1, urgentQueued, "switching to parallel must not strand the chained check")
+
+	close(gate)
+	require.True(t, block.Wait(context.Background()))
+	require.True(t, chained.Wait(context.Background()))
+}
+
+func TestParseProbeOrder(t *testing.T) {
+	for _, tc := range []struct {
+		value   string
+		want    ProbeOrder
+		wantErr bool
+	}{
+		{value: "", want: OrderSequential},
+		{value: "sequential", want: OrderSequential},
+		{value: "SEQUENTIAL", want: OrderSequential},
+		{value: "parallel", want: OrderParallel},
+		{value: " Parallel ", want: OrderParallel},
+		{value: "ordered", wantErr: true},
+	} {
+		got, err := ParseProbeOrder(tc.value)
+		if tc.wantErr {
+			require.Error(t, err, tc.value)
+			continue
+		}
+		require.NoError(t, err, tc.value)
+		require.Equal(t, tc.want, got, tc.value)
+	}
+	require.Equal(t, "sequential", OrderSequential.String())
+	require.Equal(t, "parallel", OrderParallel.String())
+}

@@ -64,7 +64,11 @@ type General struct {
 	// ProbeConcurrency is how many health probes the whole process runs at
 	// once. Every group shares this limit instead of holding one of its own,
 	// so the load on the network does not depend on the number of groups.
-	ProbeConcurrency  int                     `json:"probe-concurrency"`
+	ProbeConcurrency int `json:"probe-concurrency"`
+	// ProbeOrder is how the scheduled cold checks of the ordered groups run:
+	// sequential serves one wave of the chain at a time, parallel restores the
+	// plain urgent round-robin.
+	ProbeOrder        string                  `json:"probe-order"`
 	FindProcessMode   process.FindProcessMode `json:"find-process-mode"`
 	Sniffing          bool                    `json:"sniffing"`
 	GlobalUA          string                  `json:"global-ua"`
@@ -455,6 +459,7 @@ type RawConfig struct {
 	GeositeMatcher                string                  `yaml:"geosite-matcher" json:"geosite-matcher"`
 	TCPConcurrent                 bool                    `yaml:"tcp-concurrent" json:"tcp-concurrent"`
 	ProbeConcurrency              int                     `yaml:"probe-concurrency" json:"probe-concurrency"`
+	ProbeOrder                    string                  `yaml:"probe-order" json:"probe-order"`
 	FindProcessMode               process.FindProcessMode `yaml:"find-process-mode" json:"find-process-mode"`
 	GlobalClientFingerprint       string                  `yaml:"global-client-fingerprint" json:"global-client-fingerprint"`
 	GlobalUA                      string                  `yaml:"global-ua" json:"global-ua"`
@@ -515,6 +520,7 @@ func DefaultRawConfig() *RawConfig {
 		ProxyGroup:        []map[string]any{},
 		TCPConcurrent:     false,
 		ProbeConcurrency:  probequeue.DefaultConcurrency,
+		ProbeOrder:        probequeue.OrderSequential.String(),
 		FindProcessMode:   process.FindProcessStrict,
 		GlobalUA:          "clash.meta/" + C.Version,
 		ETagSupport:       true,
@@ -777,6 +783,10 @@ func parseGeneral(cfg *RawConfig) (*General, error) {
 	if cfg.GlobalClientFingerprint != "" {
 		log.Errorln("The `global-client-fingerprint` configuration is removed, please set `client-fingerprint` directly on the proxy instead")
 	}
+	probeOrder, err := probequeue.ParseProbeOrder(cfg.ProbeOrder)
+	if err != nil {
+		return nil, err
+	}
 	return &General{
 		Inbound: Inbound{
 			Port:              cfg.Port,
@@ -813,6 +823,7 @@ func parseGeneral(cfg *RawConfig) (*General, error) {
 		GeositeMatcher:    cfg.GeositeMatcher,
 		TCPConcurrent:     cfg.TCPConcurrent,
 		ProbeConcurrency:  cfg.ProbeConcurrency,
+		ProbeOrder:        probeOrder.String(),
 		FindProcessMode:   cfg.FindProcessMode,
 		GlobalUA:          cfg.GlobalUA,
 		ETagSupport:       cfg.ETagSupport,
@@ -930,7 +941,10 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 		AllProxies = append(AllProxies, proxy.Name())
 	}
 
-	// keep the original order of ProxyGroups in config file
+	// keep the original order of ProxyGroups in config file. The ordered
+	// probe chain follows the same order, so the indices are read here, before
+	// proxyGroupsDagSort reorders the groups.
+	declaredAt := make(map[string]int, len(groupsConfig))
 	for idx, mapping := range groupsConfig {
 		groupName, existName := mapping["name"].(string)
 		if !existName {
@@ -939,6 +953,7 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 		if groupName == "GLOBAL" {
 			hasGlobal = true
 		}
+		declaredAt[groupName] = idx
 		proxyList = append(proxyList, groupName)
 	}
 
@@ -966,7 +981,10 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 	slices.Sort(AllProxies)
 	slices.Sort(AllProviders)
 
-	// parse proxy group
+	// parse proxy group. The ordered chain of the new profile is built aside
+	// and swapped in only when every group parsed, so a config that fails to
+	// parse cannot take away the order the running profile's queue uses.
+	probequeue.BeginChain()
 	for idx, mapping := range groupsConfig {
 		group, err := outboundgroup.ParseProxyGroup(mapping, proxies, providersMap, AllProxies, AllProviders)
 		if err != nil {
@@ -978,8 +996,12 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 			return nil, nil, fmt.Errorf("proxy group %s: the duplicate name", groupName)
 		}
 
+		if chained, ok := group.(interface{ ChainOrder() *int }); ok {
+			probequeue.RegisterChain(groupName, chained.ChainOrder(), declaredAt[groupName])
+		}
 		proxies[groupName] = adapter.NewProxy(group)
 	}
+	probequeue.CommitChain()
 
 	var ps []C.Proxy
 	for _, v := range proxyList {

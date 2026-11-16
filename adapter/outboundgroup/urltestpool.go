@@ -193,6 +193,12 @@ type URLTestPoolOption struct {
 	// defaultURLTestPoolAttemptTimeout, so a hanging member costs one attempt
 	// instead of the whole budget.
 	AttemptTimeout *int `group:"attempt-timeout,omitempty"`
+	// Ordered places the pool in the profile-wide probe chain: the scheduled
+	// cold checks run wave by wave, the explicit numbers ascending first and
+	// the pools without one following in declaration order. Pools with equal
+	// numbers share a wave. It changes only the order of the checks, never
+	// what they measure.
+	Ordered *int `group:"ordered,omitempty"`
 }
 
 // URLTestPool keeps a fixed pool of the fastest proxies.
@@ -209,6 +215,15 @@ type URLTestPoolOption struct {
 // dial waits only for the first result (bounded by `timeout` and a 2s cap), so
 // it is not routed to the first proxy of the list only because nothing has
 // been measured.
+//
+// A pool that sets `ordered` takes part in the profile-wide chain: the queue
+// serves the scheduled cold checks one wave at a time, the explicit numbers
+// ascending and the pools that set none following in declaration order, so the
+// profile decides which group finds its member first instead of the sorted
+// group order doing it. A dial that arrives for a pool promotes its check to
+// the head of the chain; `probe-order: parallel` restores the plain urgent
+// round-robin.
+//
 // Dial failures mark the used proxy as suspicious so the next connection is
 // routed to the next best pool member; with `attempt-timeout` set, the next
 // member is tried inside the same call as well.
@@ -232,6 +247,9 @@ type URLTestPool struct {
 	attemptTimeout  time.Duration
 	recoveryWait    time.Duration
 	lazy            bool
+	// ordered is the `ordered` option of the pool: its place in the profile-
+	// wide probe chain. nil means the profile gave the pool no number.
+	ordered *int
 	// reputation remembers how the nodes served real traffic: the store is
 	// shared by every group, so a node that failed in one group sinks in the
 	// recovery scan of the others as well.
@@ -737,6 +755,12 @@ func (u *URLTestPool) PoolCheck(ctx context.Context) (map[string]uint16, error) 
 	// caller's budget bounds only the answer: a member still being probed
 	// reports into the pool when it finishes, and a probe that ran out of its
 	// own timeout is a dead member like any other.
+	if !u.hasUsableNode(members) {
+		// The caller waits on this answer, and the pool has nothing measured
+		// alive to route by: its check takes the head of the ordered chain
+		// instead of the wave the profile gave the pool.
+		probequeue.Promote(u.Name())
+	}
 	results, _ := u.probeProxies(ctx, members, time.Duration(u.testTimeout)*time.Millisecond, true, false, false)
 	if len(results) == 0 {
 		if ctx.Err() != nil {
@@ -890,6 +914,12 @@ func (u *URLTestPool) hasUsableNode(proxies []C.Proxy) bool {
 // its members against.
 func (u *URLTestPool) SelfTestTarget() (string, utils.IntRanges[uint16]) {
 	return u.testUrl, u.expectedRanges
+}
+
+// ChainOrder reports the `ordered` number of the pool, nil when the profile
+// gave it none. The config parser reads it to build the probe chain.
+func (u *URLTestPool) ChainOrder() *int {
+	return u.ordered
 }
 
 // MarshalJSON implements C.ProxyAdapter
@@ -1694,16 +1724,21 @@ func (u *URLTestPool) markWarm() {
 // check, so the whole check cycle delays dials by at most firstResultWait. It
 // also never spends the retry reserve of the caller's budget.
 func (u *URLTestPool) waitWarm(ctx context.Context) {
-	if u.firstResultWait <= 0 {
-		return
-	}
-
 	u.mu.RLock()
 	cold := len(u.pool) == 0
 	channel := u.warmCh
 	started := u.checkStart
 	u.mu.RUnlock()
 	if !cold || channel == nil {
+		return
+	}
+
+	// A dial needs this pool now: its scheduled check takes the head of the
+	// ordered chain instead of waiting for the waves ahead of it. The request
+	// is remembered if the check has not reached the queue yet.
+	probequeue.Promote(u.Name())
+
+	if u.firstResultWait <= 0 {
 		return
 	}
 
@@ -2894,11 +2929,12 @@ func (u *URLTestPool) testProxiesStreaming(ctx context.Context, proxies []C.Prox
 
 // probeSubmit chooses the lane of one wave. A probe a caller waits on carries
 // Priority itself, which is what puts it in the priority lane, so the batch is
-// submitted as usual. A cold pool goes to the urgent lane: nothing is measured
-// yet, so a dial waits for the first answer, and the wave must not queue behind
-// the sweeps of the groups that already route. A warm pool keeps checking by
-// its `lazy`: a group the profile routes by its own answers runs in the
-// foreground lane, a lazy one takes the background ring.
+// submitted as usual. A cold pool goes to the ordered chain: nothing is
+// measured yet, so a dial waits for the first answer, and each wave of the
+// profile runs in the order it set instead of all of them at once. A dial that
+// arrives for the pool promotes its check to the head of the chain. A warm
+// pool keeps checking by its `lazy`: a group the profile routes by its own
+// answers runs in the foreground lane, a lazy one takes the background ring.
 //
 // The retry wave asks this again: the first wave may have measured the member
 // that makes the pool warm, and its failures then belong in the warm lane.
@@ -2909,7 +2945,7 @@ func (u *URLTestPool) probeSubmit(proxies []C.Proxy, priority bool) func(string,
 	if !u.hasUsableNode(proxies) {
 		foreground := !u.lazy
 		return func(source string, probes []probequeue.Probe, onResult func(probequeue.Result)) *probequeue.Check {
-			return probequeue.SubmitUrgent(source, foreground, probes, onResult)
+			return probequeue.SubmitChain(source, foreground, probes, onResult)
 		}
 	}
 	if !u.lazy {
@@ -3278,6 +3314,15 @@ func NewURLTestPool(option GroupCommonOption, poolOption URLTestPoolOption, empt
 		}
 	}
 
+	var ordered *int
+	if poolOption.Ordered != nil {
+		if *poolOption.Ordered < 0 {
+			return nil, fmt.Errorf("ordered %d must be a non-negative integer", *poolOption.Ordered)
+		}
+		value := *poolOption.Ordered
+		ordered = &value
+	}
+
 	testUrl := option.URL
 	if testUrl == "" {
 		testUrl = C.DefaultTestURL
@@ -3322,6 +3367,7 @@ func NewURLTestPool(option GroupCommonOption, poolOption URLTestPoolOption, empt
 		attemptTimeout:  attemptTimeout,
 		recoveryWait:    urlTestPoolRecoveryWait,
 		lazy:            option.Lazy,
+		ordered:         ordered,
 		reputation:      reputation.Default(),
 		preWarmRecheck:  urlTestPoolPreWarmRecheck,
 		backoffJitter:   randomBackoffJitter,
