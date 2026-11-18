@@ -7,7 +7,6 @@ import (
 
 	"github.com/metacubex/mihomo/adapter/outboundgroup"
 	"github.com/metacubex/mihomo/common/utils"
-	"github.com/metacubex/mihomo/component/profile/cachefile"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/tunnel"
 
@@ -24,6 +23,7 @@ func groupRouter() http.Handler {
 		r.Use(parseProxyName, findProxyByName)
 		r.Get("/", getGroup)
 		r.Get("/delay", getGroupDelay)
+		r.Get("/history", getGroupHistory)
 	})
 	return r
 }
@@ -59,11 +59,6 @@ func getGroupDelay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if selectAble, ok := proxy.Adapter().(outboundgroup.SelectAble); ok && proxy.Type() != C.Selector {
-		selectAble.ForceSet("")
-		cachefile.Cache().SetSelected(proxy.Name(), "")
-	}
-
 	query := r.URL.Query()
 	url := query.Get("url")
 	timeout, err := strconv.ParseInt(query.Get("timeout"), 10, 32)
@@ -91,4 +86,36 @@ func getGroupDelay(w http.ResponseWriter, r *http.Request) {
 	}
 
 	render.JSON(w, r, dm)
+}
+
+// getGroupHistory returns the significant changes of one group: the member it
+// routes through, a manual selection, a mark and its recovery, and the pool
+// rebuilds. The store is a bounded ring, so the answer is capped at
+// GroupHistoryLimit no matter what the caller asks.
+func getGroupHistory(w http.ResponseWriter, r *http.Request) {
+	proxy := r.Context().Value(CtxKeyProxy).(C.Proxy)
+	if _, ok := proxy.Adapter().(outboundgroup.ProxyGroup); !ok {
+		render.Status(r, http.StatusNotFound)
+		render.JSON(w, r, ErrNotFound)
+		return
+	}
+
+	limit := outboundgroup.GroupHistoryLimit
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, ErrBadRequest)
+			return
+		}
+		limit = parsed
+	}
+	if limit > outboundgroup.GroupHistoryLimit {
+		limit = outboundgroup.GroupHistoryLimit
+	}
+
+	render.JSON(w, r, render.M{
+		"events": outboundgroup.GroupHistory(proxy.Name(), limit),
+		"limit":  limit,
+	})
 }

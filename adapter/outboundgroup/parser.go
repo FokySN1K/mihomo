@@ -95,6 +95,22 @@ func ParseProxyGroup(config map[string]any, proxyMap map[string]C.Proxy, provide
 		groupOption.Use = AllProviders
 	}
 	if groupOption.IncludeAllProxies {
+		// Several filters can match the same node. The expanded list is built
+		// once per name, while an explicit `proxies` entry keeps whatever the
+		// profile wrote (duplicates there are a deliberate weight, not a bug).
+		seen := make(map[string]struct{}, len(groupOption.Proxies)+len(AllProxies))
+		for _, name := range groupOption.Proxies {
+			seen[name] = struct{}{}
+		}
+		expanded := make([]string, 0, len(AllProxies))
+		add := func(name string) {
+			if _, ok := seen[name]; ok {
+				return
+			}
+			seen[name] = struct{}{}
+			expanded = append(expanded, name)
+		}
+
 		if groupOption.Filter != "" {
 			var filterRegs []*regexp2.Regexp
 			for _, filter := range strings.Split(groupOption.Filter, "`") {
@@ -104,13 +120,17 @@ func ParseProxyGroup(config map[string]any, proxyMap map[string]C.Proxy, provide
 			for _, p := range AllProxies {
 				for _, filterReg := range filterRegs {
 					if mat, _ := filterReg.MatchString(p); mat {
-						groupOption.Proxies = append(groupOption.Proxies, p)
+						add(p)
+						break
 					}
 				}
 			}
 		} else {
-			groupOption.Proxies = append(groupOption.Proxies, AllProxies...)
+			for _, name := range AllProxies {
+				add(name)
+			}
 		}
+		groupOption.Proxies = append(groupOption.Proxies, expanded...)
 		if len(groupOption.Proxies) == 0 && len(groupOption.Use) == 0 {
 			groupOption.Proxies = []string{groupOption.EmptyFallback}
 		}

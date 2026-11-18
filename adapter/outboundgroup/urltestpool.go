@@ -70,6 +70,23 @@ const (
 	// short on purpose: a blind dial of a decent node connects sooner than the
 	// first probe answers, and the pool corrects a failed guess right after.
 	defaultURLTestPoolFirstResultWait = 300 * time.Millisecond
+	// defaultURLTestPoolFirstWaveWait caps how long the first dial of a cold
+	// pool waits for the sweep to fill the pool. The dial leaves earlier as
+	// soon as the sweep answered for `pool-size` members with at least one
+	// alive, and the window is counted from the start of the check, so the
+	// whole check cycle delays dials by at most this.
+	defaultURLTestPoolFirstWaveWait = 1500 * time.Millisecond
+	// defaultURLTestPoolLazyWaveWait is the window of a lazy pool: its warm
+	// check measures only the handful of members the reputation trusts, so a
+	// full sample is never expected of it and waiting for one would only delay
+	// the dial.
+	defaultURLTestPoolLazyWaveWait = 300 * time.Millisecond
+	// urlTestPoolReputationBand is how many reputation points separate two
+	// bands of the pre-test order. Inside one band the measured delay decides
+	// which member is probed first; across bands the reputation does, so a
+	// proven node is measured before an unknown one without letting the noise
+	// of a single strike reorder the wave.
+	urlTestPoolReputationBand = 10
 	// urlTestPoolPreWarmRecheck is the safety net of a pre-warm: a load of a
 	// provider of the group wakes the wait at once, and this only covers a load
 	// that finished before the group subscribed.
@@ -193,6 +210,13 @@ type URLTestPoolOption struct {
 	// defaultURLTestPoolAttemptTimeout, so a hanging member costs one attempt
 	// instead of the whole budget.
 	AttemptTimeout *int `group:"attempt-timeout,omitempty"`
+	// FirstWaveWait caps how long the first dial of a cold pool waits for the
+	// sweep to fill the pool, in milliseconds: the dial leaves as soon as the
+	// sweep answered for `pool-size` members with at least one alive, and never
+	// later than this window. 0 disables the wait. An unset value uses 1500ms,
+	// or 300ms for a lazy group, whose warm check measures only the members the
+	// reputation trusts.
+	FirstWaveWait *int `group:"first-wave-wait,omitempty"`
 	// Ordered places the pool in the profile-wide probe chain: the scheduled
 	// cold checks run wave by wave, the explicit numbers ascending first and
 	// the pools without one following in declaration order. Pools with equal
@@ -212,9 +236,10 @@ type URLTestPoolOption struct {
 // a start: it measures only the members the reputation trusts, which fills the
 // pool for the first dial without a sweep of the whole provider. On a cold
 // start every measured member is published as soon as its probe returns, and a
-// dial waits only for the first result (bounded by `timeout` and a 2s cap), so
-// it is not routed to the first proxy of the list only because nothing has
-// been measured.
+// dial waits for a sample of `pool-size` answers with at least one alive member
+// (bounded by `first-wave-wait` and by half of the caller's budget), so it
+// leaves on the best of a measured sample instead of the first proxy of the
+// list only because nothing has been measured.
 //
 // A pool that sets `ordered` takes part in the profile-wide chain: the queue
 // serves the scheduled cold checks one wave at a time, the explicit numbers
@@ -244,6 +269,7 @@ type URLTestPool struct {
 	degradedChecks  int
 	tolerance       uint16
 	firstResultWait time.Duration
+	firstWaveWait   time.Duration
 	attemptTimeout  time.Duration
 	recoveryWait    time.Duration
 	lazy            bool
@@ -285,6 +311,11 @@ type URLTestPool struct {
 	// reply watchdog of the next connection.
 	firstBytes map[string]*poolFirstByte
 	fastNode   C.Proxy
+	fastReason string
+	// eventNow and eventReason are the state the history last recorded, so a
+	// read of the group writes an event only when the route actually changed.
+	eventNow    string
+	eventReason string
 	// measuredAt is when the pool last saw each member measured alive, by a
 	// check or by a dial that reached it. A proxy reports its last delay
 	// without an age, so this map is what keeps a stale measurement from
@@ -327,6 +358,14 @@ type URLTestPool struct {
 	// the whole check cycle never delays dials longer than the cap.
 	warmCh     chan struct{}
 	checkStart time.Time
+	// warmFill is the gate a dial of a cold pool waits on: it closes once the
+	// sweep answered for `pool-size` members with at least one alive, so the
+	// dial leaves on the best of a sample instead of the first answer. A sweep
+	// too slow to fill it is left on the window instead, and warmDelivered
+	// counts its answers so a dial can tell a sweep that is producing results
+	// from one still queued behind another group.
+	warmFill      chan struct{}
+	warmDelivered int
 
 	// preWarming guards the single pre-warm of the group: the executor asks
 	// for it on every config apply, and only the first ask may start a wait.
@@ -479,6 +518,12 @@ func (u *URLTestPool) attemptContext(ctx context.Context) (context.Context, cont
 // verdict at all, and a budget that ended before the handshake is a cut. Only
 // a failure the member owns keeps it out for the whole interval.
 func (u *URLTestPool) noteDialFailure(ctx context.Context, proxy C.Proxy, err error, cut bool) {
+	if errors.Is(context.Cause(ctx), errCandidateBudget) {
+		// A parent cut its whole candidate share of the budget: the member
+		// was not measured, and the cut says nothing about it.
+		log.Debugln("ProxyGroup: %s: %s was cut with the candidate budget of the parent", u.Name(), proxy.Name())
+		return
+	}
 	switch {
 	case ctx.Err() != nil:
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
@@ -677,7 +722,15 @@ func (u *URLTestPool) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 
 // Now implements ProxyGroup
 func (u *URLTestPool) Now() string {
-	return u.fast(false).Name()
+	proxy, _ := u.nowState(false)
+	return proxy.Name()
+}
+
+// nowState returns the member a read of the group routes through and the
+// reason it was chosen, so MarshalJSON publishes both from the same choice.
+func (u *URLTestPool) nowState(touch bool) (C.Proxy, string) {
+	proxy, _, reason := u.fastForTrafficState(touch, nil)
+	return proxy, reason
 }
 
 // Providers implements ProxyGroup
@@ -705,9 +758,14 @@ func (u *URLTestPool) Set(name string) error {
 // ForceSet implements SelectAble
 func (u *URLTestPool) ForceSet(name string) {
 	u.mu.Lock()
+	previous := u.selected
 	u.selected = name
 	u.fastNode = nil
+	u.fastReason = ""
 	u.mu.Unlock()
+	if previous != name {
+		recordPinEvent(groupName(u.GroupBase), previous, name)
+	}
 }
 
 // URLTest implements ProxyGroup
@@ -928,7 +986,8 @@ func (u *URLTestPool) MarshalJSON() ([]byte, error) {
 	for _, proxy := range u.GetProxies(false) {
 		all = append(all, proxy.Name())
 	}
-	now := u.Now()
+	nowProxy, reason := u.nowState(false)
+	now := nowProxy.Name()
 
 	u.mu.RLock()
 	pool := append([]string(nil), u.pool...)
@@ -952,6 +1011,8 @@ func (u *URLTestPool) MarshalJSON() ([]byte, error) {
 	sort.Strings(suspicious)
 	sort.Strings(silent)
 
+	fixedOK := fixedActive(selected, now)
+
 	// The type is the adapter's own name: hosts that know url-test-pool show it
 	// as such, and the built-in fields below still let the rest render the group
 	// as a plain selector over the pool.
@@ -964,6 +1025,8 @@ func (u *URLTestPool) MarshalJSON() ([]byte, error) {
 		"testUrl":        u.testUrl,
 		"expectedStatus": u.expectedStatus,
 		"fixed":          selected,
+		"fixedActive":    fixedOK,
+		"nowReason":      reason,
 		"lastGood":       lastGood,
 		"recovering":     recovering,
 		"suspicious":     suspicious,
@@ -1005,7 +1068,53 @@ func udpProxies(proxies []C.Proxy) []C.Proxy {
 	return filtered
 }
 
+// fastForTraffic keeps the dial-facing signature; the reason is only needed by
+// reads of the group state.
 func (u *URLTestPool) fastForTraffic(touch bool, usable func([]C.Proxy) []C.Proxy) (C.Proxy, bool) {
+	proxy, exhausted, _ := u.fastForTrafficState(touch, usable)
+	return proxy, exhausted
+}
+
+func (u *URLTestPool) fastForTrafficState(touch bool, usable func([]C.Proxy) []C.Proxy) (C.Proxy, bool, string) {
+	proxy, exhausted, reason := u.fastForTrafficChoice(touch, usable)
+	if usable == nil {
+		// A UDP-filtered choice is a view of the same group, not a change of
+		// the member it routes through, so only the general choice is a
+		// history event.
+		u.recordNowEvent(proxy, reason)
+	}
+	return proxy, exhausted, reason
+}
+
+// recordNowEvent stores a change of the member the group routes through. The
+// dial path reads the group on every connection, so the pair is compared under
+// the lock and only a change builds an event.
+func (u *URLTestPool) recordNowEvent(now C.Proxy, reason string) {
+	name := ""
+	if now != nil {
+		name = now.Name()
+	}
+
+	u.mu.Lock()
+	if u.eventNow == name && u.eventReason == reason {
+		u.mu.Unlock()
+		return
+	}
+	from := u.eventNow
+	u.eventNow = name
+	u.eventReason = reason
+	u.mu.Unlock()
+
+	RecordGroupEvent(GroupEvent{
+		Group:  groupName(u.GroupBase),
+		Type:   GroupEventNow,
+		From:   from,
+		To:     name,
+		Reason: reason,
+	})
+}
+
+func (u *URLTestPool) fastForTrafficChoice(touch bool, usable func([]C.Proxy) []C.Proxy) (C.Proxy, bool, string) {
 	// with lazy enabled the checks are driven only by real traffic: reading the
 	// group state (Now/MarshalJSON) must never start a test, not even the very
 	// first one after a start, so a launch without traffic stays silent.
@@ -1020,25 +1129,47 @@ func (u *URLTestPool) fastForTraffic(touch bool, usable func([]C.Proxy) []C.Prox
 		}
 	}
 	if len(proxies) == 0 {
-		return u.EmptyFallback(), false
+		return u.EmptyFallback(), false, NowReasonEmpty
 	}
 
 	proxy, exhausted := u.pickFast(proxies, touch)
+	reason := u.currentFastReason()
 	if !exhausted {
-		return proxy, false
+		return proxy, false, reason
 	}
 
 	if fallback := u.blindDialFallback(proxies); fallback != nil {
+		fallbackReason := reason
 		if fallback.Name() != proxy.Name() {
 			// the member the pool already marked as out of play is the one it
 			// would have dialed before, so the log names both and a field log
 			// shows which memory the dial left on instead
 			log.Debugln("ProxyGroup: %s: %s is marked out of play, dialing %s instead", u.Name(), proxy.Name(), fallback.Name())
+			fallbackReason = NowReasonEmpty
+			if u.isLastGood(fallback.Name()) {
+				fallbackReason = NowReasonLastGood
+			}
 		}
-		return fallback, true
+		return fallback, true, fallbackReason
 	}
 
-	return proxy, true
+	return proxy, true, reason
+}
+
+func (u *URLTestPool) currentFastReason() string {
+	u.mu.RLock()
+	reason := u.fastReason
+	u.mu.RUnlock()
+	if reason == "" {
+		return NowReasonEmpty
+	}
+	return reason
+}
+
+func (u *URLTestPool) isLastGood(name string) bool {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	return u.lastGood == name
 }
 
 func (u *URLTestPool) lastGoodLocked(proxies []C.Proxy) C.Proxy {
@@ -1149,12 +1280,24 @@ func (u *URLTestPool) pickFastLocked(proxies []C.Proxy) (C.Proxy, bool, C.Proxy)
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
+	fixedReason := ""
 	if u.selected != "" {
 		for _, proxy := range proxies {
-			if proxy.Name() == u.selected && proxy.AliveForTestUrl(u.testUrl) && !u.isSuspiciousLocked(proxy.Name()) {
-				u.fastNode = proxy
-				return proxy, false, nil
+			if proxy.Name() != u.selected {
+				continue
 			}
+			if proxy.AliveForTestUrl(u.testUrl) {
+				if !u.isSuspiciousLocked(proxy.Name()) {
+					u.fastNode = proxy
+					u.fastReason = NowReasonFixed
+					return proxy, false, nil
+				}
+				fixedReason = NowReasonFixedSuspicious
+			}
+			break
+		}
+		if fixedReason == "" {
+			fixedReason = NowReasonFixedUnavailable
 		}
 	}
 
@@ -1176,6 +1319,11 @@ func (u *URLTestPool) pickFastLocked(proxies []C.Proxy) (C.Proxy, bool, C.Proxy)
 	}
 	if best == nil {
 		u.fastNode = nil
+		if fixedReason != "" {
+			u.fastReason = fixedReason
+		} else {
+			u.fastReason = NowReasonEmpty
+		}
 		return u.bestGuessLocked(proxies), exhausted, nil
 	}
 
@@ -1184,6 +1332,14 @@ func (u *URLTestPool) pickFastLocked(proxies []C.Proxy) (C.Proxy, bool, C.Proxy)
 		!u.isSuspiciousLocked(u.fastNode.Name()) && containsProxy(candidates, u.fastNode) {
 		bestDelay := best.LastDelayForTestUrl(u.testUrl)
 		if u.fastNode.LastDelayForTestUrl(u.testUrl) <= bestDelay+u.tolerance {
+			u.fastReason = fixedReason
+			if u.fastReason == "" {
+				if bestDelay < u.fastNode.LastDelayForTestUrl(u.testUrl) {
+					u.fastReason = NowReasonTolerance
+				} else {
+					u.fastReason = NowReasonBest
+				}
+			}
 			return u.fastNode, exhausted, nil
 		}
 		// A member the pool never measured (0xffff is not a delay but the
@@ -1196,11 +1352,20 @@ func (u *URLTestPool) pickFastLocked(proxies []C.Proxy) (C.Proxy, bool, C.Proxy)
 			// gone, and a dial that leaves on it pays the outage the memory
 			// hides. The pool keeps the member that is up and has the candidate
 			// probed before it takes the dial.
+			u.fastReason = fixedReason
+			if u.fastReason == "" {
+				u.fastReason = NowReasonPromotion
+			}
 			return u.fastNode, exhausted, best
 		}
 	}
 
 	u.fastNode = best
+	if fixedReason != "" {
+		u.fastReason = fixedReason
+	} else {
+		u.fastReason = NowReasonBest
+	}
 	return best, exhausted, nil
 }
 
@@ -1269,8 +1434,11 @@ func (u *URLTestPool) bestAliveLocked(candidates []C.Proxy, skipSuspicious bool)
 		// Nothing measured yet: every candidate reports the max delay, so the
 		// reputation decides which one a cold dial leaves on. Once a check has
 		// run, the max delay of an alive member means something else and the
-		// measured order must not be overridden.
-		if delay == bestDelay && delay == 0xffff && !u.hasFullCheck.Load() &&
+		// measured order must not be overridden. An empty pool is the same
+		// question even after a full check: the check measured nothing, so the
+		// best reputation is the least blind guess the pool can make.
+		if delay == bestDelay && delay == 0xffff &&
+			(len(u.pool) == 0 || !u.hasFullCheck.Load()) &&
 			u.reputation.Score(proxy.Name()) > u.reputation.Score(best.Name()) {
 			best = proxy
 		}
@@ -1376,7 +1544,17 @@ func (u *URLTestPool) markSuspicious(name string) {
 // markSuspiciousFor keeps a member that failed a dial out of the next choices
 // for the full interval.
 func (u *URLTestPool) markSuspiciousFor(name string, ttl time.Duration) {
-	u.markFor(&u.suspicious, name, ttl)
+	if !u.markFor(&u.suspicious, name, ttl) {
+		return
+	}
+	// One event per outage: a member that keeps failing only extends its mark,
+	// and the history must not turn a single dead node into a wall of rows.
+	RecordGroupEvent(GroupEvent{
+		Group:  groupName(u.GroupBase),
+		Type:   GroupEventSuspicious,
+		To:     name,
+		Detail: "for " + ttl.String(),
+	})
 }
 
 // markCut keeps a member our own attempt-timeout cut out of the next choices
@@ -1389,13 +1567,18 @@ func (u *URLTestPool) markCut(name string) {
 // markFor keeps a member out of the next choices until the given ttl ends. A
 // later expiry always wins: a cut must not shorten the interval a failed dial
 // earned, and neither may a repeated mark shorten itself.
-func (u *URLTestPool) markFor(marks *map[string]time.Time, name string, ttl time.Duration) {
+func (u *URLTestPool) markFor(marks *map[string]time.Time, name string, ttl time.Duration) bool {
 	u.mu.Lock()
 	if *marks == nil {
 		*marks = make(map[string]time.Time)
 	}
-	next := time.Now().Add(ttl)
-	if until, ok := (*marks)[name]; !ok || until.Before(next) {
+	now := time.Now()
+	next := now.Add(ttl)
+	previous, existed := (*marks)[name]
+	// A mark that had already expired is a new outage, not a repeat of the
+	// one the history already names.
+	fresh := !existed || !now.Before(previous)
+	if !existed || previous.Before(next) {
 		(*marks)[name] = next
 	}
 	if u.fastNode != nil && u.fastNode.Name() == name {
@@ -1414,6 +1597,7 @@ func (u *URLTestPool) markFor(marks *map[string]time.Time, name string, ttl time
 	if exhausted {
 		u.requestFullCheckOnExhaustion()
 	}
+	return fresh
 }
 
 func (u *URLTestPool) maybeScheduleCheck() {
@@ -1645,7 +1829,7 @@ func (u *URLTestPool) beginCheck(kind poolCheckKind) (done <-chan struct{}, star
 				u.scheduleCheck(poolFullCheck)
 			}
 		}()
-		defer u.markWarm()
+		defer u.finishWarm()
 		switch kind {
 		case poolFullCheck:
 			u.fullCheck()
@@ -1696,18 +1880,23 @@ func (u *URLTestPool) lastResultsCopy() map[string]uint16 {
 	return results
 }
 
-// beginWarmup opens the channel a cold-start dial waits on until the first
-// measured member is published.
+// beginWarmup opens the channels a cold-start dial waits on: warmCh releases a
+// wait that only needs the first measured member, warmFill releases the dial
+// wait once the sweep answered for a sample of the pool.
 func (u *URLTestPool) beginWarmup() {
 	u.mu.Lock()
 	if u.warmCh == nil {
 		u.warmCh = make(chan struct{})
+		u.warmFill = make(chan struct{})
+		u.warmDelivered = 0
 		u.checkStart = time.Now()
 	}
 	u.mu.Unlock()
 }
 
-// markWarm releases the dials waiting for the first result of the check.
+// markWarm releases the waits that only need the first measured member of the
+// running check: a dial of an exhausted pool must not spend its budget on a
+// node the check already knows is dead.
 func (u *URLTestPool) markWarm() {
 	u.mu.Lock()
 	if u.warmCh != nil {
@@ -1717,19 +1906,55 @@ func (u *URLTestPool) markWarm() {
 	u.mu.Unlock()
 }
 
-// waitWarm lets dials that arrive before the first measured member wait for it,
-// so a connection is not routed to the first proxy of the list only because
-// nothing has been measured yet. The wait is capped by the probe timeout (a
-// result cannot arrive sooner than one probe) and counted from the start of the
-// check, so the whole check cycle delays dials by at most firstResultWait. It
-// also never spends the retry reserve of the caller's budget.
+// finishWarm releases every wait of the check: it ended, and a sweep that
+// measured nothing alive must not leave the first dials waiting out the window.
+func (u *URLTestPool) finishWarm() {
+	u.mu.Lock()
+	if u.warmCh != nil {
+		close(u.warmCh)
+		u.warmCh = nil
+	}
+	if u.warmFill != nil {
+		close(u.warmFill)
+		u.warmFill = nil
+	}
+	u.mu.Unlock()
+}
+
+// noteWarmResult books one answered probe of a check. The fill gate closes
+// once the sweep answered for as many members as the pool wants to hold: the
+// dial leaves on the best of the sample instead of waiting for the whole list,
+// and a sample without a single alive member keeps the gate open for the rest.
+func (u *URLTestPool) noteWarmResult(target, delivered, alive int) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if delivered > u.warmDelivered {
+		u.warmDelivered = delivered
+	}
+	if u.warmFill == nil || alive <= 0 || delivered < target {
+		return
+	}
+	close(u.warmFill)
+	u.warmFill = nil
+}
+
+// waitWarm lets dials that arrive before the pool has a sample wait for one, so
+// a connection leaves on the best of a measured sample instead of the first
+// proxy of the list only because nothing has been measured yet. The wait ends
+// as soon as the sweep answered for `pool-size` members with one alive
+// (warmFill), when the check ends, on the window counted from the start of the
+// check, or when half the window passed without a single answer — a check still
+// queued behind the groups ahead of it must not hold the dial. The wait also
+// never spends more than half of the caller's budget: the dial and its retries
+// need the rest.
 func (u *URLTestPool) waitWarm(ctx context.Context) {
 	u.mu.RLock()
 	cold := len(u.pool) == 0
-	channel := u.warmCh
+	fixed := u.selected != ""
+	channel := u.warmFill
 	started := u.checkStart
 	u.mu.RUnlock()
-	if !cold || channel == nil {
+	if !cold || fixed || channel == nil {
 		return
 	}
 
@@ -1738,14 +1963,14 @@ func (u *URLTestPool) waitWarm(ctx context.Context) {
 	// is remembered if the check has not reached the queue yet.
 	probequeue.Promote(u.Name())
 
-	if u.firstResultWait <= 0 {
+	if u.firstWaveWait <= 0 {
 		return
 	}
 
-	wait := u.firstResultWait - time.Since(started)
+	wait := u.firstWaveWait - time.Since(started)
 	if deadline, ok := ctx.Deadline(); ok {
-		if remaining := time.Until(deadline) - urlTestPoolRetryReserve; remaining < wait {
-			wait = remaining
+		if remaining := time.Until(deadline); remaining/2 < wait {
+			wait = remaining / 2
 		}
 	}
 	if wait <= 0 {
@@ -1754,10 +1979,27 @@ func (u *URLTestPool) waitWarm(ctx context.Context) {
 
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
-	select {
-	case <-channel:
-	case <-timer.C:
-	case <-ctx.Done():
+	// A sweep that produced no answer by the middle of the window is stuck
+	// behind the probes of another group: waiting out the rest of the window
+	// only delays the connection.
+	half := time.NewTimer(wait / 2)
+	defer half.Stop()
+	for {
+		select {
+		case <-channel:
+			return
+		case <-timer.C:
+			return
+		case <-ctx.Done():
+			return
+		case <-half.C:
+			u.mu.RLock()
+			delivered := u.warmDelivered
+			u.mu.RUnlock()
+			if delivered == 0 {
+				return
+			}
+		}
 	}
 }
 
@@ -2077,9 +2319,19 @@ func (u *URLTestPool) noteDialSucceeded(proxy C.Proxy) {
 	// a member that carried a connection is not suspicious: a mark earned on
 	// another route, or by a sweep that measured nothing at all, must not
 	// outlive the proof that this one works
+	until, marked := u.suspicious[proxy.Name()]
+	recovered := marked && time.Now().Before(until)
 	delete(u.suspicious, proxy.Name())
 	delete(u.cutMarks, proxy.Name())
 	u.mu.Unlock()
+	if recovered {
+		RecordGroupEvent(GroupEvent{
+			Group:  groupName(u.GroupBase),
+			Type:   GroupEventRecovered,
+			To:     proxy.Name(),
+			Detail: "carried traffic",
+		})
+	}
 
 	u.noteDialAccepted(proxy)
 }
@@ -2148,6 +2400,8 @@ func (u *URLTestPool) noteDataAnswered(proxy C.Proxy, delay time.Duration) {
 	now := time.Now()
 
 	u.mu.Lock()
+	previousMark, marked := u.dataMarks[name]
+	recovered := marked && now.Before(previousMark.until)
 	delete(u.dataMarks, name)
 	if u.firstBytes == nil {
 		u.firstBytes = make(map[string]*poolFirstByte)
@@ -2168,6 +2422,14 @@ func (u *URLTestPool) noteDataAnswered(proxy C.Proxy, delay time.Duration) {
 	sample.last = now
 	u.pruneDataEvidenceLocked(now)
 	u.mu.Unlock()
+	if recovered {
+		RecordGroupEvent(GroupEvent{
+			Group:  groupName(u.GroupBase),
+			Type:   GroupEventRecovered,
+			To:     name,
+			Detail: "answered again",
+		})
+	}
 }
 
 // firstByteWatchdog sizes the reply watchdog of the next connection: never
@@ -2225,6 +2487,9 @@ func (u *URLTestPool) onDataSilent(proxy C.Proxy, err error) {
 		mark.strikes++
 	}
 	mark.last = now
+	// The history names the first silent flow of an incident, not every flow
+	// that followed it: a burst of parallel connections dies together.
+	notify := !now.Before(mark.until)
 
 	ttl := urlTestPoolDataStrike
 	for strikes := mark.strikes; strikes > 1 && ttl < urlTestPoolDataStrikeMax; strikes-- {
@@ -2251,6 +2516,14 @@ func (u *URLTestPool) onDataSilent(proxy C.Proxy, err error) {
 	u.mu.Unlock()
 
 	log.Warnln("ProxyGroup: %s: %s accepted the handshake and went silent (%v), keep it out for %s", u.Name(), name, err, ttl)
+	if notify {
+		RecordGroupEvent(GroupEvent{
+			Group:  groupName(u.GroupBase),
+			Type:   GroupEventSilent,
+			To:     name,
+			Detail: "for " + ttl.String(),
+		})
+	}
 	if strikes > 1 && tracksNodeReputation(proxy.Type()) {
 		u.reputation.DataFailed(name)
 	}
@@ -2561,7 +2834,7 @@ func (u *URLTestPool) applyRecovery(results map[string]uint16, tested map[string
 	if len(results) > 0 || len(tested) >= candidates {
 		u.hasFullCheck.Store(true)
 	}
-	u.markWarm()
+	u.finishWarm()
 }
 
 func (u *URLTestPool) fullCheck() {
@@ -2622,6 +2895,7 @@ func (u *URLTestPool) orderForCheck(proxies []C.Proxy) []C.Proxy {
 		proxy  C.Proxy
 		marked bool
 		tier   int
+		band   int
 		delay  uint16
 		score  int
 	}
@@ -2638,6 +2912,7 @@ func (u *URLTestPool) orderForCheck(proxies []C.Proxy) []C.Proxy {
 	for i := range items {
 		items[i].delay = items[i].proxy.LastDelayForTestUrl(u.testUrl)
 		items[i].score = u.reputation.Score(items[i].proxy.Name())
+		items[i].band = (items[i].score + 100) / urlTestPoolReputationBand
 		switch {
 		case items[i].score >= reputation.Trusted:
 			items[i].tier = 0
@@ -2653,6 +2928,14 @@ func (u *URLTestPool) orderForCheck(proxies []C.Proxy) []C.Proxy {
 		}
 		if items[i].tier != items[j].tier {
 			return items[i].tier < items[j].tier
+		}
+		// The reputation leads inside a tier: a node that carried traffic
+		// recently is likelier to answer than one that keeps failing, and the
+		// first wave has one budget to spend. A band of ten points absorbs the
+		// noise of a single strike, so one bad flow does not reorder the wave,
+		// and the delay decides between the members of one band.
+		if items[i].band != items[j].band {
+			return items[i].band > items[j].band
 		}
 		if items[i].delay != items[j].delay {
 			return items[i].delay < items[j].delay
@@ -2770,7 +3053,7 @@ func (u *URLTestPool) applyResults(results map[string]uint16) {
 	} else {
 		u.exitBackoff("a full check measured a member")
 	}
-	u.markWarm()
+	u.finishWarm()
 }
 
 // enterEmptyBackoff postpones the next full sweep after one that measured
@@ -2837,9 +3120,10 @@ func (u *URLTestPool) exitBackoff(reason string) {
 // member that failed leaves it at once. The check bookkeeping is left to
 // applyResults.
 //
-// Only an alive result releases the first-result wait: a probe that failed is
-// not a member a dial can leave on, and the wait must cover the wave that may
-// still find one.
+// Only an alive result releases the check wait: a probe that failed is not a
+// member a dial can leave on, and the wait must cover the wave that may still
+// find one. The fill gate of a cold-start dial is not released here: the pool
+// takes the best of a sample, so one alive member is not the sample yet.
 func (u *URLTestPool) publishPartial(results map[string]uint16, tested map[string]struct{}) {
 	u.publishPool(results, tested, false)
 	if len(results) > 0 {
@@ -2864,6 +3148,7 @@ func (u *URLTestPool) publishPool(results map[string]uint16, tested map[string]s
 
 	now := time.Now()
 	u.mu.Lock()
+	previous := u.pool
 	if u.measuredAt == nil {
 		u.measuredAt = make(map[string]time.Time, len(results))
 	}
@@ -2917,6 +3202,36 @@ func (u *URLTestPool) publishPool(results map[string]uint16, tested map[string]s
 		}
 	}
 	u.mu.Unlock()
+
+	// Only a finished check reports the pool: a partial publish runs for every
+	// probe, and the order follows the measured delay, so the same members
+	// measured again are not a change of the pool.
+	if final && !sameNameSet(previous, names) {
+		RecordGroupEvent(GroupEvent{
+			Group:  groupName(u.GroupBase),
+			Type:   GroupEventPool,
+			Detail: fmt.Sprintf("%d -> %d members", len(previous), len(names)),
+		})
+	}
+}
+
+// sameNameSet reports whether two member lists hold the same names. The pool
+// order follows the measured delay, so a rebuild of the same members is not a
+// change of the pool.
+func sameNameSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := make(map[string]struct{}, len(a))
+	for _, name := range a {
+		seen[name] = struct{}{}
+	}
+	for _, name := range b {
+		if _, ok := seen[name]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // testProxiesStreaming sweeps proxies with the member timeout and publishes
@@ -2983,6 +3298,12 @@ func (u *URLTestPool) probeProxies(ctx context.Context, proxies []C.Proxy, timeo
 
 	probes := u.probesFor(proxies, timeout, priority)
 	submit := u.probeSubmit(proxies, priority)
+	// The sample a cold-start dial waits for: the pool holds no more members
+	// than its size, and no more than the sweep was given.
+	target := u.poolSize
+	if target <= 0 || target > len(proxies) {
+		target = len(proxies)
+	}
 	deliver := func(result probequeue.Result, recordFailure bool) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -2993,6 +3314,7 @@ func (u *URLTestPool) probeProxies(ctx context.Context, proxies []C.Proxy, timeo
 				// the failed member leaves the pool now instead of
 				// holding a slot until the check ends
 				u.publishPartial(results, tested)
+				u.noteWarmResult(target, len(tested), len(results))
 			}
 			if recordFailure && !errors.Is(result.Err, context.Canceled) {
 				failed = append(failed, result.Name)
@@ -3005,6 +3327,7 @@ func (u *URLTestPool) probeProxies(ctx context.Context, proxies []C.Proxy, timeo
 			// published under the results lock: a later publish always
 			// carries every earlier result, so the pool cannot shrink back
 			u.publishPartial(results, tested)
+			u.noteWarmResult(target, len(tested), len(results))
 		}
 	}
 	// A retried check leaves the reputation to its second wave: a timeout on a
@@ -3314,6 +3637,17 @@ func NewURLTestPool(option GroupCommonOption, poolOption URLTestPoolOption, empt
 		}
 	}
 
+	firstWaveWait := defaultURLTestPoolFirstWaveWait
+	if option.Lazy {
+		firstWaveWait = defaultURLTestPoolLazyWaveWait
+	}
+	if poolOption.FirstWaveWait != nil {
+		firstWaveWait = time.Duration(*poolOption.FirstWaveWait) * time.Millisecond
+		if firstWaveWait < 0 {
+			firstWaveWait = 0
+		}
+	}
+
 	var ordered *int
 	if poolOption.Ordered != nil {
 		if *poolOption.Ordered < 0 {
@@ -3346,7 +3680,8 @@ func NewURLTestPool(option GroupCommonOption, poolOption URLTestPoolOption, empt
 	}
 
 	// A result cannot be published before one probe finishes, so the probe
-	// timeout is the meaningful cap on the wait of a cold start.
+	// timeout is the meaningful cap on the first-result wait of a pool that has
+	// nothing measured alive.
 	firstResultWait := time.Duration(base.testTimeout) * time.Millisecond
 	if firstResultWait > defaultURLTestPoolFirstResultWait {
 		firstResultWait = defaultURLTestPoolFirstResultWait
@@ -3364,6 +3699,7 @@ func NewURLTestPool(option GroupCommonOption, poolOption URLTestPoolOption, empt
 		degradedChecks:  degradedChecks,
 		tolerance:       tolerance,
 		firstResultWait: firstResultWait,
+		firstWaveWait:   firstWaveWait,
 		attemptTimeout:  attemptTimeout,
 		recoveryWait:    urlTestPoolRecoveryWait,
 		lazy:            option.Lazy,

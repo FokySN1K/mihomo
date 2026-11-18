@@ -1354,6 +1354,35 @@ func TestURLTestPoolFirstResultWaitFollowsTimeout(t *testing.T) {
 		"a probe longer than the cap must not delay a cold dial past it")
 }
 
+// TestURLTestPoolFirstWaveWaitDefaults guards the window defaults: a pool waits
+// 1.5s for a sample, a lazy group 300ms, a profile value overrides both, and 0
+// turns the wait off.
+func TestURLTestPoolFirstWaveWaitDefaults(t *testing.T) {
+	pool, err := NewURLTestPool(GroupCommonOption{Name: "pool"}, URLTestPoolOption{}, newPoolEmptyFallback(), nil)
+	require.NoError(t, err)
+	require.Equal(t, defaultURLTestPoolFirstWaveWait, pool.firstWaveWait)
+
+	pool, err = NewURLTestPool(GroupCommonOption{Name: "pool", Lazy: true}, URLTestPoolOption{}, newPoolEmptyFallback(), nil)
+	require.NoError(t, err)
+	require.Equal(t, defaultURLTestPoolLazyWaveWait, pool.firstWaveWait,
+		"a lazy group probes a handful of members, so its sample arrives sooner")
+
+	pool, err = NewURLTestPool(GroupCommonOption{Name: "pool"},
+		URLTestPoolOption{FirstWaveWait: intPtr(700)}, newPoolEmptyFallback(), nil)
+	require.NoError(t, err)
+	require.Equal(t, 700*time.Millisecond, pool.firstWaveWait, "a profile value overrides both defaults")
+
+	pool, err = NewURLTestPool(GroupCommonOption{Name: "pool"},
+		URLTestPoolOption{FirstWaveWait: intPtr(0)}, newPoolEmptyFallback(), nil)
+	require.NoError(t, err)
+	require.Zero(t, pool.firstWaveWait, "an explicit 0 opts out of the wait")
+
+	pool, err = NewURLTestPool(GroupCommonOption{Name: "pool"},
+		URLTestPoolOption{FirstWaveWait: intPtr(-1)}, newPoolEmptyFallback(), nil)
+	require.NoError(t, err)
+	require.Zero(t, pool.firstWaveWait, "a negative window disables the wait")
+}
+
 // newColdPoolForTest builds a pool that never ran a check, so a dial starts one.
 func newColdPoolForTest(t *testing.T, opt URLTestPoolOption, proxies ...C.Proxy) *URLTestPool {
 	t.Helper()
@@ -1482,7 +1511,10 @@ func TestURLTestPoolPublishKeepsFastNodeAndClearsMeasured(t *testing.T) {
 	require.Contains(t, pool.suspicious, "b", "an unmeasured node keeps its suspicion")
 }
 
-func TestURLTestPoolWaitsForFirstResult(t *testing.T) {
+// TestURLTestPoolWaitsForFirstSample guards the cold-start sample: the dial
+// waits until the sweep answered for every member the pool can hold, because
+// the pool takes the best of the sample, not the first answer.
+func TestURLTestPoolWaitsForFirstSample(t *testing.T) {
 	release := make(chan struct{})
 	log := &dialLog{}
 
@@ -1506,7 +1538,7 @@ func TestURLTestPoolWaitsForFirstResult(t *testing.T) {
 
 	select {
 	case err := <-done:
-		t.Fatalf("the dial returned before the first measured members: %v", err)
+		t.Fatalf("the dial returned before the sample was measured: %v", err)
 	case <-time.After(100 * time.Millisecond):
 	}
 
@@ -1515,72 +1547,128 @@ func TestURLTestPoolWaitsForFirstResult(t *testing.T) {
 	case err := <-done:
 		require.NoError(t, err)
 	case <-time.After(2 * time.Second):
-		t.Fatal("the dial did not resume after the first measured members")
+		t.Fatal("the dial did not resume after the sample was measured")
 	}
-	require.NotEmpty(t, poolNames(pool), "the dial must have waited for the first measured members")
+	require.NotEmpty(t, poolNames(pool), "the dial must have waited for the measured sample")
 }
 
-func TestURLTestPoolFirstResultWaitTimesOut(t *testing.T) {
-	release := make(chan struct{})
-	defer close(release)
+// TestURLTestPoolFirstWaveWaitLeavesOnSample guards the early exit: the dial
+// leaves as soon as the sweep answered for `pool-size` members with one alive,
+// without waiting for the slow probes of the rest of the list.
+func TestURLTestPoolFirstWaveWaitLeavesOnSample(t *testing.T) {
+	held := newPoolRelease()
+	t.Cleanup(held.close)
 
-	probe := &poolProbeProxy{cascadeFakeProxy: newPoolSucceedingProxy("slow", &dialLog{})}
-	probe.testFn = func() (uint16, error) {
-		<-release
-		return 50, nil
+	proxies := []C.Proxy{
+		newPoolControlledProxy("fast-0", nil, poolProbeOk(20)),
+		newPoolControlledProxy("fast-1", nil, poolProbeOk(30)),
+		newPoolControlledProxy("slow-0", nil, poolProbeHeld(held)),
+		newPoolControlledProxy("slow-1", nil, poolProbeHeld(held)),
 	}
-
-	pool := newColdPoolForTest(t, URLTestPoolOption{}, probe)
-	pool.firstResultWait = 80 * time.Millisecond
+	pool := newColdPoolForTest(t, URLTestPoolOption{PoolSize: 2}, proxies...)
+	pool.firstWaveWait = 2 * time.Second
 
 	start := time.Now()
 	conn, err := pool.DialContext(context.Background(), &C.Metadata{})
 	elapsed := time.Since(start)
 
-	require.NoError(t, err, "the dial must proceed on its own once the wait is over")
+	require.NoError(t, err)
 	require.NotNil(t, conn)
-	require.GreaterOrEqual(t, elapsed, 80*time.Millisecond)
-	require.Less(t, elapsed, time.Second)
+	require.Less(t, elapsed, time.Second,
+		"the dial must leave once the sample is measured, not wait for the whole list")
 }
 
-func TestURLTestPoolFirstResultWaitBudgetIsPerCheck(t *testing.T) {
-	release := make(chan struct{})
-	defer close(release)
+// TestURLTestPoolFirstWaveWaitLeavesAtHalfWindowWithoutAnswers guards the queue
+// guard: a sweep that produced no answer by the middle of the window is stuck
+// behind the probes of another group, and waiting out the rest only delays the
+// connection.
+func TestURLTestPoolFirstWaveWaitLeavesAtHalfWindowWithoutAnswers(t *testing.T) {
+	held := newPoolRelease()
+	t.Cleanup(held.close)
 
-	probe := &poolProbeProxy{cascadeFakeProxy: newPoolSucceedingProxy("slow", &dialLog{})}
-	probe.testFn = func() (uint16, error) {
-		<-release
-		return 50, nil
-	}
-
+	probe := newPoolControlledProxy("slow", nil, poolProbeHeld(held))
 	pool := newColdPoolForTest(t, URLTestPoolOption{}, probe)
-	pool.firstResultWait = 80 * time.Millisecond
+	pool.firstWaveWait = 200 * time.Millisecond
+
+	start := time.Now()
+	conn, err := pool.DialContext(context.Background(), &C.Metadata{})
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	require.GreaterOrEqual(t, elapsed, 70*time.Millisecond)
+	require.Less(t, elapsed, 190*time.Millisecond,
+		"a sweep without a single answer must not hold the dial for the whole window")
+}
+
+// TestURLTestPoolFirstWaveWaitCountsFromCheckStart guards the per-check budget:
+// the window is measured from the start of the sweep, so a dial that arrives
+// after the window already passed does not wait again.
+func TestURLTestPoolFirstWaveWaitCountsFromCheckStart(t *testing.T) {
+	held := newPoolRelease()
+	t.Cleanup(held.close)
+
+	probe := newPoolControlledProxy("slow", nil, poolProbeHeld(held))
+	pool := newPoolForTest(t, URLTestPoolOption{}, probe)
+	pool.mu.Lock()
+	pool.pool = nil
+	pool.mu.Unlock()
+	pool.firstWaveWait = 200 * time.Millisecond
+	pool.beginWarmup()
+	pool.mu.Lock()
+	pool.checkStart = time.Now().Add(-time.Second)
+	pool.mu.Unlock()
+	t.Cleanup(pool.finishWarm)
 
 	start := time.Now()
 	_, err := pool.DialContext(context.Background(), &C.Metadata{})
 	require.NoError(t, err)
-	require.GreaterOrEqual(t, time.Since(start), 80*time.Millisecond)
-
-	// the check still runs and the pool is still empty, but the wait is counted
-	// from the start of the check, so its budget is already spent
-	start = time.Now()
-	_, err = pool.DialContext(context.Background(), &C.Metadata{})
-	require.NoError(t, err)
-	require.Less(t, time.Since(start), 50*time.Millisecond, "the wait budget is counted from the start of the check")
+	require.Less(t, time.Since(start), 50*time.Millisecond,
+		"the wait budget is counted from the start of the check")
 }
 
-func TestURLTestPoolFirstResultRespectsCallerDeadline(t *testing.T) {
-	release := make(chan struct{})
-	defer close(release)
+// TestURLTestPoolFirstWaveWaitWaitsOutWindowWithoutAlive guards the other side:
+// a sample the sweep answered without a single alive member keeps the gate
+// open, and the dial leaves only on the window or when the check ends.
+func TestURLTestPoolFirstWaveWaitWaitsOutWindowWithoutAlive(t *testing.T) {
+	held := newPoolRelease()
+	t.Cleanup(held.close)
 
-	probe := &poolProbeProxy{cascadeFakeProxy: newPoolSucceedingProxy("slow", &dialLog{})}
-	probe.testFn = func() (uint16, error) {
-		<-release
-		return 50, nil
+	dead := func(name string) C.Proxy {
+		return newPoolControlledProxy(name, nil, func(context.Context) (uint16, error) {
+			return 0, errors.New("probe failed")
+		})
 	}
+	// the pool-size sample answered without an alive member, the third probe
+	// keeps the check running so only the window can release the dial
+	pool := newColdPoolForTest(t, URLTestPoolOption{PoolSize: 2},
+		dead("dead-0"), dead("dead-1"), newPoolControlledProxy("slow", nil, poolProbeHeld(held)))
+	pool.firstWaveWait = 300 * time.Millisecond
 
-	pool := newColdPoolForTest(t, URLTestPoolOption{}, probe)
-	pool.firstResultWait = 5 * time.Second
+	start := time.Now()
+	conn, err := pool.DialContext(context.Background(), &C.Metadata{})
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	require.GreaterOrEqual(t, elapsed, 250*time.Millisecond,
+		"a sample without an alive member must not release the dial")
+	require.Less(t, elapsed, time.Second)
+}
+
+// TestURLTestPoolFirstWaveWaitRespectsCallerDeadline guards the cap: the wait
+// never spends more than half of the caller's budget, the dial and its retries
+// need the rest.
+func TestURLTestPoolFirstWaveWaitRespectsCallerDeadline(t *testing.T) {
+	held := newPoolRelease()
+	t.Cleanup(held.close)
+
+	dead := newPoolControlledProxy("dead", nil, func(context.Context) (uint16, error) {
+		return 0, errors.New("probe failed")
+	})
+	slow := newPoolControlledProxy("slow", nil, poolProbeHeld(held))
+	pool := newColdPoolForTest(t, URLTestPoolOption{}, dead, slow)
+	pool.firstWaveWait = 5 * time.Second
 
 	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
 	defer cancel()
@@ -1590,7 +1678,50 @@ func TestURLTestPoolFirstResultRespectsCallerDeadline(t *testing.T) {
 	elapsed := time.Since(start)
 
 	require.NoError(t, err)
-	require.Less(t, elapsed, 1500*time.Millisecond, "the first-result wait must stay inside the caller's deadline")
+	// one answer of the sample arrived, so the half-window guard does not fire:
+	// the full half of the caller's budget is spent on the wait
+	require.GreaterOrEqual(t, elapsed, 300*time.Millisecond, "the cap is half of the caller's budget")
+	require.Less(t, elapsed, 700*time.Millisecond, "the wait must stay inside the caller's deadline")
+}
+
+// TestURLTestPoolFirstWaveWaitDisabled guards the option: 0 turns the wait off
+// and a dial goes out at once.
+func TestURLTestPoolFirstWaveWaitDisabled(t *testing.T) {
+	held := newPoolRelease()
+	t.Cleanup(held.close)
+
+	probe := newPoolControlledProxy("slow", nil, poolProbeHeld(held))
+	pool := newColdPoolForTest(t, URLTestPoolOption{FirstWaveWait: intPtr(0)}, probe)
+
+	start := time.Now()
+	_, err := pool.DialContext(context.Background(), &C.Metadata{})
+	require.NoError(t, err)
+	require.Less(t, time.Since(start), 100*time.Millisecond)
+}
+
+// TestURLTestPoolFirstWaveWaitSkipsFixed guards the pinned member: the profile
+// already decided which node to use, so the dial must not wait for a sample.
+func TestURLTestPoolFirstWaveWaitSkipsFixed(t *testing.T) {
+	held := newPoolRelease()
+	t.Cleanup(held.close)
+
+	log := &dialLog{}
+	probe := newPoolControlledProxy("slow", nil, poolProbeHeld(held))
+	fixed := newPoolSucceedingProxy("fixed", log)
+	pool := newPoolForTest(t, URLTestPoolOption{}, probe, fixed)
+	pool.mu.Lock()
+	pool.pool = nil
+	pool.selected = "fixed"
+	pool.mu.Unlock()
+	pool.firstWaveWait = 5 * time.Second
+	pool.beginWarmup()
+	t.Cleanup(pool.finishWarm)
+
+	start := time.Now()
+	_, err := pool.DialContext(context.Background(), &C.Metadata{})
+	require.NoError(t, err)
+	require.Less(t, time.Since(start), 100*time.Millisecond, "a pinned member needs no sample")
+	require.Equal(t, []string{"fixed"}, log.list())
 }
 
 // TestURLTestPoolWarmUpFillsThePoolBeforeADial guards the pre-warm: the pool is
@@ -1855,6 +1986,34 @@ func TestURLTestPoolColdPickUsesReputation(t *testing.T) {
 
 	proxy, _ := pool.fastForDial(false)
 	require.Equal(t, "rep-best", proxy.Name())
+}
+
+// An empty pool after a full check is the same blind choice as a cold one: the
+// check measured nothing, so the reputation is the least blind guess the pool
+// can make. A pool that holds a member keeps the order its measurements gave.
+func TestURLTestPoolEmptyPoolPicksByReputation(t *testing.T) {
+	first := newPoolControlledProxy("rep-first", nil, poolProbeOk(10))
+	best := newPoolControlledProxy("rep-best", nil, poolProbeOk(10))
+	pool := newPoolForTest(t, URLTestPoolOption{}, first, best)
+	pool.mu.Lock()
+	pool.pool = nil
+	pool.mu.Unlock()
+	pool.hasFullCheck.Store(true) // the check ran and measured nothing alive
+
+	for i := 0; i < 4; i++ {
+		pool.reputation.DialSucceeded("rep-best")
+	}
+
+	proxy, _ := pool.fastForDial(false)
+	require.Equal(t, "rep-best", proxy.Name(),
+		"an empty pool is a blind choice even after a full check")
+
+	pool.mu.Lock()
+	pool.pool = []string{"rep-first"}
+	pool.mu.Unlock()
+	proxy, _ = pool.fastForDial(false)
+	require.Equal(t, "rep-first", proxy.Name(),
+		"a pool that holds a member keeps the order the measurements gave")
 }
 
 // A failed probe is evidence too: a node that does not answer a health check
@@ -2620,6 +2779,31 @@ func TestURLTestPoolOrderForCheckPrefersTheTrustedTier(t *testing.T) {
 		"the tier must decide before the measured delay")
 }
 
+// A band of ten points absorbs the noise of a single strike: inside a tier the
+// sweep follows the reputation by bands, not by the exact score, and the delay
+// decides between the members of one band.
+func TestURLTestPoolOrderForCheckBandsReputation(t *testing.T) {
+	proven := newPoolOrderedProxy("proven", true, 40)
+	same := newPoolOrderedProxy("same-band", true, 10)
+	neutral := newPoolOrderedProxy("neutral", true, 40)
+	sunk := newPoolOrderedProxy("sunk", true, 10)
+	pool := newPoolForTest(t, URLTestPoolOption{}, proven, same, neutral, sunk)
+	for i := 0; i < 12; i++ {
+		pool.reputation.DialSucceeded("proven")
+	}
+	for i := 0; i < 5; i++ {
+		pool.reputation.DialSucceeded("same-band")
+	}
+	pool.reputation.DialFailed("sunk")
+	require.Equal(t, 21, pool.reputation.Score("proven"))
+	require.Equal(t, 5, pool.reputation.Score("same-band"))
+	require.Equal(t, -25, pool.reputation.Score("sunk"))
+
+	ordered := pool.orderForCheck([]C.Proxy{sunk, neutral, same, proven})
+	require.Equal(t, []string{"proven", "same-band", "neutral", "sunk"}, cascadeProxyNames(ordered),
+		"the band decides ahead of the delay, and the delay decides inside one band")
+}
+
 // The pool is cold when nothing it could route by was measured: a proxy is
 // created alive, so only a per-URL delay tells a measured member from one the
 // pool never reached.
@@ -2764,11 +2948,10 @@ func TestURLTestPoolDialPromotesItsChainCheck(t *testing.T) {
 	// still holds it behind the wave of the group ordered first.
 	pool.mu.Lock()
 	pool.pool = nil
-	pool.warmCh = make(chan struct{})
-	pool.checkStart = time.Now()
-	pool.firstResultWait = 10 * time.Millisecond
 	pool.mu.Unlock()
-	t.Cleanup(pool.markWarm)
+	pool.firstWaveWait = 10 * time.Millisecond
+	pool.beginWarmup()
+	t.Cleanup(pool.finishWarm)
 
 	pool.waitWarm(context.Background())
 

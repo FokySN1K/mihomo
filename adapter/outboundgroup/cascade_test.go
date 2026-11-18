@@ -45,12 +45,14 @@ func (f *cascadeFakeProxy) URLTest(context.Context, string, utils.IntRanges[uint
 
 type cascadeFakeConn struct {
 	N.ExtendedConn
+	chains C.Chain
 }
 
-func (c *cascadeFakeConn) Chains() C.Chain               { return nil }
+func (c *cascadeFakeConn) Chains() C.Chain               { return c.chains }
 func (c *cascadeFakeConn) ProviderChains() C.Chain       { return nil }
 func (c *cascadeFakeConn) AppendToChains(C.ProxyAdapter) {}
 func (c *cascadeFakeConn) RemoteDestination() string     { return "" }
+func (c *cascadeFakeConn) Close() error                  { return nil }
 
 type dialLog struct {
 	mu    sync.Mutex
@@ -104,6 +106,15 @@ func newCascadeSucceedingProxy(name string, log *dialLog) *cascadeFakeProxy {
 	return newCascadeFakeProxy(name, C.Shadowsocks, func(context.Context, *C.Metadata) (C.Conn, error) {
 		log.record(name)
 		return &cascadeFakeConn{}, nil
+	}, nil, 0)
+}
+
+// newCascadeRejectProxy answers the dial the way a reject action does: with a
+// null connection whose chain names the reject, not with a carrier.
+func newCascadeRejectProxy(name string, log *dialLog) *cascadeFakeProxy {
+	return newCascadeFakeProxy(name, C.Shadowsocks, func(context.Context, *C.Metadata) (C.Conn, error) {
+		log.record(name)
+		return &cascadeFakeConn{chains: C.Chain{"REJECT"}}, nil
 	}, nil, 0)
 }
 
@@ -488,7 +499,36 @@ func TestCascadeTimeoutCutRecheckThrottled(t *testing.T) {
 	require.Equal(t, int32(1), probes.Load(), "a second cut must not probe again inside the interval")
 }
 
-func TestCascadeAttemptContextSkipsNestedAttempts(t *testing.T) {
+// A nested pool or cascade runs its own attempts, but it is not exempt from the
+// share: the share bounds the candidate as a whole, so a pool that keeps
+// replacing members cannot eat the budget of the candidates after it. The
+// candidate keeps its own member timeout inside the share.
+func TestCascadeAttemptContextSharesNestedAttempts(t *testing.T) {
+	group := newCascadeForTest(t, CascadeOption{AttemptTimeout: intPtr(30)}, newCascadeTestProxy("a"))
+	parent, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	// A budget shorter than the reserve of the rest is split in half, so every
+	// remaining candidate keeps a turn.
+	pool := newPoolForTest(t, URLTestPoolOption{}, newCascadeTestProxy("p"), newCascadeTestProxy("q"))
+	ctx, cancelAttempt := group.attemptContext(parent, adapter.NewProxy(pool), 2)
+	deadline, ok := ctx.Deadline()
+	cancelAttempt()
+	require.True(t, ok, "a nested pool must be bounded by its share")
+	require.WithinDuration(t, time.Now().Add(500*time.Millisecond), deadline, 100*time.Millisecond,
+		"a nested pool keeps its own member timeout inside the share, not the attempt-timeout of the group")
+
+	nested := newCascadeForTest(t, CascadeOption{}, newCascadeTestProxy("n"), newCascadeTestProxy("m"))
+	ctx, cancelAttempt = group.attemptContext(parent, adapter.NewProxy(nested), 2)
+	deadline, ok = ctx.Deadline()
+	cancelAttempt()
+	require.True(t, ok, "a nested cascade must be bounded by its share")
+	require.WithinDuration(t, time.Now().Add(500*time.Millisecond), deadline, 100*time.Millisecond)
+}
+
+// A plain candidate is bounded by attempt-timeout as before: the share can only
+// shorten it, never extend it.
+func TestCascadeAttemptContextClampsPlainCandidate(t *testing.T) {
 	group := newCascadeForTest(t, CascadeOption{AttemptTimeout: intPtr(30)}, newCascadeTestProxy("a"))
 	parent, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -498,18 +538,6 @@ func TestCascadeAttemptContextSkipsNestedAttempts(t *testing.T) {
 	cancelAttempt()
 	require.True(t, ok)
 	require.WithinDuration(t, time.Now().Add(30*time.Millisecond), deadline, 25*time.Millisecond)
-
-	// a nested pool or cascade that switches between its own members retries
-	// them itself, so it keeps its budget
-	pool := newPoolForTest(t, URLTestPoolOption{}, newCascadeTestProxy("p"), newCascadeTestProxy("q"))
-	ctx, cancelAttempt = group.attemptContext(parent, adapter.NewProxy(pool), 2)
-	cancelAttempt()
-	require.Equal(t, parent, ctx, "a nested pool must not be cut")
-
-	nested := newCascadeForTest(t, CascadeOption{}, newCascadeTestProxy("n"), newCascadeTestProxy("m"))
-	ctx, cancelAttempt = group.attemptContext(parent, adapter.NewProxy(nested), 2)
-	cancelAttempt()
-	require.Equal(t, parent, ctx, "a nested cascade must not be cut")
 }
 
 func TestCascadeAttemptContextFollowsSelector(t *testing.T) {
@@ -526,13 +554,16 @@ func TestCascadeAttemptContextFollowsSelector(t *testing.T) {
 	require.NoError(t, err)
 
 	ctx, cancelAttempt := group.attemptContext(parent, adapter.NewProxy(selector), 2)
+	deadline, ok := ctx.Deadline()
 	cancelAttempt()
-	require.Equal(t, parent, ctx, "a selector leading to a nested pool must not be cut")
+	require.True(t, ok)
+	require.WithinDuration(t, time.Now().Add(500*time.Millisecond), deadline, 100*time.Millisecond,
+		"the selector must not hide the nested pool from the share")
 }
 
-// A candidate that cannot switch between its own members is a plain dial: it
-// may take only its share of the caller's budget, so the candidates after it
-// keep a turn of their own.
+// A candidate that has others behind it may take only its share of the caller's
+// budget, so they keep a turn of their own; the last candidate is bounded by the
+// caller's deadline alone.
 func TestCascadeCandidateBudgetKeepsATurnForTheRest(t *testing.T) {
 	group := newCascadeForTest(t, CascadeOption{}, newCascadeTestProxy("a"))
 	parent, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -671,6 +702,56 @@ func TestCascadeDialFailsOverWithinOneConnection(t *testing.T) {
 	require.Equal(t, []string{"b"}, log.list(), "the proven candidate must be dialed first")
 }
 
+// A candidate that answers with a reject action hands a null connection to the
+// caller: the flow would die at once. The cascade must read the chain the
+// tunnel itself checks and treat the answer as a failed attempt, so the next
+// candidate carries the connection.
+func TestCascadeMovesPastARejectedCandidate(t *testing.T) {
+	log := &dialLog{}
+	group := newCascadeForTest(t, CascadeOption{},
+		newCascadeRejectProxy("reject", log),
+		newCascadeSucceedingProxy("good", log),
+	)
+
+	conn, err := group.DialContext(context.Background(), &C.Metadata{})
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	require.Equal(t, []string{"reject", "good"}, log.list(),
+		"a candidate that rejected the traffic must not keep the connection")
+
+	group.mu.RLock()
+	require.True(t, group.states["reject"].failedUntil.After(time.Now()),
+		"the reject answer must leave the candidate out of play")
+	group.mu.RUnlock()
+	require.Equal(t, "good", group.Now())
+}
+
+// The live shape of the same answer: an empty pool hands the dial to its
+// empty-fallback, and a fallback that rejects turns every dial of the pool
+// into the same null connection. The cascade must move on to its reserve.
+func TestCascadeMovesPastAnEmptyPoolThatRejects(t *testing.T) {
+	log := &dialLog{}
+	reject := newCascadeRejectProxy("reject", log)
+	pool, err := NewURLTestPool(GroupCommonOption{Name: "empty", Interval: 300},
+		URLTestPoolOption{}, reject, nil)
+	require.NoError(t, err)
+	// freeze the schedule: the pool has no member to measure and must not
+	// spend the test on background checks
+	pool.hasFullCheck.Store(true)
+	pool.lastFull.Store(time.Now())
+	pool.lastQuick.Store(time.Now())
+
+	group := newCascadeForTest(t, CascadeOption{}, adapter.NewProxy(pool),
+		newCascadeSucceedingProxy("reserve", log))
+
+	conn, err := group.DialContext(context.Background(), &C.Metadata{})
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	require.Equal(t, []string{"reject", "reserve"}, log.list(),
+		"an empty pool that rejects must hand the connection to the next candidate")
+	require.Equal(t, "reserve", group.Now())
+}
+
 func TestCascadeDialRespectsMaxAttempts(t *testing.T) {
 	log := &dialLog{}
 	group := newCascadeForTest(t, CascadeOption{MaxAttempts: intPtr(2)},
@@ -708,6 +789,51 @@ func TestCascadeWrapsPoolAttemptTimeout(t *testing.T) {
 	require.NotNil(t, conn)
 	require.Equal(t, []string{"alive"}, log.list(), "the pool must replace its dead member inside the cascade attempt")
 	require.Equal(t, "pool", group.Now(), "the cascade must keep the pool as the active candidate")
+}
+
+// A pool candidate is bounded by its share, not by its own member timeout: a
+// hanging member must not spend the whole caller budget, and the cut must say
+// nothing about the member. The candidate after the pool gets the rest.
+func TestCascadeShareCutsAPoolCandidate(t *testing.T) {
+	log := &dialLog{}
+	hang := newPoolControlledProxy("hang", func(ctx context.Context, _ *C.Metadata) (C.Conn, error) {
+		log.record("hang")
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}, poolProbeOk(20))
+	spare := newPoolSucceedingProxy("spare", log)
+	// the pool keeps its own member timeout, the share bounds it from outside
+	pool := newPoolForTest(t, URLTestPoolOption{AttemptTimeout: intPtr(23000)}, hang, spare)
+	group := newCascadeForTest(t, CascadeOption{MaxAttempts: intPtr(2)},
+		adapter.NewProxy(pool), newCascadeSucceedingProxy("fallback", log))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 900*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	conn, err := group.DialContext(ctx, &C.Metadata{})
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	require.Equal(t, []string{"hang", "fallback"}, log.list(),
+		"the share must hand the connection to the next candidate, not to the next member of the pool")
+	require.GreaterOrEqual(t, elapsed, 350*time.Millisecond, "the pool must spend its share before the switch")
+	require.Less(t, elapsed, 800*time.Millisecond, "the next candidate must dial inside the caller budget")
+
+	pool.mu.RLock()
+	_, suspicious := pool.suspicious["hang"]
+	_, cutMark := pool.cutMarks["hang"]
+	pool.mu.RUnlock()
+	require.False(t, suspicious, "a budget cut says nothing about the member")
+	require.False(t, cutMark, "a budget cut is not a member cut")
+
+	group.mu.RLock()
+	state := *group.states["pool"]
+	group.mu.RUnlock()
+	require.Equal(t, 1, state.timeoutCount, "a pool cut by its share is cut like any slow candidate")
+	require.LessOrEqual(t, time.Until(state.failedUntil), cascadeTimeoutCooldown+time.Second,
+		"a share cut takes the short cooldown, not the failed one")
 }
 
 func TestCascadeDoesNotDemoteDirectFailures(t *testing.T) {
@@ -825,6 +951,8 @@ func TestCascadeMarshalJSON(t *testing.T) {
 	require.Equal(t, C.Cascade.String(), payload["type"])
 	require.Equal(t, "b", payload["now"])
 	require.Equal(t, "b", payload["fixed"])
+	require.Equal(t, true, payload["fixedActive"])
+	require.Equal(t, NowReasonFixed, payload["nowReason"])
 	require.Equal(t, float64(2), payload["lookahead"])
 	require.Equal(t, []any{"a", "b"}, payload["all"])
 }

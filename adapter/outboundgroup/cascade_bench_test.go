@@ -79,12 +79,12 @@ func BenchmarkURLTestPoolProxies(b *testing.B) {
 	}
 }
 
-// BenchmarkURLTestPoolWarmPath measures the first-result check every dial runs
+// BenchmarkURLTestPoolWarmPath measures the first-sample gate every dial runs
 // when the pool already has members, which is the steady state of a connection.
 func BenchmarkURLTestPoolWarmPath(b *testing.B) {
 	pool := &URLTestPool{
-		pool:            []string{"a"},
-		firstResultWait: defaultURLTestPoolFirstResultWait,
+		pool:          []string{"a"},
+		firstWaveWait: defaultURLTestPoolFirstWaveWait,
 	}
 	ctx := context.Background()
 
@@ -133,8 +133,8 @@ func BenchmarkURLTestPoolNoteDialSucceeded(b *testing.B) {
 	}
 }
 
-// BenchmarkCascadeRunsOwnAttempts measures deciding whether one candidate keeps
-// its own budget, which runs on every cascade attempt.
+// BenchmarkCascadeRunsOwnAttempts measures deciding whether a candidate runs
+// its own attempts, which runs on every cascade attempt.
 func BenchmarkCascadeRunsOwnAttempts(b *testing.B) {
 	proxy := newCascadeTestProxy("node")
 

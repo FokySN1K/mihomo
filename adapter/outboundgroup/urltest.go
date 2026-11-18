@@ -36,9 +36,12 @@ type URLTest struct {
 	disableUDP     bool
 	// stateMux guards the fixed selection and the member it resolved to: a
 	// user selection can arrive while a choice is being made.
-	stateMux   sync.Mutex
-	fastNode   C.Proxy
-	fastSingle *singledo.Single[C.Proxy]
+	stateMux    sync.Mutex
+	fastNode    C.Proxy
+	fastReason  string
+	eventNow    string
+	eventReason string
+	fastSingle  *singledo.Single[C.Proxy]
 }
 
 func (u *URLTest) Now() string {
@@ -62,8 +65,12 @@ func (u *URLTest) Set(name string) error {
 
 func (u *URLTest) ForceSet(name string) {
 	u.stateMux.Lock()
+	previous := u.selected
 	u.selected = name
 	u.stateMux.Unlock()
+	if previous != name {
+		recordPinEvent(u.Name(), previous, name)
+	}
 	u.fastSingle.Reset()
 }
 
@@ -134,22 +141,55 @@ func (u *URLTest) fast(touch bool) C.Proxy {
 	return elm
 }
 
+// fastState returns the member the group routes through and the reason it was
+// chosen, so MarshalJSON publishes both from the same choice.
+func (u *URLTest) fastState(touch bool) (C.Proxy, string) {
+	proxy := u.fast(touch)
+	u.stateMux.Lock()
+	reason := u.fastReason
+	u.stateMux.Unlock()
+	if reason == "" {
+		reason = NowReasonBest
+	}
+	return proxy, reason
+}
+
 // pickFastest applies the fixed selection and the tolerance to the current
 // member list. The state it reads is guarded: a selection can arrive while a
 // connection is being routed.
 func (u *URLTest) pickFastest(proxies []C.Proxy) C.Proxy {
-	u.stateMux.Lock()
-	defer u.stateMux.Unlock()
+	proxy, _ := u.pickFastestState(proxies)
+	return proxy
+}
 
+func (u *URLTest) pickFastestState(proxies []C.Proxy) (C.Proxy, string) {
+	u.stateMux.Lock()
+	proxy, reason := u.pickFastestLocked(proxies)
+	u.stateMux.Unlock()
+	u.recordNow(proxy.Name(), reason)
+	return proxy, reason
+}
+
+func (u *URLTest) pickFastestLocked(proxies []C.Proxy) (C.Proxy, string) {
+	if len(proxies) == 0 {
+		u.fastNode = nil
+		u.fastReason = NowReasonEmpty
+		return u.EmptyFallback(), NowReasonEmpty
+	}
+
+	fixedUnavailable := false
 	if u.selected != "" {
+		fixedUnavailable = true
 		for _, proxy := range proxies {
-			if !proxy.AliveForTestUrl(u.testUrl) {
+			if proxy.Name() != u.selected {
 				continue
 			}
-			if proxy.Name() == u.selected {
+			if proxy.AliveForTestUrl(u.testUrl) {
 				u.fastNode = proxy
-				return proxy
+				u.fastReason = NowReasonFixed
+				return proxy, NowReasonFixed
 			}
+			break
 		}
 	}
 
@@ -173,11 +213,49 @@ func (u *URLTest) pickFastest(proxies []C.Proxy) C.Proxy {
 		}
 
 	}
-	// tolerance
-	if u.fastNode == nil || fastNotExist || !u.fastNode.AliveForTestUrl(u.testUrl) || u.fastNode.LastDelayForTestUrl(u.testUrl) > fast.LastDelayForTestUrl(u.testUrl)+u.tolerance {
+
+	// tolerance: a measured candidate replaces the current member only when
+	// it is faster by more than the hysteresis band.
+	switched := u.fastNode == nil || fastNotExist || !u.fastNode.AliveForTestUrl(u.testUrl) ||
+		u.fastNode.LastDelayForTestUrl(u.testUrl) > fast.LastDelayForTestUrl(u.testUrl)+u.tolerance
+
+	reason := NowReasonBest
+	if fixedUnavailable {
+		reason = NowReasonFixedUnavailable
+	} else if !switched && fast.LastDelayForTestUrl(u.testUrl) < u.fastNode.LastDelayForTestUrl(u.testUrl) {
+		reason = NowReasonTolerance
+	}
+
+	if switched {
 		u.fastNode = fast
 	}
-	return u.fastNode
+	if u.fastNode == nil {
+		u.fastNode = fast
+	}
+	u.fastReason = reason
+	return u.fastNode, reason
+}
+
+// recordNow stores the routing change as a history event; a repeated read of
+// the same member with the same reason is not a new event.
+func (u *URLTest) recordNow(name, reason string) {
+	u.stateMux.Lock()
+	if u.eventNow == name && u.eventReason == reason {
+		u.stateMux.Unlock()
+		return
+	}
+	from := u.eventNow
+	u.eventNow = name
+	u.eventReason = reason
+	u.stateMux.Unlock()
+
+	RecordGroupEvent(GroupEvent{
+		Group:  u.Name(),
+		Type:   GroupEventNow,
+		From:   from,
+		To:     name,
+		Reason: reason,
+	})
 }
 
 // SupportUDP implements C.ProxyAdapter
@@ -199,13 +277,18 @@ func (u *URLTest) MarshalJSON() ([]byte, error) {
 	for _, proxy := range u.GetProxies(false) {
 		all = append(all, proxy.Name())
 	}
+	nowProxy, reason := u.fastState(false)
+	now := nowProxy.Name()
+	fixed := u.fixedSelection()
 	return json.Marshal(map[string]any{
 		"type":           u.Type().String(),
-		"now":            u.Now(),
+		"now":            now,
 		"all":            all,
 		"testUrl":        u.testUrl,
 		"expectedStatus": u.expectedStatus,
-		"fixed":          u.fixedSelection(),
+		"fixed":          fixed,
+		"fixedActive":    fixedActive(fixed, now),
+		"nowReason":      reason,
 		"hidden":         u.Hidden(),
 		"icon":           u.Icon(),
 		"emptyFallback":  u.EmptyFallback().Name(),

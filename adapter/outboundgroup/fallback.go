@@ -24,6 +24,9 @@ type Fallback struct {
 	selected       string
 	selectedMux    sync.RWMutex
 	expectedStatus string
+	eventNow       string
+	eventReason    string
+	historyMux     sync.Mutex
 }
 
 func (f *Fallback) Now() string {
@@ -95,13 +98,18 @@ func (f *Fallback) MarshalJSON() ([]byte, error) {
 	for _, proxy := range f.GetProxies(false) {
 		all = append(all, proxy.Name())
 	}
+	nowProxy, reason := f.findAliveProxyState(false)
+	now := nowProxy.Name()
+	fixed := f.fixedSelection()
 	return json.Marshal(map[string]any{
 		"type":           f.Type().String(),
-		"now":            f.Now(),
+		"now":            now,
 		"all":            all,
 		"testUrl":        f.testUrl,
 		"expectedStatus": f.expectedStatus,
-		"fixed":          f.fixedSelection(),
+		"fixed":          fixed,
+		"fixedActive":    fixedActive(fixed, now),
+		"nowReason":      reason,
 		"hidden":         f.Hidden(),
 		"icon":           f.Icon(),
 		"emptyFallback":  f.EmptyFallback().Name(),
@@ -122,30 +130,70 @@ func (f *Fallback) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 }
 
 func (f *Fallback) findAliveProxy(touch bool) C.Proxy {
+	proxy, _ := f.findAliveProxyState(touch)
+	return proxy
+}
+
+// findAliveProxyState returns the member a fallback routes through and the
+// reason it was chosen. A pinned member that died is skipped for this choice,
+// but the selection is not cleared: the reason reports that the pin is not
+// active, and a member that comes back keeps the place the user gave it.
+func (f *Fallback) findAliveProxyState(touch bool) (C.Proxy, string) {
+	proxy, reason := f.chooseAliveProxy(touch)
+	f.recordNow(proxy.Name(), reason)
+	return proxy, reason
+}
+
+func (f *Fallback) chooseAliveProxy(touch bool) (C.Proxy, string) {
 	proxies := f.GetProxies(touch)
+	if len(proxies) == 0 {
+		return f.EmptyFallback(), NowReasonEmpty
+	}
 	selected := f.fixedSelection()
 
-	// A fixed member that died is skipped for this choice, but the selection is
-	// not cleared: a read of the group must not write its state, and a member
-	// that comes back keeps the place the user gave it.
+	reason := NowReasonBest
 	if len(selected) != 0 {
+		reason = NowReasonFixedUnavailable
 		for _, proxy := range proxies {
-			if proxy.Name() == selected {
-				if proxy.AliveForTestUrl(f.testUrl) {
-					return proxy
-				}
-				break
+			if proxy.Name() != selected {
+				continue
 			}
+			if proxy.AliveForTestUrl(f.testUrl) {
+				return proxy, NowReasonFixed
+			}
+			break
 		}
 	}
 
 	for _, proxy := range proxies {
 		if proxy.AliveForTestUrl(f.testUrl) {
-			return proxy
+			return proxy, reason
 		}
 	}
 
-	return proxies[0]
+	return proxies[0], NowReasonEmpty
+}
+
+// recordNow stores the routing change as a history event; a repeated read of
+// the same member with the same reason is not a new event.
+func (f *Fallback) recordNow(name, reason string) {
+	f.historyMux.Lock()
+	if f.eventNow == name && f.eventReason == reason {
+		f.historyMux.Unlock()
+		return
+	}
+	from := f.eventNow
+	f.eventNow = name
+	f.eventReason = reason
+	f.historyMux.Unlock()
+
+	RecordGroupEvent(GroupEvent{
+		Group:  f.Name(),
+		Type:   GroupEventNow,
+		From:   from,
+		To:     name,
+		Reason: reason,
+	})
 }
 
 func (f *Fallback) Set(name string) error {
@@ -176,8 +224,12 @@ func (f *Fallback) Set(name string) error {
 
 func (f *Fallback) ForceSet(name string) {
 	f.selectedMux.Lock()
+	previous := f.selected
 	f.selected = name
 	f.selectedMux.Unlock()
+	if previous != name {
+		recordPinEvent(f.Name(), previous, name)
+	}
 }
 
 func (f *Fallback) Providers() []P.ProxyProvider {
