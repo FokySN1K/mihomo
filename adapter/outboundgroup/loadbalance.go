@@ -71,7 +71,9 @@ func getKeyWithSrcAndDst(metadata *C.Metadata) string {
 		src = metadata.SrcIP.String()
 	}
 
-	return fmt.Sprintf("%s%s", src, dst)
+	// A separator is required: without one, source 1.2.3.4 with destination
+	// 5.6.7.8 and source 1.2.3.45 with destination 6.7.8 hash to the same key.
+	return src + "\x00" + dst
 }
 
 // getKeyWithInUser pins on the authenticated inbound user instead of on an
