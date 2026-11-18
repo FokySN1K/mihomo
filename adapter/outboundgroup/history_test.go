@@ -137,10 +137,10 @@ func TestURLTestPoolRecordsPinAndNowOnce(t *testing.T) {
 	require.Equal(t, "b", nowTo)
 }
 
-// A pin stays in `fixed` even when the group routes around it: `fixedActive`
-// is the separate bit a host shows, and the reason names why the route does
-// not follow the pin.
-func TestURLTestPoolReportsAnInactivePin(t *testing.T) {
+// A pin is a decision, not a hint: the pool keeps dialing the pinned member
+// even when it is not alive, and reports the pin as the route. The marks still
+// name the member, so a host shows the risk on the card.
+func TestURLTestPoolKeepsAPinOnADeadMember(t *testing.T) {
 	a := newPoolOrderedProxy("a", true, 100)
 	dead := newPoolOrderedProxy("dead", false, 0)
 	pool := newPoolForTest(t, URLTestPoolOption{}, a, dead)
@@ -149,9 +149,9 @@ func TestURLTestPoolReportsAnInactivePin(t *testing.T) {
 	pool.ForceSet("dead")
 	decoded := marshalGroupState(t, pool)
 	require.Equal(t, "dead", decoded["fixed"])
-	require.Equal(t, false, decoded["fixedActive"])
-	require.Equal(t, NowReasonFixedUnavailable, decoded["nowReason"])
-	require.Equal(t, "a", decoded["now"])
+	require.Equal(t, true, decoded["fixedActive"])
+	require.Equal(t, NowReasonFixed, decoded["nowReason"])
+	require.Equal(t, "dead", decoded["now"])
 
 	pool.ForceSet("a")
 	decoded = marshalGroupState(t, pool)
@@ -161,9 +161,10 @@ func TestURLTestPoolReportsAnInactivePin(t *testing.T) {
 	require.Equal(t, "a", decoded["now"])
 }
 
-// A suspicious member is alive for the test URL but out of play for now, so a
-// pin on it must not claim the group routes through it.
-func TestURLTestPoolReportsASuspiciousPin(t *testing.T) {
+// A mark a failed dial left on the pinned member is not a reason to route
+// around the user's pick: the pin still carries the route, and the mark stays
+// on the member for the card.
+func TestURLTestPoolKeepsAPinOnASuspiciousMember(t *testing.T) {
 	a := newPoolOrderedProxy("a", true, 100)
 	b := newPoolOrderedProxy("b", true, 200)
 	pool := newPoolForTest(t, URLTestPoolOption{}, a, b)
@@ -174,9 +175,9 @@ func TestURLTestPoolReportsASuspiciousPin(t *testing.T) {
 
 	decoded := marshalGroupState(t, pool)
 	require.Equal(t, "b", decoded["fixed"])
-	require.Equal(t, false, decoded["fixedActive"])
-	require.Equal(t, NowReasonFixedSuspicious, decoded["nowReason"])
-	require.Equal(t, "a", decoded["now"])
+	require.Equal(t, true, decoded["fixedActive"])
+	require.Equal(t, NowReasonFixed, decoded["nowReason"])
+	require.Equal(t, "b", decoded["now"])
 }
 
 func marshalGroupState(t *testing.T, group C.ProxyAdapter) map[string]any {

@@ -4,16 +4,15 @@ package outboundgroup
 // are part of the REST contract: a host renders them as they are, and an
 // unknown value must render as is instead of breaking the group card.
 const (
-	// NowReasonFixed means the member the user pinned is alive and carries
-	// the group's traffic.
+	// NowReasonFixed means the group routes through the member the user
+	// pinned. The pin is a decision, not a health hint: it holds even when a
+	// check marks the member out of play, and the marks are reported on their
+	// own fields so a host can show the risk on the member.
 	NowReasonFixed = "fixed"
-	// NowReasonFixedUnavailable means a member is pinned, but it is not alive
-	// for the group's test URL (or has left the member list), so the group
-	// routes through another member.
+	// NowReasonFixedUnavailable means a member is pinned, but it has left the
+	// member list, so the group cannot dial it and routes through another
+	// member.
 	NowReasonFixedUnavailable = "fixed-unavailable"
-	// NowReasonFixedSuspicious means the pinned member is alive, but a failed
-	// dial or a silent data plane marked it out of play for now.
-	NowReasonFixedSuspicious = "fixed-suspicious"
 	// NowReasonTolerance means a faster member exists, but the group kept the
 	// current one because the gain is inside the tolerance band.
 	NowReasonTolerance = "tolerance"

@@ -1280,25 +1280,23 @@ func (u *URLTestPool) pickFastLocked(proxies []C.Proxy) (C.Proxy, bool, C.Proxy)
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
+	// A pin is the user's decision, not a health hint: the pool dials the
+	// pinned member even when it is not alive or a mark took it out of play.
+	// The marks still name the member and a probe still measures it, so the
+	// route returns to the pool's own choice only when the pin is cleared.
+	// `fixed-unavailable` is left for the pin whose member left the list: that
+	// one cannot be dialed at all.
 	fixedReason := ""
 	if u.selected != "" {
 		for _, proxy := range proxies {
 			if proxy.Name() != u.selected {
 				continue
 			}
-			if proxy.AliveForTestUrl(u.testUrl) {
-				if !u.isSuspiciousLocked(proxy.Name()) {
-					u.fastNode = proxy
-					u.fastReason = NowReasonFixed
-					return proxy, false, nil
-				}
-				fixedReason = NowReasonFixedSuspicious
-			}
-			break
+			u.fastNode = proxy
+			u.fastReason = NowReasonFixed
+			return proxy, false, nil
 		}
-		if fixedReason == "" {
-			fixedReason = NowReasonFixedUnavailable
-		}
+		fixedReason = NowReasonFixedUnavailable
 	}
 
 	candidates := u.poolProxiesLocked(proxies)
