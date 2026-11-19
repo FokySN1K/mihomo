@@ -2,6 +2,8 @@ package statistic
 
 import (
 	"os"
+	"sort"
+	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
@@ -19,6 +21,8 @@ func init() {
 		downloadBlip:  atomic.NewInt64(0),
 		uploadTotal:   atomic.NewInt64(0),
 		downloadTotal: atomic.NewInt64(0),
+		nodes:         make(map[string]*nodeCounter),
+		nodeProviders: make(map[string]string),
 		pid:           int32(os.Getpid()),
 	}
 
@@ -41,6 +45,13 @@ type Manager struct {
 	proxyDownloadTotal atomic.Int64
 	pid                int32
 	memory             uint64
+
+	// nodeMu guards the per-node counters and the provider names. The
+	// counters themselves are atomic: a busy dial phase closes many
+	// connections at once and every close adds its bytes.
+	nodeMu        sync.Mutex
+	nodes         map[string]*nodeCounter
+	nodeProviders map[string]string
 }
 
 func (m *Manager) Join(c Tracker) {
@@ -52,6 +63,85 @@ func (m *Manager) Join(c Tracker) {
 
 func (m *Manager) Leave(c Tracker) {
 	m.connections.Delete(c.ID())
+	m.attributeNode(c.Info())
+}
+
+// NodeUsage is the cumulative traffic one outbound node carried since the
+// process started, together with the provider the node came from. The SNKP
+// telemetry channel asks for this snapshot and turns the totals into deltas,
+// so the counters never reset on their own.
+type NodeUsage struct {
+	Name     string `json:"name"`
+	Provider string `json:"provider"`
+	Up       int64  `json:"up"`
+	Down     int64  `json:"down"`
+}
+
+type nodeCounter struct {
+	up   atomic.Int64
+	down atomic.Int64
+}
+
+// attributeNode adds a finished connection's bytes to the outbound node that
+// carried it. The chain holds the outbound first (Chain.Last()), and the
+// provider chain, when the config uses proxy providers, names the airport.
+// Direct traffic and nameless outbounds are not attributed: the share quota
+// already counts them through the plain traffic totals.
+func (m *Manager) attributeNode(info *TrackerInfo) {
+	if info == nil {
+		return
+	}
+	name := info.Chain.Last()
+	if name == "" || IsDirect(name) {
+		return
+	}
+	up, down := info.UploadTotal.Load(), info.DownloadTotal.Load()
+	if up == 0 && down == 0 {
+		return
+	}
+
+	m.nodeMu.Lock()
+	if m.nodes == nil {
+		m.nodes = make(map[string]*nodeCounter)
+		m.nodeProviders = make(map[string]string)
+	}
+	counter := m.nodes[name]
+	if counter == nil {
+		counter = &nodeCounter{}
+		m.nodes[name] = counter
+	}
+	if provider := info.ProviderChain.Last(); provider != "" {
+		m.nodeProviders[name] = provider
+	}
+	m.nodeMu.Unlock()
+
+	counter.up.Add(up)
+	counter.down.Add(down)
+}
+
+// NodeSnapshot returns the per-node traffic accumulated so far, the busiest
+// node first.
+func (m *Manager) NodeSnapshot() []NodeUsage {
+	m.nodeMu.Lock()
+	usages := make([]NodeUsage, 0, len(m.nodes))
+	for name, counter := range m.nodes {
+		usages = append(usages, NodeUsage{
+			Name:     name,
+			Provider: m.nodeProviders[name],
+			Up:       counter.up.Load(),
+			Down:     counter.down.Load(),
+		})
+	}
+	m.nodeMu.Unlock()
+
+	sort.Slice(usages, func(i, j int) bool {
+		left, right := usages[i].Up+usages[i].Down, usages[j].Up+usages[j].Down
+		if left != right {
+			return left > right
+		}
+		return usages[i].Name < usages[j].Name
+	})
+	return usages
 }
 
 func (m *Manager) Get(id string) (c Tracker) {

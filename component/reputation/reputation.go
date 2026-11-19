@@ -327,6 +327,48 @@ func (s *Store) Flush() {
 	s.backend.Save(entries, deletes)
 }
 
+// SnapshotEntry is one node's reliability as the telemetry channel reports
+// it: the decayed score plus the evidence behind it.
+type SnapshotEntry struct {
+	Name     string    `json:"name"`
+	Score    int       `json:"score"`
+	Fails    int       `json:"fails"`
+	Streak   int       `json:"streak"`
+	LastSeen time.Time `json:"last_seen"`
+}
+
+// Snapshot returns the current score of every node the store knows, worst
+// first, so a caller that reports only the unreliable part can cut the tail
+// without sorting again.
+func (s *Store) Snapshot() []SnapshotEntry {
+	if s == nil {
+		return nil
+	}
+
+	s.mu.Lock()
+	s.loadLocked()
+	now := time.Now()
+	entries := make([]SnapshotEntry, 0, len(s.entries))
+	for name, e := range s.entries {
+		entries = append(entries, SnapshotEntry{
+			Name:     name,
+			Score:    e.decayed(now),
+			Fails:    int(e.Fails),
+			Streak:   int(e.Streak),
+			LastSeen: e.LastSeen,
+		})
+	}
+	s.mu.Unlock()
+
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Score != entries[j].Score {
+			return entries[i].Score < entries[j].Score
+		}
+		return entries[i].Name < entries[j].Name
+	})
+	return entries
+}
+
 func (s *Store) entryLocked(name string) *entry {
 	e := s.entries[name]
 	if e == nil {
