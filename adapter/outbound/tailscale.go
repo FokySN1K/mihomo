@@ -166,7 +166,7 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 		ExtraRootCAs: ca.GetCertPool(),
 		LookupHook: func(ctx context.Context, host string) ([]netip.Addr, error) {
 			log.Debugln("[Tailscale](%s) LookupHook: start lookup %s", option.Name, host)
-			ips, err := resolver.LookupIPWithResolver(ctx, host, resolver.ProxyServerHostResolver)
+			ips, err := resolver.LookupIPWithResolver(ctx, host, resolver.ProxyServerHostResolver.Load())
 			log.Debugln("[Tailscale](%s) LookupHook: finish lookup %s, ips: %v, err: %v", option.Name, host, ips, err)
 			return ips, err
 		},

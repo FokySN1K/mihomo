@@ -158,7 +158,7 @@ func GetGeneral() *config.General {
 		Mode:         tunnel.Mode(),
 		UnifiedDelay: adapter.UnifiedDelay.Load(),
 		LogLevel:     log.Level(),
-		IPv6:         !resolver.DisableIPv6,
+		IPv6:         !resolver.DisableIPv6.Load(),
 		Interface:    dialer.DefaultInterface.Load(),
 		RoutingMark:  int(dialer.DefaultRoutingMark.Load()),
 		GeoXUrl: config.GeoXUrl{
@@ -252,11 +252,11 @@ func updateNTP(c *config.NTP) {
 
 func updateDNS(c *config.DNS, generalIPv6 bool) {
 	if !c.Enable {
-		resolver.DefaultResolver = nil
-		resolver.DefaultHostMapper = nil
-		resolver.DefaultService = nil
-		resolver.ProxyServerHostResolver = nil
-		resolver.DirectHostResolver = nil
+		resolver.DefaultResolver.Store(nil)
+		resolver.SetHostMapper(nil)
+		resolver.SetService(nil)
+		resolver.ProxyServerHostResolver.Store(nil)
+		resolver.DirectHostResolver.Store(nil)
 		dns.ReCreateServer("", nil, nil)
 		return
 	}
@@ -293,27 +293,27 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 	})
 
 	// reuse cache of old host mapper
-	if old := resolver.DefaultHostMapper; old != nil {
+	if old := resolver.HostMapper(); old != nil {
 		m.PatchFrom(old.(*dns.ResolverEnhancer))
 	}
 
 	s := dns.NewService(r, m)
 
-	resolver.DefaultResolver = r
-	resolver.DefaultHostMapper = m
-	resolver.DefaultService = s
-	resolver.UseSystemHosts = c.UseSystemHosts
+	resolver.DefaultResolver.Store(r)
+	resolver.SetHostMapper(m)
+	resolver.SetService(s)
+	resolver.UseSystemHosts.Store(c.UseSystemHosts)
 
 	if r.ProxyResolver.Invalid() {
-		resolver.ProxyServerHostResolver = r.ProxyResolver
+		resolver.ProxyServerHostResolver.Store(r.ProxyResolver)
 	} else {
-		resolver.ProxyServerHostResolver = r.Resolver
+		resolver.ProxyServerHostResolver.Store(r.Resolver)
 	}
 
 	if r.DirectResolver.Invalid() {
-		resolver.DirectHostResolver = r.DirectResolver
+		resolver.DirectHostResolver.Store(r.DirectResolver)
 	} else {
-		resolver.DirectHostResolver = r.Resolver
+		resolver.DirectHostResolver.Store(r.Resolver)
 	}
 
 	lc := inbound.NewListenConfig()
@@ -322,7 +322,8 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 }
 
 func updateHosts(tree *trie.DomainTrie[resolver.HostValue]) {
-	resolver.DefaultHosts = resolver.NewHosts(tree)
+	hosts := resolver.NewHosts(tree)
+	resolver.SetHosts(&hosts)
 }
 
 func updateProxies(proxies map[string]C.Proxy, providers map[string]P.ProxyProvider) {
@@ -434,7 +435,7 @@ func temporaryUpdateGeneral(general *config.General) func() {
 func updateGeneral(general *config.General, logging bool) {
 	tunnel.SetMode(general.Mode)
 	tunnel.SetFindProcessMode(general.FindProcessMode)
-	resolver.DisableIPv6 = !general.IPv6
+	resolver.DisableIPv6.Store(!general.IPv6)
 
 	dialer.SetTcpConcurrent(general.TCPConcurrent)
 	if logging && general.TCPConcurrent {

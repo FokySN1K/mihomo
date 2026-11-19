@@ -14,7 +14,7 @@ import (
 // of that, and mihomo calls them on its own, so they are left as they are.
 func ClearAll() {
 	var pending []*Resolver
-	for _, r := range []resolver.Resolver{resolver.DefaultResolver, resolver.SystemResolver} {
+	for _, r := range []resolver.Resolver{resolver.DefaultResolver.Load(), resolver.SystemResolver} {
 		if rs, ok := r.(Resolvers); ok {
 			pending = append(pending, rs.Resolver, rs.ProxyResolver, rs.DirectResolver)
 		}

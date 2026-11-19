@@ -20,7 +20,8 @@ func dnsRouter() http.Handler {
 }
 
 func queryDNS(w http.ResponseWriter, r *http.Request) {
-	if resolver.DefaultResolver == nil {
+	defaultResolver := resolver.DefaultResolver.Load()
+	if defaultResolver == nil {
 		render.Status(r, http.StatusInternalServerError)
 		render.JSON(w, r, newError("DNS section is disabled"))
 		return
@@ -41,7 +42,7 @@ func queryDNS(w http.ResponseWriter, r *http.Request) {
 
 	msg := dns.Msg{}
 	msg.SetQuestion(dns.Fqdn(name), qType)
-	resp, err := resolver.DefaultResolver.ExchangeContext(ctx, &msg)
+	resp, err := defaultResolver.ExchangeContext(ctx, &msg)
 	if err != nil {
 		render.Status(r, http.StatusInternalServerError)
 		render.JSON(w, r, newError(err.Error()))

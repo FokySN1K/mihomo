@@ -441,7 +441,7 @@ func (w *Masque) Close() error {
 func (w *Masque) dialContextL4(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
 	var conn net.Conn
 	if !metadata.Resolved() || w.resolver != nil {
-		r := resolver.DefaultResolver
+		r := resolver.DefaultResolver.Load()
 		if w.resolver != nil {
 			r = w.resolver
 		}
@@ -470,7 +470,7 @@ func (w *Masque) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Con
 		return nil, err
 	}
 	if !metadata.Resolved() || w.resolver != nil {
-		r := resolver.DefaultResolver
+		r := resolver.DefaultResolver.Load()
 		if w.resolver != nil {
 			r = w.resolver
 		}
@@ -514,7 +514,7 @@ func (w *Masque) ListenPacketContext(ctx context.Context, metadata *C.Metadata) 
 
 func (w *Masque) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
 	if (!metadata.Resolved() || w.resolver != nil) && metadata.Host != "" {
-		r := resolver.DefaultResolver
+		r := resolver.DefaultResolver.Load()
 		if w.resolver != nil {
 			r = w.resolver
 		}

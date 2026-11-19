@@ -8,6 +8,7 @@ import (
 	"strings"
 	_ "unsafe"
 
+	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/component/resolver/hosts"
 	"github.com/metacubex/mihomo/component/trie"
 	"github.com/metacubex/randv2"
@@ -15,7 +16,8 @@ import (
 
 var (
 	DisableSystemHosts, _ = strconv.ParseBool(os.Getenv("DISABLE_SYSTEM_HOSTS"))
-	UseSystemHosts        bool
+	// UseSystemHosts is written by an apply and read on every hosts search.
+	UseSystemHosts = atomic.NewBool(false)
 )
 
 type Hosts struct {
@@ -50,7 +52,7 @@ func (h *Hosts) Search(domain string, isDomain bool) (*HostValue, bool) {
 		return &hostValue, false
 	}
 
-	if !isDomain && !DisableSystemHosts && UseSystemHosts {
+	if !isDomain && !DisableSystemHosts && UseSystemHosts.Load() {
 		addr, _ := hosts.LookupStaticHost(domain)
 		if hostValue, err := NewHostValue(addr); err == nil {
 			return &hostValue, true

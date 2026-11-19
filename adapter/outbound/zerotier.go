@@ -1259,7 +1259,7 @@ func (z *ZeroTier) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.C
 	z.stateMu.RUnlock()
 	var conn net.Conn
 	if !metadata.Resolved() || remoteResolver != nil {
-		r := resolver.DefaultResolver
+		r := resolver.DefaultResolver.Load()
 		if remoteResolver != nil {
 			r = remoteResolver
 		}
@@ -1315,7 +1315,7 @@ func (z *ZeroTier) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
 	remoteResolver := z.resolver
 	z.stateMu.RUnlock()
 	if (!metadata.Resolved() || remoteResolver != nil) && metadata.Host != "" {
-		r := resolver.DefaultResolver
+		r := resolver.DefaultResolver.Load()
 		if remoteResolver != nil {
 			r = remoteResolver
 		}

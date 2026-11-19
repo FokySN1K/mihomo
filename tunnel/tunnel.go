@@ -50,6 +50,12 @@ var (
 	ruleProviders map[string]P.RuleProvider
 	configMux     sync.RWMutex
 
+	// activeRoute is what a connection resolves against: the rules an apply
+	// installed, the sub rules they name and the proxies they can pick. One
+	// apply publishes all three together, so a dial keeps one coherent view
+	// instead of reading a lock an apply holds while it waits for a dial.
+	activeRoute atomic.TypedValue[route]
+
 	// for compatibility, lazy init
 	tcpQueue  chan C.ConnContext
 	tcpInOnce sync.Once
@@ -57,7 +63,7 @@ var (
 	udpInOnce sync.Once
 
 	// Outbound Rule
-	mode = Rule
+	mode = atomic.NewInt32Enum(Rule)
 
 	// default timeout for UDP session
 	udpTimeout = 60 * time.Second
@@ -72,11 +78,20 @@ var (
 
 	findProcessMode = atomic.NewInt32Enum(process.FindProcessStrict)
 
-	snifferDispatcher *sniffer.Dispatcher
-	sniffingEnable    = false
+	// sniffingEnable decides whether a connection is sniffed; the dispatcher
+	// that does it is swapped by an apply, so both live behind atomics.
+	snifferDispatcher atomic.TypedValue[*sniffer.Dispatcher]
+	sniffingEnable    atomic.Bool
 
 	ruleUpdateCallback = utils.NewCallback[P.RuleProvider]()
 )
+
+// route is one apply's view of what a connection may match and reach.
+type route struct {
+	rules    []C.Rule
+	subRules map[string][]C.Rule
+	proxies  map[string]C.Proxy
+}
 
 type tunnel struct{}
 
@@ -125,7 +140,7 @@ func (t tunnel) NatTable() C.NatTable {
 }
 
 func (t tunnel) Proxies() map[string]C.Proxy {
-	return proxies
+	return Proxies()
 }
 
 func (t tunnel) Providers() map[string]P.ProxyProvider {
@@ -157,15 +172,13 @@ func Status() TunnelStatus {
 }
 
 func SetSniffing(b bool) {
-	if snifferDispatcher.Enable() {
-		configMux.Lock()
-		sniffingEnable = b
-		configMux.Unlock()
+	if dispatcher := snifferDispatcher.Load(); dispatcher != nil && dispatcher.Enable() {
+		sniffingEnable.Store(b)
 	}
 }
 
 func IsSniffing() bool {
-	return sniffingEnable
+	return sniffingEnable.Load()
 }
 
 // TCPIn return fan-in queue
@@ -203,7 +216,7 @@ func NatTable() C.NatTable {
 
 // Rules return all rules
 func Rules() []C.Rule {
-	return rules
+	return activeRoute.Load().rules
 }
 
 func Listeners() map[string]C.InboundListener {
@@ -216,12 +229,19 @@ func UpdateRules(newRules []C.Rule, newSubRule map[string][]C.Rule, rp map[strin
 	rules = newRules
 	ruleProviders = rp
 	subRules = newSubRule
+	publishRoute()
 	configMux.Unlock()
 }
 
 // Proxies return all proxies
 func Proxies() map[string]C.Proxy {
-	return proxies
+	return activeRoute.Load().proxies
+}
+
+// publishRoute installs the view a connection resolves against. The caller
+// holds configMux, so the three pieces come from one apply.
+func publishRoute() {
+	activeRoute.Store(route{rules: rules, subRules: subRules, proxies: proxies})
 }
 
 // Providers return all compatible providers
@@ -244,6 +264,7 @@ func UpdateProxies(newProxies map[string]C.Proxy, newProviders map[string]P.Prox
 	// (an inline or fallback payload) are complete here; a provider that loads
 	// after the apply reports the change itself.
 	publishDirectNames(newProxies, newProviders)
+	publishRoute()
 	configMux.Unlock()
 }
 
@@ -254,20 +275,22 @@ func UpdateListeners(newListeners map[string]C.InboundListener) {
 }
 
 func UpdateSniffer(dispatcher *sniffer.Dispatcher) {
-	configMux.Lock()
-	snifferDispatcher = dispatcher
-	sniffingEnable = dispatcher.Enable()
-	configMux.Unlock()
+	snifferDispatcher.Store(dispatcher)
+	if dispatcher == nil {
+		sniffingEnable.Store(false)
+		return
+	}
+	sniffingEnable.Store(dispatcher.Enable())
 }
 
 // Mode return current mode
 func Mode() TunnelMode {
-	return mode
+	return mode.Load()
 }
 
 // SetMode change the mode of tunnel
 func SetMode(m TunnelMode) {
-	mode = m
+	mode.Store(m)
 }
 
 func FindProcessMode() process.FindProcessMode {
@@ -310,7 +333,7 @@ func preHandleMetadata(metadata *C.Metadata) error {
 				// only clear dstIP if it is confirmed to be a fake IP
 				metadata.DstIP = netip.Addr{}
 				metadata.DNSMode = C.DNSFakeIP
-			} else if node, ok := resolver.DefaultHosts.Search(host, false); ok {
+			} else if node, ok := resolver.SearchHosts(host, false); ok {
 				// redir-host should lookup the hosts
 				metadata.DstIP, _ = node.RandIP()
 			} else if node != nil && node.IsDomain {
@@ -319,7 +342,7 @@ func preHandleMetadata(metadata *C.Metadata) error {
 		} else if resolver.IsFakeIP(metadata.DstIP) {
 			return fmt.Errorf("fake DNS record %s missing", metadata.DstIP)
 		}
-	} else if node, ok := resolver.DefaultHosts.Search(metadata.Host, true); ok {
+	} else if node, ok := resolver.SearchHosts(metadata.Host, true); ok {
 		// try use domain mapping
 		metadata.Host = node.Domain
 	}
@@ -328,9 +351,12 @@ func preHandleMetadata(metadata *C.Metadata) error {
 }
 
 func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err error) {
+	// One snapshot for the whole decision: a rule that names a proxy and the
+	// proxy itself come from the same apply even if another one lands now.
+	snapshot := activeRoute.Load()
 	if metadata.SpecialProxy != "" {
 		var exist bool
-		proxy, exist = proxies[metadata.SpecialProxy]
+		proxy, exist = snapshot.proxies[metadata.SpecialProxy]
 		if !exist {
 			err = fmt.Errorf("proxy %s not found", metadata.SpecialProxy)
 		}
@@ -341,7 +367,7 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 		attemptProcessLookup = metadata.Type != C.INNER
 	)
 
-	if node, ok := resolver.DefaultHosts.Search(metadata.Host, false); ok {
+	if node, ok := resolver.SearchHosts(metadata.Host, false); ok {
 		metadata.DstIP, _ = node.RandIP()
 		resolved = true
 	}
@@ -390,7 +416,7 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 			}
 		},
 		CheckPassRule: func(adapterName string) bool {
-			adapter, ok := proxies[adapterName]
+			adapter, ok := snapshot.proxies[adapterName]
 			if !ok {
 				return false
 			}
@@ -411,14 +437,14 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 		helper.FindProcess = nil
 	}
 
-	switch mode {
+	switch Mode() {
 	case Direct:
-		proxy = proxies["DIRECT"]
+		proxy = snapshot.proxies["DIRECT"]
 	case Global:
-		proxy = proxies["GLOBAL"]
+		proxy = snapshot.proxies["GLOBAL"]
 	// Rule
 	default:
-		proxy, rule, err = match(metadata, helper)
+		proxy, rule, err = match(snapshot, metadata, helper)
 	}
 	return
 }
@@ -453,8 +479,10 @@ func handleUDPConn(packet C.PacketAdapter) {
 	key := packet.Key()
 	sender, loaded := natTable.GetOrCreate(key, func() C.PacketSender {
 		sender := newPacketSender()
-		if sniffingEnable && snifferDispatcher.Enable() {
-			return snifferDispatcher.UDPSniff(packet, sender)
+		if sniffingEnable.Load() {
+			if dispatcher := snifferDispatcher.Load(); dispatcher != nil && dispatcher.Enable() {
+				return dispatcher.UDPSniff(packet, sender)
+			}
 		}
 		return sender
 	})
@@ -538,12 +566,14 @@ func handleTCPConn(connCtx C.ConnContext) {
 
 	conn := connCtx.Conn()
 	conn.ResetPeeked() // reset before sniffer
-	if sniffingEnable && snifferDispatcher.Enable() {
-		// Try to sniff a domain when `preHandleMetadata` failed, this is usually
-		// caused by a "Fake DNS record missing" error when enhanced-mode is fake-ip.
-		if snifferDispatcher.TCPSniff(conn, metadata) {
-			// we now have a domain name
-			preHandleFailed = false
+	if sniffingEnable.Load() {
+		if dispatcher := snifferDispatcher.Load(); dispatcher != nil && dispatcher.Enable() {
+			// Try to sniff a domain when `preHandleMetadata` failed, this is usually
+			// caused by a "Fake DNS record missing" error when enhanced-mode is fake-ip.
+			if dispatcher.TCPSniff(conn, metadata) {
+				// we now have a domain name
+				preHandleFailed = false
+			}
 		}
 	}
 
@@ -573,7 +603,7 @@ func handleTCPConn(connCtx C.ConnContext) {
 
 	dialMetadata := metadata
 	if len(metadata.Host) > 0 {
-		if node, ok := resolver.DefaultHosts.Search(metadata.Host, false); ok {
+		if node, ok := resolver.SearchHosts(metadata.Host, false); ok {
 			if dstIp, _ := node.RandIP(); !resolver.IsFakeIP(dstIp) {
 				dialMetadata.DstIP = dstIp
 				dialMetadata.DNSMode = C.DNSHosts
@@ -648,6 +678,7 @@ func logMetadataErr(metadata *C.Metadata, rule C.Rule, proxy C.ProxyAdapter, err
 }
 
 func logMetadata(metadata *C.Metadata, rule C.Rule, remoteConn C.Connection) {
+	currentMode := Mode()
 	switch {
 	case metadata.SpecialProxy != "":
 		log.Infoln("[%s] %s --> %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), remoteConn.Chains().String())
@@ -657,27 +688,24 @@ func logMetadata(metadata *C.Metadata, rule C.Rule, remoteConn C.Connection) {
 		} else {
 			log.Infoln("[%s] %s --> %s match %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), rule.RuleType().String(), remoteConn.Chains().String())
 		}
-	case mode == Global:
+	case currentMode == Global:
 		log.Infoln("[%s] %s --> %s using GLOBAL", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress())
-	case mode == Direct:
+	case currentMode == Direct:
 		log.Infoln("[%s] %s --> %s using DIRECT", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress())
 	default:
 		log.Infoln("[%s] %s --> %s doesn't match any rule using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), remoteConn.Chains().String())
 	}
 }
 
-func match(metadata *C.Metadata, helper C.RuleMatchHelper) (C.Proxy, C.Rule, error) {
-	configMux.RLock()
-	defer configMux.RUnlock()
-
+func match(snapshot route, metadata *C.Metadata, helper C.RuleMatchHelper) (C.Proxy, C.Rule, error) {
 	var rematchChain []string
 	for {
 		var rematchProxy C.Proxy
 		var rematchRule C.Rule
 	GetRules:
-		for _, rule := range getRules(metadata) {
+		for _, rule := range getRules(snapshot, metadata) {
 			if matched, ada := rule.Match(metadata, helper); matched {
-				adapter, ok := proxies[ada]
+				adapter, ok := snapshot.proxies[ada]
 				if !ok {
 					continue
 				}
@@ -721,17 +749,17 @@ func match(metadata *C.Metadata, helper C.RuleMatchHelper) (C.Proxy, C.Rule, err
 			log.Debugln("[Rule] rematch proxy %s update metadata to rematch-name=%q sub-rule=%q", rematchProxy.Name(), metadata.InName, metadata.SpecialRules)
 			continue
 		}
-		return proxies["DIRECT"], nil, nil
+		return snapshot.proxies["DIRECT"], nil, nil
 	}
 }
 
-func getRules(metadata *C.Metadata) []C.Rule {
-	if sr, ok := subRules[metadata.SpecialRules]; ok {
+func getRules(snapshot route, metadata *C.Metadata) []C.Rule {
+	if sr, ok := snapshot.subRules[metadata.SpecialRules]; ok {
 		log.Debugln("[Rule] use %s rules", metadata.SpecialRules)
 		return sr
 	} else {
 		log.Debugln("[Rule] use default rules")
-		return rules
+		return snapshot.rules
 	}
 }
 

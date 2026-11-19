@@ -236,9 +236,9 @@ func TestAnswersThatSkipTheResolverAreNotRecorded(t *testing.T) {
 
 func useDefaultResolver(t *testing.T, rs Resolvers) {
 	t.Helper()
-	previous := resolver.DefaultResolver
-	resolver.DefaultResolver = rs
-	t.Cleanup(func() { resolver.DefaultResolver = previous })
+	previous := resolver.DefaultResolver.Load()
+	resolver.DefaultResolver.Store(rs)
+	t.Cleanup(func() { resolver.DefaultResolver.Store(previous) })
 }
 
 func TestClearAllDropsEveryCachedAnswer(t *testing.T) {
