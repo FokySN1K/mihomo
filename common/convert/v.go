@@ -79,6 +79,13 @@ func handleVShareLink(names map[string]int, url *url.URL, scheme string, proxy m
 	} else if network == "http" {
 		network = "h2"
 	}
+	// An HTTPUpgrade link is a WebSocket transport whose upgrade is carried by
+	// an HTTP request: the adapters know it as `network: ws` plus the upgrade
+	// flag, so the emitted network must not keep a value they do not handle.
+	httpUpgrade := network == "httpupgrade"
+	if httpUpgrade {
+		network = "ws"
+	}
 	proxy["network"] = network
 	switch network {
 	case "tcp":
@@ -112,25 +119,27 @@ func handleVShareLink(names map[string]int, url *url.URL, scheme string, proxy m
 		}
 		proxy["h2-opts"] = h2Opts
 
-	case "ws", "httpupgrade":
+	case "ws":
 		headers := make(map[string]any)
 		wsOpts := make(map[string]any)
 		headers["User-Agent"] = RandUserAgent()
 		headers["Host"] = query.Get("host")
 		wsOpts["path"] = query.Get("path")
 		wsOpts["headers"] = headers
+		if httpUpgrade {
+			wsOpts["v2ray-http-upgrade"] = true
+		}
 
 		if earlyData := query.Get("ed"); earlyData != "" {
 			med, err := strconv.Atoi(earlyData)
 			if err != nil {
 				return fmt.Errorf("bad WebSocket max early data size: %v", err)
 			}
-			switch network {
-			case "ws":
+			if httpUpgrade {
+				wsOpts["v2ray-http-upgrade-fast-open"] = true
+			} else {
 				wsOpts["max-early-data"] = med
 				wsOpts["early-data-header-name"] = "Sec-WebSocket-Protocol"
-			case "httpupgrade":
-				wsOpts["v2ray-http-upgrade-fast-open"] = true
 			}
 		}
 		if earlyDataHeader := query.Get("eh"); earlyDataHeader != "" {

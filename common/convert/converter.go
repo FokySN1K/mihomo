@@ -185,6 +185,14 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 			}
 
 			network := strings.ToLower(query.Get("type"))
+			// An HTTPUpgrade link is a WebSocket transport whose upgrade is
+			// carried by an HTTP request: the adapter knows it as `network: ws`
+			// plus the upgrade flag, so the emitted network must not keep a
+			// value it does not handle.
+			httpUpgrade := network == "httpupgrade"
+			if httpUpgrade {
+				network = "ws"
+			}
 			if network != "" {
 				trojan["network"] = network
 			}
@@ -195,9 +203,18 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 				wsOpts := make(map[string]any)
 
 				headers["User-Agent"] = RandUserAgent()
+				if host := query.Get("host"); host != "" {
+					headers["Host"] = host
+				}
 
 				wsOpts["path"] = query.Get("path")
 				wsOpts["headers"] = headers
+				if httpUpgrade {
+					wsOpts["v2ray-http-upgrade"] = true
+					if query.Get("ed") != "" {
+						wsOpts["v2ray-http-upgrade-fast-open"] = true
+					}
+				}
 
 				trojan["ws-opts"] = wsOpts
 
@@ -312,12 +329,19 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 			}
 
 			network, ok := values["net"].(string)
+			httpUpgrade := false
 			if ok {
 				network = strings.ToLower(network)
 				if values["type"] == "http" {
 					network = "http"
 				} else if network == "http" {
 					network = "h2"
+				}
+				// The adapter knows HTTPUpgrade as `network: ws` plus the
+				// upgrade flag, not as a network of its own.
+				httpUpgrade = network == "httpupgrade"
+				if httpUpgrade {
+					network = "ws"
 				}
 				vmess["network"] = network
 			}
@@ -359,7 +383,7 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 				}
 				vmess["h2-opts"] = h2Opts
 
-			case "ws", "httpupgrade":
+			case "ws":
 				headers := make(map[string]any)
 				wsOpts := make(map[string]any)
 				wsOpts["path"] = "/"
@@ -374,12 +398,11 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 						if earlyData := query.Get("ed"); earlyData != "" {
 							med, err := strconv.Atoi(earlyData)
 							if err == nil {
-								switch network {
-								case "ws":
+								if httpUpgrade {
+									wsOpts["v2ray-http-upgrade-fast-open"] = true
+								} else {
 									wsOpts["max-early-data"] = med
 									wsOpts["early-data-header-name"] = "Sec-WebSocket-Protocol"
-								case "httpupgrade":
-									wsOpts["v2ray-http-upgrade-fast-open"] = true
 								}
 								query.Del("ed")
 								pathURL.RawQuery = query.Encode()
@@ -391,6 +414,9 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 						}
 					}
 					wsOpts["path"] = path
+				}
+				if httpUpgrade {
+					wsOpts["v2ray-http-upgrade"] = true
 				}
 				wsOpts["headers"] = headers
 				vmess["ws-opts"] = wsOpts

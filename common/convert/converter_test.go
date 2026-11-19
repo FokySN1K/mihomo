@@ -360,3 +360,87 @@ func TestConvertsV2RayVmessBase64HTTPRemappedToH2Transport(t *testing.T) {
 	_, err = adapter.ParseProxy(proxies[0])
 	assert.NoError(t, err)
 }
+
+// An HTTPUpgrade share link names a transport the adapters do not know by
+// that name: they carry it as `network: ws` with `ws-opts.v2ray-http-upgrade`.
+// The converter must emit that pair for every protocol link that can carry it.
+func TestConvertsV2RayHTTPUpgradeTransport(t *testing.T) {
+	tests := []struct {
+		name    string
+		link    string
+		wantTyp string
+	}{
+		{
+			name:    "vless",
+			link:    "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?encryption=none&security=tls&type=httpupgrade&host=cdn.example.com&path=%2Fup#vless-up",
+			wantTyp: "vless",
+		},
+		{
+			name:    "vmess-aead",
+			link:    "vmess://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?encryption=none&security=tls&type=httpupgrade&host=cdn.example.com&path=%2Fup#vmess-up",
+			wantTyp: "vmess",
+		},
+		{
+			// base64 payload decodes to:
+			// {"v":"2","ps":"httpupgrade-demo","add":"server.example.com","port":"443",
+			//  "id":"b831381d-6324-4d53-ad4f-8cda48b30811","aid":"0","scy":"auto",
+			//  "net":"httpupgrade","type":"none","host":"cdn.example.com","path":"/up","tls":"tls"}
+			name:    "vmess-base64",
+			link:    "vmess://eyJ2IjoiMiIsInBzIjoiaHR0cHVwZ3JhZGUtZGVtbyIsImFkZCI6InNlcnZlci5leGFtcGxlLmNvbSIsInBvcnQiOiI0NDMiLCJpZCI6ImI4MzEzODFkLTYzMjQtNGQ1My1hZDRmLThjZGE0OGIzMDgxMSIsImFpZCI6IjAiLCJzY3kiOiJhdXRvIiwibmV0IjoiaHR0cHVwZ3JhZGUiLCJ0eXBlIjoibm9uZSIsImhvc3QiOiJjZG4uZXhhbXBsZS5jb20iLCJwYXRoIjoiL3VwIiwidGxzIjoidGxzIn0=",
+			wantTyp: "vmess",
+		},
+		{
+			name:    "trojan",
+			link:    "trojan://password@example.com:443?type=httpupgrade&host=cdn.example.com&path=%2Fup&sni=cdn.example.com#trojan-up",
+			wantTyp: "trojan",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proxies, err := ConvertsV2Ray([]byte(tt.link))
+			if !assert.NoError(t, err) || !assert.Len(t, proxies, 1) {
+				return
+			}
+			proxy := proxies[0]
+			assert.Equal(t, tt.wantTyp, proxy["type"])
+			assert.Equal(t, "ws", proxy["network"], "the adapters do not know an httpupgrade network")
+
+			wsOpts, ok := proxy["ws-opts"].(map[string]any)
+			if !assert.True(t, ok, "ws-opts must be emitted for an HTTPUpgrade link") {
+				return
+			}
+			assert.Equal(t, true, wsOpts["v2ray-http-upgrade"])
+			assert.Equal(t, "/up", wsOpts["path"])
+			headers, ok := wsOpts["headers"].(map[string]any)
+			if assert.True(t, ok, "ws-opts must carry the Host header") {
+				assert.Equal(t, "cdn.example.com", headers["Host"])
+			}
+
+			_, err = adapter.ParseProxy(proxy)
+			assert.NoError(t, err)
+		})
+	}
+}
+
+// The early-data request of an HTTPUpgrade link turns on the fast open of the
+// upgrade, not the WebSocket early data fields a plain ws link sets.
+func TestConvertsV2RayHTTPUpgradeEarlyData(t *testing.T) {
+	link := "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?encryption=none&security=tls&type=httpupgrade&host=cdn.example.com&path=%2Fup&ed=2048#vless-up-ed"
+
+	proxies, err := ConvertsV2Ray([]byte(link))
+
+	if !assert.NoError(t, err) || !assert.Len(t, proxies, 1) {
+		return
+	}
+	wsOpts, ok := proxies[0]["ws-opts"].(map[string]any)
+	if !assert.True(t, ok) {
+		return
+	}
+	assert.Equal(t, true, wsOpts["v2ray-http-upgrade"])
+	assert.Equal(t, true, wsOpts["v2ray-http-upgrade-fast-open"])
+	assert.NotContains(t, wsOpts, "max-early-data")
+
+	_, err = adapter.ParseProxy(proxies[0])
+	assert.NoError(t, err)
+}
