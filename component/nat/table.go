@@ -27,6 +27,15 @@ func (t *Table) GetOrCreate(key string, maker func() C.PacketSender) (C.PacketSe
 	return item.PacketSender, loaded
 }
 
+// Load returns the sender of an existing flow without creating one.
+func (t *Table) Load(key string) (C.PacketSender, bool) {
+	entry, exist := t.mapping.Load(key)
+	if !exist {
+		return nil, false
+	}
+	return entry.PacketSender, true
+}
+
 func (t *Table) Delete(key string) {
 	t.mapping.Delete(key)
 }

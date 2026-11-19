@@ -57,6 +57,13 @@ func (p *Pool) Lookup(host string) netip.Addr {
 
 // LookBack return host with the fake ip
 func (p *Pool) LookBack(ip netip.Addr) (string, bool) {
+	// An address outside the pool can not be mapped: answering that from the
+	// prefix keeps a packet to a real destination, the common case, free of
+	// the lock.
+	if !p.ipnet.Contains(ip) {
+		return "", false
+	}
+
 	p.mux.Lock()
 	defer p.mux.Unlock()
 
@@ -65,6 +72,10 @@ func (p *Pool) LookBack(ip netip.Addr) (string, bool) {
 
 // Exist returns if given ip exists in fake-ip pool
 func (p *Pool) Exist(ip netip.Addr) bool {
+	if !p.ipnet.Contains(ip) {
+		return false
+	}
+
 	p.mux.Lock()
 	defer p.mux.Unlock()
 

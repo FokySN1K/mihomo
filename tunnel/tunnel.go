@@ -312,6 +312,11 @@ func fixMetadata(metadata *C.Metadata) {
 	// first unmap dstIP
 	metadata.DstIP = metadata.DstIP.Unmap()
 	// handle IP string on host
+	if metadata.Host == "" {
+		// Every packet with a resolved destination lands here, and parsing
+		// the empty string would build an error for nothing.
+		return
+	}
 	if ip, err := netip.ParseAddr(metadata.Host); err == nil {
 		metadata.DstIP = ip.Unmap()
 		metadata.Host = ""
@@ -470,13 +475,21 @@ func handleUDPConn(packet C.PacketAdapter) {
 	}
 	fixMetadata(metadata) // fix some metadata not set via metadata.SetRemoteAddr or metadata.SetRemoteAddress
 
+	// An established flow already resolved its route when it was created, so
+	// the packet only has to reach its sender. Skipping the pre-check and the
+	// metadata copy here keeps the per-packet cost to one map lookup.
+	key := packet.Key()
+	if sender, ok := natTable.Load(key); ok {
+		sender.Send(packet) // nonblocking
+		return
+	}
+
 	if err := preHandleMetadata(metadata.Clone()); err != nil { // precheck without modify metadata
 		packet.Drop()
 		log.Debugln("[Metadata PreHandle] error: %s", err)
 		return
 	}
 
-	key := packet.Key()
 	sender, loaded := natTable.GetOrCreate(key, func() C.PacketSender {
 		sender := newPacketSender()
 		if sniffingEnable.Load() {
@@ -487,58 +500,63 @@ func handleUDPConn(packet C.PacketAdapter) {
 		return sender
 	})
 	if !loaded {
-		dial := func() (C.PacketConn, C.WriteBackProxy, error) {
-			originMetadata := metadata  // save origin metadata
-			metadata = metadata.Clone() // don't modify PacketAdapter's metadata
+		startUDPDial(key, metadata, packet, sender)
+	}
+	sender.Send(packet) // nonblocking
+}
 
-			if err := sender.DoSniff(metadata); err != nil {
+// startUDPDial opens the packet connection of a new flow and starts the loop
+// that forwards its replies. It lives outside handleUDPConn so that the
+// per-packet fast path keeps no reference to the metadata, which would force
+// the variable to the heap on every packet.
+func startUDPDial(key string, originMetadata *C.Metadata, packet C.PacketAdapter, sender C.PacketSender) {
+	dialMetadata := originMetadata.Clone() // don't modify PacketAdapter's metadata
+
+	go func() {
+		pc, writeBackProxy, err := func() (C.PacketConn, C.WriteBackProxy, error) {
+			if err := sender.DoSniff(dialMetadata); err != nil {
 				log.Warnln("[UDP] DoSniff error: %s", err.Error())
 				return nil, nil, err
 			}
 
-			_ = preHandleMetadata(metadata) // error was pre-checked
+			_ = preHandleMetadata(dialMetadata) // error was pre-checked
 
-			proxy, rule, err := resolveMetadata(metadata)
+			proxy, rule, err := resolveMetadata(dialMetadata)
 			if err != nil {
 				log.Warnln("[UDP] Parse metadata failed: %s", err.Error())
 				return nil, nil, err
 			}
 
-			dialMetadata := metadata.Pure()
+			pureMetadata := dialMetadata.Pure()
 			timeout, retries := dialTimeout, dialRetryLimit
 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
 			rawPc, err := retry(ctx, retries, func(ctx context.Context) (C.PacketConn, error) {
-				return proxy.ListenPacketContext(ctx, dialMetadata)
+				return proxy.ListenPacketContext(ctx, pureMetadata)
 			}, func(err error) {
-				logMetadataErr(metadata, rule, proxy, err)
+				logMetadataErr(dialMetadata, rule, proxy, err)
 			})
 			if err != nil {
 				return nil, nil, err
 			}
-			logMetadata(metadata, rule, rawPc)
+			logMetadata(dialMetadata, rule, rawPc)
 
-			pc := statistic.NewUDPTracker(rawPc, statistic.DefaultManager, metadata, rule, 0, 0, true)
+			pc := statistic.NewUDPTracker(rawPc, statistic.DefaultManager, dialMetadata, rule, 0, 0, true)
 
-			sender.AddMapping(originMetadata, dialMetadata)
-			oAddrPort := dialMetadata.AddrPort()
+			sender.AddMapping(originMetadata, pureMetadata)
+			oAddrPort := pureMetadata.AddrPort()
 			writeBackProxy := nat.NewWriteBackProxy(packet)
 
 			go handleUDPToLocal(writeBackProxy, pc, sender, key, oAddrPort)
 			return pc, writeBackProxy, nil
-		}
-
-		go func() {
-			pc, proxy, err := dial()
-			if err != nil {
-				sender.Close()
-				natTable.Delete(key)
-				return
-			}
-			sender.Process(pc, proxy)
 		}()
-	}
-	sender.Send(packet) // nonblocking
+		if err != nil {
+			sender.Close()
+			natTable.Delete(key)
+			return
+		}
+		sender.Process(pc, writeBackProxy)
+	}()
 }
 
 func handleTCPConn(connCtx C.ConnContext) {
