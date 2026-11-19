@@ -291,6 +291,73 @@ func TestURLTestPoolFallsBackToLastGood(t *testing.T) {
 	require.Equal(t, "b", proxy.Name(), "an exhausted pool must dial the last known good proxy")
 }
 
+// A pin the pool measured dead must not blackhole the route while the pool
+// still has a live member: the dial moves to that member, the pin stays in
+// `fixed` and the group says why it is skipped. The route returns to the pin
+// as soon as the member answers again.
+func TestURLTestPoolPinnedDeadMemberYieldsToThePool(t *testing.T) {
+	log := &dialLog{}
+	pinned := newPoolDeadProxy("pinned")
+	other := newPoolSucceedingProxy("other", log)
+	pool := newPoolForTest(t, URLTestPoolOption{}, pinned, other)
+	pool.ForceSet("pinned")
+
+	_, err := pinned.URLTest(context.Background(), pool.testUrl, pool.expectedRanges)
+	require.Error(t, err, "the fixture must measure the pinned member dead")
+
+	conn, err := pool.DialContext(context.Background(), &C.Metadata{})
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+	require.Equal(t, []string{"other"}, log.list(), "a dead pin must yield to the live pool")
+	require.Equal(t, "other", pool.Now())
+	require.Equal(t, NowReasonFixedSuspicious, pool.currentFastReason())
+
+	var state struct {
+		Fixed       string `json:"fixed"`
+		FixedActive bool   `json:"fixedActive"`
+		NowReason   string `json:"nowReason"`
+	}
+	data, err := pool.MarshalJSON()
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(data, &state))
+	require.Equal(t, "pinned", state.Fixed, "the pin must survive the skip")
+	require.False(t, state.FixedActive)
+	require.Equal(t, NowReasonFixedSuspicious, state.NowReason)
+}
+
+// A pin that answers stays the user's route even while the pool holds other
+// members: the skip exists for a dead pin, not for every risk on a live one.
+func TestURLTestPoolPinnedLiveMemberKeepsTheRoute(t *testing.T) {
+	log := &dialLog{}
+	pinned := newPoolSucceedingProxy("pinned", log)
+	other := newPoolSucceedingProxy("other", log)
+	pool := newPoolForTest(t, URLTestPoolOption{}, pinned, other)
+	pool.ForceSet("pinned")
+
+	conn, err := pool.DialContext(context.Background(), &C.Metadata{})
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+	require.Equal(t, []string{"pinned"}, log.list())
+	require.Equal(t, NowReasonFixed, pool.currentFastReason())
+}
+
+// When nothing in the pool answers, the pin is still the least blind choice:
+// the skip must not turn a pin into an empty group.
+func TestURLTestPoolPinnedDeadMemberHoldsWhenNothingIsAlive(t *testing.T) {
+	pinned := newPoolDeadProxy("pinned")
+	other := newPoolDeadProxy("other")
+	pool := newPoolForTest(t, URLTestPoolOption{}, pinned, other)
+	pool.ForceSet("pinned")
+
+	for _, proxy := range []C.Proxy{pinned, other} {
+		_, err := proxy.URLTest(context.Background(), pool.testUrl, pool.expectedRanges)
+		require.Error(t, err)
+	}
+
+	require.Equal(t, "pinned", pool.Now(), "a pool with nothing alive must keep the pin")
+	require.Equal(t, NowReasonFixed, pool.currentFastReason())
+}
+
 func TestURLTestPoolRecoverySkipsWithoutTime(t *testing.T) {
 	pool, err := NewURLTestPool(GroupCommonOption{Name: "pool"}, URLTestPoolOption{}, newPoolEmptyFallback(), nil)
 	require.NoError(t, err)

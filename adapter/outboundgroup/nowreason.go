@@ -5,10 +5,16 @@ package outboundgroup
 // unknown value must render as is instead of breaking the group card.
 const (
 	// NowReasonFixed means the group routes through the member the user
-	// pinned. The pin is a decision, not a health hint: it holds even when a
-	// check marks the member out of play, and the marks are reported on their
-	// own fields so a host can show the risk on the member.
+	// pinned. The pin is a decision, not a health hint: while the member is
+	// not measured dead the group keeps dialing it, and the marks are reported
+	// on their own fields so a host can show the risk on the member.
 	NowReasonFixed = "fixed"
+	// NowReasonFixedSuspicious means a member is pinned, but it is measured
+	// dead or carries a mark that took it out of play while the pool still has
+	// a live member to route through. The pin stays in `fixed`, so a host can
+	// say the route does not follow it and why; the route returns to the pin
+	// as soon as the member answers again.
+	NowReasonFixedSuspicious = "fixed-suspicious"
 	// NowReasonFixedUnavailable means a member is pinned, but it has left the
 	// member list, so the group cannot dial it and routes through another
 	// member.

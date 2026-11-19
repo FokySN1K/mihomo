@@ -958,7 +958,7 @@ func (u *URLTestPool) hasUsableNode(proxies []C.Proxy) bool {
 		if _, marked := marks[proxy.Name()]; marked {
 			continue
 		}
-		if selected != "" && proxy.Name() == selected {
+		if selected != "" && proxy.Name() == selected && proxy.AliveForTestUrl(u.testUrl) {
 			return true
 		}
 		if proxy.LastDelayForTestUrl(u.testUrl) != measuredURLDelay {
@@ -1280,21 +1280,44 @@ func (u *URLTestPool) pickFastLocked(proxies []C.Proxy) (C.Proxy, bool, C.Proxy)
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
-	// A pin is the user's decision, not a health hint: the pool dials the
-	// pinned member even when it is not alive or a mark took it out of play.
-	// The marks still name the member and a probe still measures it, so the
-	// route returns to the pool's own choice only when the pin is cleared.
-	// `fixed-unavailable` is left for the pin whose member left the list: that
-	// one cannot be dialed at all.
+	// A pin is the user's decision, not a health hint: while the pinned member
+	// is not measured dead the pool dials it even when a mark names a risk.
+	// A pin that IS measured dead (or marked out of play) yields to a live pool
+	// member instead of blackholing the route: `fixed` keeps the pick and
+	// `fixedActive` turns false with the `fixed-suspicious` reason, so a host
+	// can say the pin is skipped and why. The route returns to the pin as soon
+	// as the member answers again. `fixed-unavailable` is left for the pin whose
+	// member left the list: that one cannot be dialed at all.
 	fixedReason := ""
 	if u.selected != "" {
+		var pinned C.Proxy
 		for _, proxy := range proxies {
-			if proxy.Name() != u.selected {
-				continue
+			if proxy.Name() == u.selected {
+				pinned = proxy
+				break
 			}
-			u.fastNode = proxy
+		}
+		if pinned != nil {
+			if pinned.AliveForTestUrl(u.testUrl) && !u.isSuspiciousLocked(pinned.Name()) {
+				u.fastNode = pinned
+				u.fastReason = NowReasonFixed
+				return pinned, false, nil
+			}
+			// The pin is out of play: a live member carries the dial when the
+			// pool still has one, and only a pool with nothing else left keeps
+			// the pin as the least blind choice.
+			candidates := u.poolProxiesLocked(proxies)
+			if len(candidates) == 0 {
+				candidates = proxies
+			}
+			if alive := u.bestAliveLocked(candidates, true); alive != nil {
+				u.fastNode = alive
+				u.fastReason = NowReasonFixedSuspicious
+				return alive, false, nil
+			}
+			u.fastNode = pinned
 			u.fastReason = NowReasonFixed
-			return proxy, false, nil
+			return pinned, false, nil
 		}
 		fixedReason = NowReasonFixedUnavailable
 	}
