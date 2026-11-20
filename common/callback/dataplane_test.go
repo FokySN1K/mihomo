@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -211,13 +212,13 @@ func TestDataPlaneResetReportsDropOnce(t *testing.T) {
 	_, err := conn.Write(tlsClientHello)
 	require.NoError(t, err)
 
-	inner.fail(errors.New("connection reset by peer"))
+	inner.fail(syscall.ECONNRESET)
 	_, err = conn.Read(make([]byte, 8))
-	require.ErrorContains(t, err, "reset")
-	require.ErrorContains(t, waitDrop(t, dropped, "a reset must be reported"), "reset")
+	require.ErrorIs(t, err, syscall.ECONNRESET)
+	require.ErrorIs(t, waitDrop(t, dropped, "a reset must be reported"), syscall.ECONNRESET)
 
 	// every later outcome of the same connection must not report again
-	inner.fail(errors.New("connection reset by peer"))
+	inner.fail(syscall.ECONNRESET)
 	_, _ = conn.Read(make([]byte, 8))
 	select {
 	case err := <-dropped:
@@ -244,6 +245,70 @@ func TestDataPlaneEndBeforeAnswerReportsDrop(t *testing.T) {
 	_, err = conn.Read(make([]byte, 8))
 	require.ErrorIs(t, err, io.EOF)
 	require.ErrorIs(t, waitDrop(t, dropped, "an end before the answer must be reported"), io.EOF)
+}
+
+// A close the protocol relays as an error is the peer saying goodbye, not the
+// node going silent: a WebSocket close frame used to demote the member even
+// though it carried the whole flow.
+func TestDataPlaneProtocolCloseIsNotVerdict(t *testing.T) {
+	inner := newDataFakeConn()
+	dropped := make(chan error, 1)
+	conn := NewDataPlaneConn(inner, DataPlaneOptions{
+		Handshake:        true,
+		FirstByteTimeout: time.Second,
+		OnDrop:           func(err error) { dropped <- err },
+	})
+
+	_, err := conn.Write(tlsClientHello)
+	require.NoError(t, err)
+
+	inner.fail(errors.New("websocket: close 1000 (normal)"))
+	_, err = conn.Read(make([]byte, 8))
+	require.ErrorContains(t, err, "close 1000")
+	requireNoDrop(t, dropped, 100*time.Millisecond, "a protocol-level close says nothing about the node")
+}
+
+// A connection whose first write is not a handshake owes no answer, so its end
+// cannot be read as a silent node.
+func TestDataPlaneEndWithoutHandshakeIsNotVerdict(t *testing.T) {
+	inner := newDataFakeConn()
+	dropped := make(chan error, 1)
+	conn := NewDataPlaneConn(inner, DataPlaneOptions{
+		Handshake:        true,
+		FirstByteTimeout: time.Second,
+		OnDrop:           func(err error) { dropped <- err },
+	})
+
+	_, err := conn.Write([]byte("GET / HTTP/1.1\r\nHost: example\r\n\r\n"))
+	require.NoError(t, err)
+
+	inner.fail(io.EOF)
+	_, err = conn.Read(make([]byte, 8))
+	require.ErrorIs(t, err, io.EOF)
+	requireNoDrop(t, dropped, 100*time.Millisecond, "a plain request never owed an answer")
+}
+
+// A flow that already got its answer is not a silent node: how it ends after
+// the first answered byte says nothing about the route.
+func TestDataPlaneEndAfterAnswerIsNotVerdict(t *testing.T) {
+	inner := newDataFakeConn()
+	dropped := make(chan error, 1)
+	conn := NewDataPlaneConn(inner, DataPlaneOptions{
+		Handshake:        true,
+		FirstByteTimeout: time.Second,
+		OnDrop:           func(err error) { dropped <- err },
+	})
+
+	_, err := conn.Write(tlsClientHello)
+	require.NoError(t, err)
+	inner.answer([]byte("server hello"))
+	_, err = conn.Read(make([]byte, 32))
+	require.NoError(t, err)
+
+	inner.fail(syscall.ECONNRESET)
+	_, err = conn.Read(make([]byte, 8))
+	require.ErrorIs(t, err, syscall.ECONNRESET)
+	requireNoDrop(t, dropped, 100*time.Millisecond, "the node answered, so the reset is not a verdict")
 }
 
 // The observer must work through the buffer API as well: the relay copies with

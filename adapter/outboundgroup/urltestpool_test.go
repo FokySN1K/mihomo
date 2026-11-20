@@ -680,9 +680,16 @@ type poolOrderedProxy struct {
 	*cascadeFakeProxy
 	alive bool
 	delay uint16
+	udp   bool
 }
 
 func (p *poolOrderedProxy) AliveForTestUrl(string) bool { return p.alive }
+
+func (p *poolOrderedProxy) SupportUDP() bool { return p.udp }
+
+// setUDP changes what the member reports for the packet path, the way a
+// transport without UDP support answers it.
+func (p *poolOrderedProxy) setUDP(ok bool) { p.udp = ok }
 
 func (p *poolOrderedProxy) LastDelayForTestUrl(string) uint16 {
 	if !p.alive {
@@ -692,7 +699,7 @@ func (p *poolOrderedProxy) LastDelayForTestUrl(string) uint16 {
 }
 
 func newPoolOrderedProxy(name string, alive bool, delay uint16) *poolOrderedProxy {
-	return &poolOrderedProxy{cascadeFakeProxy: newCascadeTestProxy(name), alive: alive, delay: delay}
+	return &poolOrderedProxy{cascadeFakeProxy: newCascadeTestProxy(name), alive: alive, delay: delay, udp: true}
 }
 
 // poolPromotionProxy reports itself measured alive and lets a test decide what
@@ -1259,6 +1266,14 @@ func (p *poolControlledProxy) SupportUDP() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.udp
+}
+
+// setUDP changes what the member reports for the packet path, the way a
+// transport without UDP support answers it.
+func (p *poolControlledProxy) setUDP(ok bool) {
+	p.mu.Lock()
+	p.udp = ok
+	p.mu.Unlock()
 }
 
 func (p *poolControlledProxy) ListenPacketContext(context.Context, *C.Metadata) (C.PacketConn, error) {
@@ -2788,15 +2803,14 @@ func TestURLTestPoolBlindDialSkipsSilentMember(t *testing.T) {
 	require.Equal(t, "clean", proxy.Name())
 }
 
-// A pool whose every member is marked has nothing better than the member whose
-// mark ends first: it is the least punished one.
+// A pool whose every member is measured dead has nothing better than the
+// member whose mark ends first: it is the least punished one.
 func TestURLTestPoolBlindDialPicksTheSoonestMark(t *testing.T) {
-	a := newPoolControlledProxy("a", nil, poolProbeOk(10))
-	b := newPoolControlledProxy("b", nil, poolProbeOk(10))
-	c := newPoolControlledProxy("c", nil, poolProbeOk(10))
-	pool := newExhaustedPoolForTest(t, a, b, c)
+	a := newPoolOrderedProxy("a", false, 0)
+	b := newPoolOrderedProxy("b", false, 0)
+	c := newPoolOrderedProxy("c", false, 0)
+	pool := newPoolForTest(t, URLTestPoolOption{}, a, b, c)
 	pool.mu.Lock()
-	pool.pool = nil
 	pool.lastGood = "a"
 	pool.mu.Unlock()
 	pool.markSuspiciousFor("a", 10*time.Minute)
@@ -2806,6 +2820,75 @@ func TestURLTestPoolBlindDialPicksTheSoonestMark(t *testing.T) {
 	proxy, exhausted := pool.fastForDial(false)
 	require.True(t, exhausted)
 	require.Equal(t, "b", proxy.Name())
+}
+
+// A mark is a suspicion, not a verdict: a pool whose every member is marked
+// but still measured alive keeps dialing its best member. Calling such a pool
+// exhausted would start an emergency test and leave on a guess while the
+// members carry traffic.
+func TestURLTestPoolMarkedPoolKeepsDialingItsBest(t *testing.T) {
+	slow := newPoolOrderedProxy("slow", true, 300)
+	fast := newPoolOrderedProxy("fast", true, 20)
+	pool := newPoolForTest(t, URLTestPoolOption{}, slow, fast)
+	pool.markSuspicious("slow")
+	pool.markSuspicious("fast")
+
+	proxy, exhausted := pool.fastForDial(false)
+	require.False(t, exhausted, "a marked but alive pool is not an outage")
+	require.Equal(t, "fast", proxy.Name(), "the best measured member keeps the dial")
+
+	pool.mu.RLock()
+	measuring := pool.measuring
+	pool.mu.RUnlock()
+	require.Nil(t, measuring, "no emergency test is started for a pool that is still alive")
+}
+
+// The group reports UDP support for the whole list, but the pool may hold no
+// member that carries UDP: a packet flow then leaves on the closest member of
+// the list instead of reading the empty filter as an outage. Reading it as an
+// outage started an emergency test and dialed outside the pool on every
+// packet flow, which is the churn a Speedtest adds to the rotation.
+func TestURLTestPoolPacketChoiceWithoutUDPMemberIsNotExhausted(t *testing.T) {
+	a := newPoolControlledProxy("a", nil, poolProbeOk(10))
+	b := newPoolControlledProxy("b", nil, poolProbeOk(10))
+	udpOnly := newPoolControlledProxy("udp-only", nil, poolProbeOk(10))
+	a.setUDP(false)
+	b.setUDP(false)
+	pool := newPoolForTest(t, URLTestPoolOption{}, a, b, udpOnly)
+	pool.mu.Lock()
+	pool.pool = []string{"a", "b"}
+	pool.mu.Unlock()
+
+	proxy, exhausted := pool.fastForPacket(false)
+	require.Equal(t, "udp-only", proxy.Name(), "the packet flow must leave on the member that carries UDP")
+	require.False(t, exhausted, "a pool that holds no UDP member is not an outage")
+
+	pool.mu.RLock()
+	measuring := pool.measuring
+	pool.mu.RUnlock()
+	require.Nil(t, measuring, "no emergency test must start for a healthy pool")
+}
+
+// A packet choice is a view of the same group, not a change of the member it
+// routes through: the packet flow may leave on another member while Now()
+// stays on the member the group measured best.
+func TestURLTestPoolPacketChoiceKeepsTheRoute(t *testing.T) {
+	fast := newPoolOrderedProxy("fast", true, 10)
+	udpSlow := newPoolOrderedProxy("udp-slow", true, 30)
+	fast.setUDP(false)
+	pool := newPoolForTest(t, URLTestPoolOption{}, fast, udpSlow)
+
+	route, _ := pool.fastForDial(false)
+	require.Equal(t, "fast", route.Name(), "the fastest member carries the route")
+	reason := pool.currentFastReason()
+
+	proxy, exhausted := pool.fastForPacket(false)
+	require.Equal(t, "udp-slow", proxy.Name(), "the packet flow leaves on the member that carries UDP")
+	require.False(t, exhausted)
+
+	require.Equal(t, "fast", pool.Now(), "a packet flow must not move the route")
+	require.Equal(t, reason, pool.currentFastReason(),
+		"a packet flow must not rewrite the reason the group reports")
 }
 
 // The sweep must leave the members it already marked for the tail: those marks

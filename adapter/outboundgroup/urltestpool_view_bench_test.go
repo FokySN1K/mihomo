@@ -54,7 +54,7 @@ func BenchmarkURLTestPoolFastRebuild(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				pool.mu.Lock()
 				members := pool.poolProxiesLocked(proxies)
-				proxy, _, _ := pool.pickFastLocked(proxies, members)
+				proxy, _, _ := pool.pickFastLocked(proxies, members, false, false)
 				pool.mu.Unlock()
 				if proxy == nil {
 					b.Fatal("no member")

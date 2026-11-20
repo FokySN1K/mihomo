@@ -8,6 +8,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/metacubex/mihomo/common/buf"
@@ -70,6 +71,11 @@ type dataPlaneConn struct {
 	written  atomic.Bool
 	answered atomic.Bool
 	shut     atomic.Bool
+	// armed marks the handshake write the remote owes an answer to. Only a
+	// read error of such a connection, before that answer, is evidence about
+	// the node: every other error is the client's own close or a protocol-
+	// level end that says nothing about it.
+	armed atomic.Bool
 	// startAt is when the first write was accepted, in unix nanoseconds: the
 	// first answer is measured from it.
 	startAt atomic.Int64
@@ -157,6 +163,7 @@ func (c *dataPlaneConn) noteWrite(n int, handshake bool, err error) {
 	if n > 0 && c.written.CompareAndSwap(false, true) {
 		c.startAt.Store(time.Now().UnixNano())
 		if handshake {
+			c.armed.Store(true)
 			c.armWatchdog()
 		}
 	}
@@ -175,17 +182,22 @@ func (c *dataPlaneConn) noteRead(n int, err error) {
 	if err == nil || c.shut.Load() {
 		return
 	}
-	switch {
-	case errors.Is(err, io.EOF):
-		// A peer that ends the connection before answering the handshake is
-		// not carrying traffic: the flow the client started cannot finish, no
-		// matter how cleanly the proxy relayed the end.
-		if c.written.Load() && !c.answered.Load() {
-			c.drop(err)
-		}
-	case errors.Is(err, net.ErrClosed), errors.Is(err, os.ErrDeadlineExceeded), errors.Is(err, context.Canceled):
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.Canceled) {
 		// the client's own close or deadline, not a verdict on the node
-	default:
+		return
+	}
+	if c.answered.Load() || !c.armed.Load() {
+		// The flow already got its answer, or the connection never owed one:
+		// how it ends says nothing about the node. A protocol-level end that
+		// the proxy relays as an error (a WebSocket close frame, for one) is
+		// the peer saying goodbye, not the node going silent.
+		return
+	}
+	// Only an end the node owes evidence for counts: the peer reset the
+	// stream, or ended it before answering the handshake the observer waits
+	// on. Any other error is a protocol detail, not a verdict, and a node
+	// demoted on it would leave the rotation for no reason.
+	if errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) {
 		c.drop(err)
 	}
 }
