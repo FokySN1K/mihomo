@@ -152,20 +152,16 @@ func invalidateAllProxies() {
 	allProxiesVersions = nil
 }
 
-// ProvidersSnapshot returns the proxy providers the tunnel holds, read under
-// the lock an apply installs them with — Providers() takes none. The maps are
-// never written in place, so the result stays valid after the lock is dropped.
+// ProvidersSnapshot returns the proxy providers the tunnel currently holds.
+// The map is replaced wholesale by an apply, never written in place, so the
+// result stays valid after the lock-free load.
 func ProvidersSnapshot() map[string]P.ProxyProvider {
-	configMux.RLock()
-	defer configMux.RUnlock()
-	return providers
+	return providersView.Load()
 }
 
 // RuleProvidersSnapshot is ProvidersSnapshot for rule providers.
 func RuleProvidersSnapshot() map[string]P.RuleProvider {
-	configMux.RLock()
-	defer configMux.RUnlock()
-	return ruleProviders
+	return ruleProvidersView.Load()
 }
 
 // ResolveRoute picks the adapter a connection for metadata would be handed

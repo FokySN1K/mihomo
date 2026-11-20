@@ -50,6 +50,15 @@ var (
 	ruleProviders map[string]P.RuleProvider
 	configMux     sync.RWMutex
 
+	// The maps above are replaced wholesale by an apply, never written in
+	// place, so readers take the current one through these views instead of
+	// racing with the assignment. A view is lock-free: a config apply may hold
+	// configMux for work of its own, and RULE-SET reads providers on every
+	// connection.
+	providersView     = atomic.NewTypedValue(providers)
+	ruleProvidersView = atomic.NewTypedValue(ruleProviders)
+	listenersView     = atomic.NewTypedValue(listeners)
+
 	// activeRoute is what a connection resolves against: the rules an apply
 	// installed, the sub rules they name and the proxies they can pick. One
 	// apply publishes all three together, so a dial keeps one coherent view
@@ -144,11 +153,11 @@ func (t tunnel) Proxies() map[string]C.Proxy {
 }
 
 func (t tunnel) Providers() map[string]P.ProxyProvider {
-	return providers
+	return providersView.Load()
 }
 
 func (t tunnel) RuleProviders() map[string]P.RuleProvider {
-	return ruleProviders
+	return ruleProvidersView.Load()
 }
 
 func (t tunnel) RuleUpdateCallback() *utils.Callback[P.RuleProvider] {
@@ -220,7 +229,7 @@ func Rules() []C.Rule {
 }
 
 func Listeners() map[string]C.InboundListener {
-	return listeners
+	return listenersView.Load()
 }
 
 // UpdateRules handle update rules
@@ -228,6 +237,7 @@ func UpdateRules(newRules []C.Rule, newSubRule map[string][]C.Rule, rp map[strin
 	configMux.Lock()
 	rules = newRules
 	ruleProviders = rp
+	ruleProvidersView.Store(rp)
 	subRules = newSubRule
 	publishRoute()
 	configMux.Unlock()
@@ -246,12 +256,12 @@ func publishRoute() {
 
 // Providers return all compatible providers
 func Providers() map[string]P.ProxyProvider {
-	return providers
+	return providersView.Load()
 }
 
 // RuleProviders return all loaded rule providers
 func RuleProviders() map[string]P.RuleProvider {
-	return ruleProviders
+	return ruleProvidersView.Load()
 }
 
 // UpdateProxies handle update proxies
@@ -259,6 +269,7 @@ func UpdateProxies(newProxies map[string]C.Proxy, newProviders map[string]P.Prox
 	configMux.Lock()
 	proxies = newProxies
 	providers = newProviders
+	providersView.Store(newProviders)
 	invalidateAllProxies()
 	// The config proxies and the lists of the providers that already carry one
 	// (an inline or fallback payload) are complete here; a provider that loads
@@ -272,6 +283,7 @@ func UpdateListeners(newListeners map[string]C.InboundListener) {
 	configMux.Lock()
 	defer configMux.Unlock()
 	listeners = newListeners
+	listenersView.Store(newListeners)
 }
 
 func UpdateSniffer(dispatcher *sniffer.Dispatcher) {

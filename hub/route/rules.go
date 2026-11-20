@@ -61,7 +61,9 @@ func getRules(w http.ResponseWriter, r *http.Request) {
 			rule = ruleWrapper.Unwrap() // unwrap RuleWrapper
 		}
 		if rule.RuleType() == constant.GEOIP || rule.RuleType() == constant.GEOSITE {
-			r.Size = rule.(constant.RuleGroup).GetRecodeSize()
+			if ruleGroup, ok := rule.(constant.RuleGroup); ok {
+				r.Size = ruleGroup.GetRecodeSize()
+			}
 		}
 		rules = append(rules, r)
 
