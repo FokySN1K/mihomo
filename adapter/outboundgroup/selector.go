@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync/atomic"
 
 	C "github.com/metacubex/mihomo/constant"
 	P "github.com/metacubex/mihomo/constant/provider"
@@ -16,8 +17,10 @@ type SelectorOption struct {
 type Selector struct {
 	*GroupBase
 	disableUDP bool
-	selected   string
-	testUrl    string
+	// selected is written by a dashboard switch while dials read it for every
+	// connection, so the name lives behind an atomic pointer.
+	selected atomic.Pointer[string]
+	testUrl  string
 }
 
 // DialContext implements C.ProxyAdapter
@@ -83,7 +86,7 @@ func (s *Selector) Now() string {
 func (s *Selector) Set(name string) error {
 	for _, proxy := range s.GetProxies(false) {
 		if proxy.Name() == name {
-			s.selected = name
+			s.setSelected(name)
 			return nil
 		}
 	}
@@ -92,7 +95,18 @@ func (s *Selector) Set(name string) error {
 }
 
 func (s *Selector) ForceSet(name string) {
-	s.selected = name
+	s.setSelected(name)
+}
+
+func (s *Selector) setSelected(name string) {
+	s.selected.Store(&name)
+}
+
+func (s *Selector) selectedName() string {
+	if selected := s.selected.Load(); selected != nil {
+		return *selected
+	}
+	return ""
 }
 
 // Unwrap implements C.ProxyAdapter
@@ -102,8 +116,9 @@ func (s *Selector) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 
 func (s *Selector) selectedProxy(touch bool) C.Proxy {
 	proxies := s.GetProxies(touch)
+	selected := s.selectedName()
 	for _, proxy := range proxies {
-		if proxy.Name() == s.selected {
+		if proxy.Name() == selected {
 			return proxy
 		}
 	}
@@ -138,10 +153,11 @@ func NewSelector(option GroupCommonOption, selectorOption SelectorOption, emptyF
 		return nil, err
 	}
 
-	return &Selector{
+	selector := &Selector{
 		GroupBase:  base,
-		selected:   selectorOption.DefaultSelected,
 		disableUDP: option.DisableUDP,
 		testUrl:    option.URL,
-	}, nil
+	}
+	selector.setSelected(selectorOption.DefaultSelected)
+	return selector, nil
 }

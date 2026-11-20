@@ -114,7 +114,10 @@ func ParseProxyGroup(config map[string]any, proxyMap map[string]C.Proxy, provide
 		if groupOption.Filter != "" {
 			var filterRegs []*regexp2.Regexp
 			for _, filter := range strings.Split(groupOption.Filter, "`") {
-				filterReg := regexp2.MustCompile(filter, regexp2.None)
+				filterReg, err := regexp2.Compile(filter, regexp2.None)
+				if err != nil {
+					return nil, fmt.Errorf("%s: invalid filter: %w", groupName, err)
+				}
 				filterRegs = append(filterRegs, filterReg)
 			}
 			for _, p := range AllProxies {

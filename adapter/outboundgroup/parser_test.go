@@ -55,3 +55,28 @@ func TestIncludeAllProxiesKeepsExplicitDuplicates(t *testing.T) {
 	require.Equal(t, []string{"A", "A", "B"}, names,
 		"only the expanded names are deduplicated")
 }
+
+// A filter the profile typed wrong is a config error, not a panic that takes
+// the Core down while it loads the profile.
+func TestIncludeAllProxiesInvalidFilterReturnsError(t *testing.T) {
+	proxyMap := map[string]C.Proxy{
+		"COMPATIBLE": namedProxy("COMPATIBLE"),
+		"A":          namedProxy("A"),
+	}
+	config := map[string]any{
+		"name":                "Group",
+		"type":                "select",
+		"include-all-proxies": true,
+		"filter":              "([",
+	}
+
+	var (
+		parsed ProxyGroup
+		err    error
+	)
+	require.NotPanics(t, func() {
+		parsed, err = ParseProxyGroup(config, proxyMap, map[string]P.ProxyProvider{}, []string{"A"}, nil)
+	})
+	require.Nil(t, parsed)
+	require.ErrorContains(t, err, "invalid filter")
+}
