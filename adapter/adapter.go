@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"strings"
@@ -172,6 +173,10 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 	// resp is declared before the deferred bookkeeping so the closure sees the
 	// response a test that completed without an accepted status answered with
 	var resp *http.Response
+	// rtt is the time the dial took, the part of the delay the node itself is
+	// responsible for. It is set only when the dial completed, so a check that
+	// never reached the proxy reports no road time.
+	var rtt uint16
 
 	defer func() {
 		if err == nil && !satisfied {
@@ -193,7 +198,7 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 		}
 
 		alive := err == nil
-		record := C.DelayHistory{Time: time.Now()}
+		record := C.DelayHistory{Time: time.Now(), RTT: rtt}
 		if alive {
 			record.Delay = t
 		}
@@ -231,6 +236,7 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 	if err != nil {
 		return
 	}
+	rtt = durationToMillis(time.Since(start))
 	defer func() {
 		_ = instance.Close()
 	}()
@@ -309,6 +315,21 @@ func NewProxy(adapter C.ProxyAdapter) *Proxy {
 		history:      queue.New[C.DelayHistory](defaultHistoriesNum),
 		alive:        atomic.NewBool(true),
 	}
+}
+
+// durationToMillis turns a measured duration into the millisecond unit of
+// DelayHistory. A measurement under a millisecond is 1, because zero keeps its
+// meaning of "nothing was measured", and a value above the field range
+// saturates instead of wrapping.
+func durationToMillis(d time.Duration) uint16 {
+	ms := d / time.Millisecond
+	if ms <= 0 {
+		return 1
+	}
+	if ms > math.MaxUint16 {
+		return math.MaxUint16
+	}
+	return uint16(ms)
 }
 
 func urlToMetadata(rawURL string) (addr C.Metadata, err error) {

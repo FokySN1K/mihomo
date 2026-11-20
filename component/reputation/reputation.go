@@ -118,6 +118,9 @@ type Store struct {
 	// the rows of an evicted node do not stay in the cache forever.
 	deletes map[string]struct{}
 	timer   *time.Timer
+	// history explains the recent changes of every score. It is a debug view
+	// only: it lives in memory, survives no restart and is not flushed.
+	history map[string][]Event
 }
 
 var defaultStore = newStore(cacheBackend{})
@@ -139,6 +142,7 @@ func newStore(backend backend) *Store {
 		entries: make(map[string]*entry),
 		dirty:   make(map[string]struct{}),
 		deletes: make(map[string]struct{}),
+		history: make(map[string][]Event),
 	}
 }
 
@@ -196,6 +200,7 @@ func (s *Store) DialSucceeded(name string) {
 		}
 		e.Score = int16(clamp(base + step))
 	}
+	s.recordChangeLocked(name, base, int(e.Score), EventDialSucceeded)
 	if e.Streak < 1000 {
 		e.Streak++
 	}
@@ -220,7 +225,9 @@ func (s *Store) DialFailed(name string) {
 	if fails > 3 {
 		fails = 3
 	}
-	e.Score = int16(clamp(e.decayed(now) - (dialFall << fails)))
+	base := e.decayed(now)
+	e.Score = int16(clamp(base - (dialFall << fails)))
+	s.recordChangeLocked(name, base, int(e.Score), EventDialFailed)
 	if e.Fails < 30 {
 		e.Fails++
 	}
@@ -243,7 +250,9 @@ func (s *Store) ProbeFailed(name string) {
 	s.loadLocked()
 	now := time.Now()
 	e := s.entryLocked(name)
-	e.Score = int16(clamp(e.decayed(now) - probeFall))
+	base := e.decayed(now)
+	e.Score = int16(clamp(base - probeFall))
+	s.recordChangeLocked(name, base, int(e.Score), EventProbeFailed)
 	e.LastSeen = now
 	s.markDirtyLocked(name)
 }
@@ -264,7 +273,9 @@ func (s *Store) DataFailed(name string) {
 	s.loadLocked()
 	now := time.Now()
 	e := s.entryLocked(name)
-	e.Score = int16(clamp(e.decayed(now) - dataFall))
+	base := e.decayed(now)
+	e.Score = int16(clamp(base - dataFall))
+	s.recordChangeLocked(name, base, int(e.Score), EventDataFailed)
 	e.LastSeen = now
 	s.markDirtyLocked(name)
 }
@@ -423,6 +434,7 @@ func (s *Store) evictLocked() []string {
 	deletes := make([]string, 0, len(items)-maxEntries)
 	for _, it := range items[:len(items)-maxEntries] {
 		delete(s.entries, it.name)
+		delete(s.history, it.name)
 		deletes = append(deletes, it.name)
 	}
 	return deletes

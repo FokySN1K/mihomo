@@ -157,6 +157,10 @@ type ProxyAdapter interface {
 type DelayHistory struct {
 	Time  time.Time `json:"time"`
 	Delay uint16    `json:"delay"`
+	// RTT is the road to the node apart from the server time Delay adds to
+	// it: how long the connection setup took, measured from the start of the
+	// check until the dial returned. Zero means the dial never completed.
+	RTT uint16 `json:"rtt,omitempty"`
 }
 
 type ProxyState struct {
