@@ -1,6 +1,10 @@
 package reputation
 
-import "time"
+import (
+	"time"
+
+	"github.com/metacubex/mihomo/log"
+)
 
 // HistoryLimit is how many score changes one node keeps. A node changes its
 // score on every connection until it reaches the band it belongs to, so the
@@ -74,4 +78,9 @@ func (s *Store) recordChangeLocked(name string, from, to int, reason string) {
 		events = events[len(events)-HistoryLimit:]
 	}
 	s.history[name] = events
+	// The debug log is the only place a change is readable while it happens:
+	// the REST history is asked for on demand, and a node that silently stays
+	// at its start score shows no events at all. Logging here, after the write,
+	// keeps the line and the stored history in the same order.
+	log.Debugln("[Reputation] %s: %d -> %d (%s)", name, from, to, reason)
 }
