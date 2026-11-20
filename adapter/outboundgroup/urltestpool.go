@@ -286,6 +286,10 @@ type URLTestPool struct {
 	pool     []string
 	lastPool []string
 	lastGood string
+	// view is the pool resolved against one snapshot of the proxy list,
+	// published so a dial, a MarshalJSON or a SupportUDP ask does not resolve
+	// the pool again. It is replaced, never edited.
+	view atomic.Pointer[poolView]
 	// suspicious holds the members that failed a dial, with the time the mark
 	// expires: a member is not skipped forever, and a check that does not reach
 	// it must not keep it out of the pool either.
@@ -433,6 +437,69 @@ type poolFirstByte struct {
 	avg  time.Duration
 	hits int
 	last time.Time
+}
+
+// poolView is the pool resolved against one snapshot of the proxy list. It is
+// immutable once published: a reader checks the generations it was built under
+// and lets the pool build a new one instead of editing this one.
+type poolView struct {
+	// members is the pool in its own order. A name the list no longer holds is
+	// skipped, and an empty result tells the caller the pool is stale.
+	members []C.Proxy
+	listGen uint64
+	poolSig uint64
+}
+
+// pickLists returns the candidates the choice picks among and the list the
+// fallbacks scan: the pool itself, or its UDP members for a packet flow.
+// The capability itself is read live and not cached with the view: a nested
+// group in the list can change it without a new provider version, and the scan
+// is what a packet dial cost before the view existed.
+func (v *poolView) pickLists(udp bool, list []C.Proxy) (candidates, scan []C.Proxy) {
+	if !udp {
+		return v.members, list
+	}
+	scan = udpProxies(list)
+	if len(scan) == 0 {
+		// A list that filters down to nothing is left as it is: the dial then
+		// reports the failure instead of silently leaving the group.
+		return v.members, list
+	}
+	return udpProxies(v.members), scan
+}
+
+// udpProxies keeps the members that carry UDP. A list that filters down to
+// nothing is left to the caller: the dial then reports the failure instead of
+// silently leaving the group.
+func udpProxies(proxies []C.Proxy) []C.Proxy {
+	filtered := make([]C.Proxy, 0, len(proxies))
+	for _, proxy := range proxies {
+		if proxy.SupportUDP() {
+			filtered = append(filtered, proxy)
+		}
+	}
+	return filtered
+}
+
+// poolSignature stamps the names the pool holds. Building the view costs a
+// scan of the whole proxy list, so it is reused while this stamp and the list
+// generation match; hashing the handful of pool names is far cheaper than the
+// scan, and no writer of the pool has to remember to bump a counter.
+func poolSignature(names []string) uint64 {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	sig := uint64(offset64)
+	for _, name := range names {
+		sig ^= uint64(len(name))
+		sig *= prime64
+		for i := 0; i < len(name); i++ {
+			sig ^= uint64(name[i])
+			sig *= prime64
+		}
+	}
+	return sig
 }
 
 // DialContext implements C.ProxyAdapter
@@ -694,7 +761,11 @@ func (u *URLTestPool) SupportUDP() bool {
 
 	// The group carries UDP when any member does: the packet path picks its
 	// member among them (fastForPacket), so a mixed pool keeps its packet flows
-	// working instead of losing them whenever the fast member changes.
+	// working instead of losing them whenever the fast member changes. The
+	// answer is read from the cached list on every call, not from the pool
+	// view: a nested group can change its capability without a new provider
+	// version, and a cached answer would keep the group out of the packet path
+	// (or inside it) until the list itself changed.
 	for _, proxy := range u.GetProxies(false) {
 		if proxy.SupportUDP() {
 			return true
@@ -729,7 +800,7 @@ func (u *URLTestPool) Now() string {
 // nowState returns the member a read of the group routes through and the
 // reason it was chosen, so MarshalJSON publishes both from the same choice.
 func (u *URLTestPool) nowState(touch bool) (C.Proxy, string) {
-	proxy, _, reason := u.fastForTrafficState(touch, nil)
+	proxy, _, reason := u.fastForTrafficState(touch, false)
 	return proxy, reason
 }
 
@@ -884,51 +955,23 @@ func (u *URLTestPool) AliveMember() (alive, known bool) {
 // reads it to tell a pool that still has something to switch to from one that
 // would only repeat the dial that just failed.
 func (u *URLTestPool) UsableMembers() int {
-	u.mu.RLock()
-	names := make(map[string]struct{}, len(u.pool))
-	for _, name := range u.pool {
-		names[name] = struct{}{}
-	}
+	proxies, listGen := u.GetProxiesWithGen(false)
+	u.mu.Lock()
+	members := u.viewLocked(proxies, listGen).members
 	now := time.Now()
-	// a member cut by our own attempt-timeout cannot carry traffic within the
-	// grace either, so a parent must not count it as a reason to stay
-	marks := make(map[string]struct{}, len(u.suspicious)+len(u.cutMarks)+len(u.dataMarks))
-	for name, until := range u.suspicious {
-		if now.Before(until) {
-			marks[name] = struct{}{}
-		}
-	}
-	for name, until := range u.cutMarks {
-		if now.Before(until) {
-			marks[name] = struct{}{}
-		}
-	}
-	// a member that accepted the handshake and went silent is out of the next
-	// choices for the same reason: a parent that keeps a pool with nothing
-	// else left only repeats the flow that just died
-	for name, mark := range u.dataMarks {
-		if now.Before(mark.until) {
-			marks[name] = struct{}{}
-		}
-	}
-	u.mu.RUnlock()
-
-	if len(names) == 0 {
-		return 0
-	}
-
 	usable := 0
-	for _, proxy := range u.GetProxies(false) {
-		if _, ok := names[proxy.Name()]; !ok {
-			continue
-		}
-		if _, marked := marks[proxy.Name()]; marked {
+	for _, proxy := range members {
+		// a member cut by our own attempt-timeout cannot carry traffic within
+		// the grace either, so a parent must not count it as a reason to stay;
+		// the same holds for one that went silent after the handshake
+		if !u.markUntilLocked(proxy.Name(), now).IsZero() {
 			continue
 		}
 		if proxy.AliveForTestUrl(u.testUrl) {
 			usable++
 		}
 	}
+	u.mu.Unlock()
 	return usable
 }
 
@@ -1046,38 +1089,25 @@ func (u *URLTestPool) fast(touch bool) C.Proxy {
 // last-known-good fallback: the pool has no usable member, so the next failure
 // should trigger an emergency test of the last pool instead of another blind dial.
 func (u *URLTestPool) fastForDial(touch bool) (C.Proxy, bool) {
-	return u.fastForTraffic(touch, nil)
+	return u.fastForTraffic(touch, false)
 }
 
 // fastForPacket is fastForDial restricted to the members that carry UDP, so a
 // packet flow of a mixed pool never lands on a member that drops it.
 func (u *URLTestPool) fastForPacket(touch bool) (C.Proxy, bool) {
-	return u.fastForTraffic(touch, udpProxies)
-}
-
-// udpProxies keeps the members that carry UDP. A list that filters down to
-// nothing is left to the caller: the dial then reports the failure instead of
-// silently leaving the group.
-func udpProxies(proxies []C.Proxy) []C.Proxy {
-	filtered := make([]C.Proxy, 0, len(proxies))
-	for _, proxy := range proxies {
-		if proxy.SupportUDP() {
-			filtered = append(filtered, proxy)
-		}
-	}
-	return filtered
+	return u.fastForTraffic(touch, true)
 }
 
 // fastForTraffic keeps the dial-facing signature; the reason is only needed by
 // reads of the group state.
-func (u *URLTestPool) fastForTraffic(touch bool, usable func([]C.Proxy) []C.Proxy) (C.Proxy, bool) {
-	proxy, exhausted, _ := u.fastForTrafficState(touch, usable)
+func (u *URLTestPool) fastForTraffic(touch bool, udp bool) (C.Proxy, bool) {
+	proxy, exhausted, _ := u.fastForTrafficState(touch, udp)
 	return proxy, exhausted
 }
 
-func (u *URLTestPool) fastForTrafficState(touch bool, usable func([]C.Proxy) []C.Proxy) (C.Proxy, bool, string) {
-	proxy, exhausted, reason := u.fastForTrafficChoice(touch, usable)
-	if usable == nil {
+func (u *URLTestPool) fastForTrafficState(touch bool, udp bool) (C.Proxy, bool, string) {
+	proxy, exhausted, reason := u.fastForTrafficChoice(touch, udp)
+	if !udp {
 		// A UDP-filtered choice is a view of the same group, not a change of
 		// the member it routes through, so only the general choice is a
 		// history event.
@@ -1114,7 +1144,7 @@ func (u *URLTestPool) recordNowEvent(now C.Proxy, reason string) {
 	})
 }
 
-func (u *URLTestPool) fastForTrafficChoice(touch bool, usable func([]C.Proxy) []C.Proxy) (C.Proxy, bool, string) {
+func (u *URLTestPool) fastForTrafficChoice(touch bool, udp bool) (C.Proxy, bool, string) {
 	// with lazy enabled the checks are driven only by real traffic: reading the
 	// group state (Now/MarshalJSON) must never start a test, not even the very
 	// first one after a start, so a launch without traffic stays silent.
@@ -1122,38 +1152,58 @@ func (u *URLTestPool) fastForTrafficChoice(touch bool, usable func([]C.Proxy) []
 		u.maybeScheduleCheck()
 	}
 
-	proxies := u.GetProxies(touch)
-	if usable != nil {
-		if filtered := usable(proxies); len(filtered) > 0 {
-			proxies = filtered
-		}
-	}
+	proxies, listGen := u.GetProxiesWithGen(touch)
 	if len(proxies) == 0 {
 		return u.EmptyFallback(), false, NowReasonEmpty
 	}
 
-	proxy, exhausted := u.pickFast(proxies, touch)
-	reason := u.currentFastReason()
-	if !exhausted {
-		return proxy, false, reason
+	// One critical section for the whole choice: the view is taken or rebuilt,
+	// the member is picked and the fallback of an exhausted pool is chosen
+	// under the same lock, so a dial no longer takes it twice.
+	u.mu.Lock()
+	candidates, scan := u.viewLocked(proxies, listGen).pickLists(udp, proxies)
+	proxy, exhausted, verify := u.pickFastLocked(scan, candidates)
+	reason := u.fastReason
+	if reason == "" {
+		reason = NowReasonEmpty
 	}
 
-	if fallback := u.blindDialFallback(proxies); fallback != nil {
-		fallbackReason := reason
-		if fallback.Name() != proxy.Name() {
-			// the member the pool already marked as out of play is the one it
-			// would have dialed before, so the log names both and a field log
-			// shows which memory the dial left on instead
-			log.Debugln("ProxyGroup: %s: %s is marked out of play, dialing %s instead", u.Name(), proxy.Name(), fallback.Name())
-			fallbackReason = NowReasonEmpty
-			if u.isLastGood(fallback.Name()) {
-				fallbackReason = NowReasonLastGood
+	var fallback C.Proxy
+	fallbackReason := reason
+	switchedTo := ""
+	if exhausted {
+		if picked := u.blindDialFallbackLocked(scan); picked != nil {
+			fallback = picked
+			if picked.Name() != proxy.Name() {
+				// the member the pool already marked as out of play is the one it
+				// would have dialed before, so the log names both and a field log
+				// shows which memory the dial left on instead
+				switchedTo = picked.Name()
+				fallbackReason = NowReasonEmpty
+				if u.lastGood == picked.Name() {
+					fallbackReason = NowReasonLastGood
+				}
 			}
 		}
-		return fallback, true, fallbackReason
+	}
+	u.mu.Unlock()
+
+	if switchedTo != "" {
+		log.Debugln("ProxyGroup: %s: %s is marked out of play, dialing %s instead", u.Name(), proxy.Name(), switchedTo)
+	}
+	if verify != nil && touch {
+		// The pool held the promotion back: the candidate is measured by one
+		// background probe, and the next dial promotes it once the answer
+		// stamps the measurement. The probe runs outside the pool lock. A read
+		// of the group state (Now/MarshalJSON) must not start it: reading a
+		// group is not traffic, and a lazy group must stay silent without it.
+		u.startPromotionProbe(verify)
 	}
 
-	return proxy, true, reason
+	if fallback != nil {
+		return fallback, true, fallbackReason
+	}
+	return proxy, exhausted, reason
 }
 
 func (u *URLTestPool) currentFastReason() string {
@@ -1164,12 +1214,6 @@ func (u *URLTestPool) currentFastReason() string {
 		return NowReasonEmpty
 	}
 	return reason
-}
-
-func (u *URLTestPool) isLastGood(name string) bool {
-	u.mu.RLock()
-	defer u.mu.RUnlock()
-	return u.lastGood == name
 }
 
 func (u *URLTestPool) lastGoodLocked(proxies []C.Proxy) C.Proxy {
@@ -1197,9 +1241,20 @@ func (u *URLTestPool) blindDialFallback(proxies []C.Proxy) C.Proxy {
 		return nil
 	}
 
-	now := time.Now()
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	return u.blindDialFallbackLocked(proxies)
+}
+
+// blindDialFallbackLocked is blindDialFallback for a caller that already holds
+// u.mu: the dial choice takes the lock once and keeps the fallback inside it.
+// It must be called with u.mu held.
+func (u *URLTestPool) blindDialFallbackLocked(proxies []C.Proxy) C.Proxy {
+	if len(proxies) == 0 {
+		return nil
+	}
+
+	now := time.Now()
 
 	clean := make([]C.Proxy, 0, len(proxies))
 	for _, proxy := range proxies {
@@ -1261,7 +1316,10 @@ func (u *URLTestPool) failedUntilLocked(name string, now time.Time) time.Time {
 }
 
 func (u *URLTestPool) pickFast(proxies []C.Proxy, touch bool) (C.Proxy, bool) {
-	proxy, exhausted, verify := u.pickFastLocked(proxies)
+	u.mu.Lock()
+	candidates, scan := u.viewForLocked(proxies).pickLists(false, proxies)
+	proxy, exhausted, verify := u.pickFastLocked(scan, candidates)
+	u.mu.Unlock()
 	if verify != nil && touch {
 		// The pool held the promotion back: the candidate is measured by one
 		// background probe, and the next dial promotes it once the answer
@@ -1273,13 +1331,11 @@ func (u *URLTestPool) pickFast(proxies []C.Proxy, touch bool) (C.Proxy, bool) {
 	return proxy, exhausted
 }
 
-// pickFastLocked chooses the member a dial leaves on. It reports the member a
-// background probe still has to verify before the pool promotes it over the
-// member the dial is already using.
-func (u *URLTestPool) pickFastLocked(proxies []C.Proxy) (C.Proxy, bool, C.Proxy) {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-
+// pickFastLocked chooses the member a dial leaves on among candidates, the pool
+// resolved against scan. It reports the member a background probe still has to
+// verify before the pool promotes it over the member the dial is already using.
+// It must be called with u.mu held.
+func (u *URLTestPool) pickFastLocked(scan, candidates []C.Proxy) (C.Proxy, bool, C.Proxy) {
 	// A pin is the user's decision, not a health hint: while the pinned member
 	// is not measured dead the pool dials it even when a mark names a risk.
 	// A pin that IS measured dead (or marked out of play) yields to a live pool
@@ -1291,7 +1347,7 @@ func (u *URLTestPool) pickFastLocked(proxies []C.Proxy) (C.Proxy, bool, C.Proxy)
 	fixedReason := ""
 	if u.selected != "" {
 		var pinned C.Proxy
-		for _, proxy := range proxies {
+		for _, proxy := range scan {
 			if proxy.Name() == u.selected {
 				pinned = proxy
 				break
@@ -1306,11 +1362,11 @@ func (u *URLTestPool) pickFastLocked(proxies []C.Proxy) (C.Proxy, bool, C.Proxy)
 			// The pin is out of play: a live member carries the dial when the
 			// pool still has one, and only a pool with nothing else left keeps
 			// the pin as the least blind choice.
-			candidates := u.poolProxiesLocked(proxies)
-			if len(candidates) == 0 {
-				candidates = proxies
+			live := candidates
+			if len(live) == 0 {
+				live = scan
 			}
-			if alive := u.bestAliveLocked(candidates, true); alive != nil {
+			if alive := u.bestAliveLocked(live, true); alive != nil {
 				u.fastNode = alive
 				u.fastReason = NowReasonFixedSuspicious
 				return alive, false, nil
@@ -1322,10 +1378,9 @@ func (u *URLTestPool) pickFastLocked(proxies []C.Proxy) (C.Proxy, bool, C.Proxy)
 		fixedReason = NowReasonFixedUnavailable
 	}
 
-	candidates := u.poolProxiesLocked(proxies)
 	stale := len(u.pool) > 0 && len(candidates) == 0
 	if len(candidates) == 0 {
-		candidates = proxies
+		candidates = scan
 	}
 
 	best := u.bestAliveLocked(candidates, true)
@@ -1334,8 +1389,8 @@ func (u *URLTestPool) pickFastLocked(proxies []C.Proxy) (C.Proxy, bool, C.Proxy)
 		// the pool is temporarily unusable, fall back to the rest of the proxies
 		// while the full health check is being requested
 		best = u.bestAliveLocked(candidates, false)
-		if best == nil && len(candidates) != len(proxies) {
-			best = u.bestAliveLocked(proxies, false)
+		if best == nil && len(candidates) != len(scan) {
+			best = u.bestAliveLocked(scan, false)
 		}
 	}
 	if best == nil {
@@ -1345,7 +1400,7 @@ func (u *URLTestPool) pickFastLocked(proxies []C.Proxy) (C.Proxy, bool, C.Proxy)
 		} else {
 			u.fastReason = NowReasonEmpty
 		}
-		return u.bestGuessLocked(proxies), exhausted, nil
+		return u.bestGuessLocked(scan), exhausted, nil
 	}
 
 	now := time.Now()
@@ -1434,6 +1489,33 @@ func (u *URLTestPool) startPromotionProbe(proxy C.Proxy) {
 func (u *URLTestPool) poolProxiesLocked(proxies []C.Proxy) []C.Proxy {
 	pool, _ := proxiesByNames(proxies, u.pool)
 	return pool
+}
+
+// viewLocked returns the pool resolved against the proxy list, rebuilding it
+// when the list generation or the pool changed. It must be called with u.mu
+// held: it reads u.pool.
+func (u *URLTestPool) viewLocked(proxies []C.Proxy, listGen uint64) *poolView {
+	sig := poolSignature(u.pool)
+	if v := u.view.Load(); v != nil && v.listGen == listGen && v.poolSig == sig {
+		return v
+	}
+
+	v := u.buildViewLocked(proxies, listGen, sig)
+	u.view.Store(v)
+	return v
+}
+
+// viewForLocked builds the view without publishing it: a caller that works on
+// a list of its own must not poison the cache of the group. It must be called
+// with u.mu held.
+func (u *URLTestPool) viewForLocked(proxies []C.Proxy) *poolView {
+	return u.buildViewLocked(proxies, 0, 0)
+}
+
+func (u *URLTestPool) buildViewLocked(proxies []C.Proxy, listGen, poolSig uint64) *poolView {
+	v := &poolView{listGen: listGen, poolSig: poolSig}
+	v.members, _ = proxiesByNames(proxies, u.pool)
+	return v
 }
 
 func (u *URLTestPool) bestAliveLocked(candidates []C.Proxy, skipSuspicious bool) C.Proxy {

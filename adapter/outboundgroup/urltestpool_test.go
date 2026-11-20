@@ -3234,3 +3234,59 @@ func TestURLTestPoolOutageSweepFindsASurvivorInTheFirstWave(t *testing.T) {
 	require.Less(t, after, wave, "the survivors must be in the first wave")
 	require.Less(t, after, busy, "the cold nodes must go before the marked ones")
 }
+
+// poolMembers returns the published view of the pool for the group's own list,
+// building it the way a dial would.
+func poolMembers(pool *URLTestPool) []C.Proxy {
+	proxies, listGen := pool.GetProxiesWithGen(false)
+	pool.mu.Lock()
+	members := pool.viewLocked(proxies, listGen).members
+	pool.mu.Unlock()
+	return members
+}
+
+func poolViewNames(pool *URLTestPool) []string {
+	members := poolMembers(pool)
+	names := make([]string, 0, len(members))
+	for _, proxy := range members {
+		names = append(names, proxy.Name())
+	}
+	return names
+}
+
+// The view of the pool follows the pool itself: a list rewritten in place is
+// not served from the cache, so a host that edits the pool sees the new order
+// on the next choice.
+func TestURLTestPoolViewFollowsPoolList(t *testing.T) {
+	a := newPoolControlledProxy("a", nil, poolProbeOk(10))
+	b := newPoolControlledProxy("b", nil, poolProbeOk(20))
+	c := newPoolControlledProxy("c", nil, poolProbeOk(30))
+	pool := newPoolForTest(t, URLTestPoolOption{}, a, b, c)
+
+	require.Equal(t, []string{"a", "b", "c"}, poolViewNames(pool))
+
+	pool.mu.Lock()
+	pool.pool = []string{"c", "a"}
+	pool.mu.Unlock()
+	require.Equal(t, []string{"c", "a"}, poolViewNames(pool),
+		"a pool rewritten in place must not be served from a stale view")
+}
+
+// A caller that picks among a list of its own must not replace the view of the
+// group: the published view is only ever built for the group's own list, so a
+// custom list cannot poison the cache of the pool.
+func TestURLTestPoolPickFastKeepsThePublishedView(t *testing.T) {
+	a := newPoolControlledProxy("a", nil, poolProbeOk(10))
+	b := newPoolControlledProxy("b", nil, poolProbeOk(20))
+	pool := newPoolForTest(t, URLTestPoolOption{}, a, b)
+
+	require.Equal(t, []string{"a", "b"}, poolViewNames(pool))
+	published := poolMembers(pool)
+
+	pool.pickFast([]C.Proxy{a}, false)
+
+	after := poolMembers(pool)
+	require.Equal(t, len(published), len(after))
+	require.True(t, &published[0] == &after[0],
+		"a choice on a foreign list must leave the published view alone")
+}

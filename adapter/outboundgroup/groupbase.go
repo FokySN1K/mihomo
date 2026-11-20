@@ -17,7 +17,6 @@ import (
 	"github.com/metacubex/mihomo/log"
 
 	"github.com/dlclark/regexp2"
-	"golang.org/x/exp/slices"
 )
 
 // defaultGroupTestTimeout is the member budget of a group test, in
@@ -52,6 +51,10 @@ type GroupBase struct {
 	getProxiesMutex  sync.Mutex
 	providerVersions []uint32
 	providerProxies  []C.Proxy
+	// listGen moves whenever the cached list is replaced with a new one, so a
+	// reader that keeps a view of the list can tell a rebuilt answer from a
+	// cached one without comparing the proxies themselves.
+	listGen uint64
 }
 
 type GroupBaseOption struct {
@@ -143,21 +146,43 @@ func (gb *GroupBase) Touch() {
 }
 
 func (gb *GroupBase) GetProxies(touch bool) []C.Proxy {
-	providerVersions := make([]uint32, len(gb.providers))
-	for i, pd := range gb.providers {
+	proxies, _ := gb.GetProxiesWithGen(touch)
+	return proxies
+}
+
+// GetProxiesWithGen returns the proxies and the generation of the cached list
+// they came from. The generation moves only when the list is really rebuilt,
+// so a caller can reuse what it derived from the same answer.
+func (gb *GroupBase) GetProxiesWithGen(touch bool) ([]C.Proxy, uint64) {
+	for _, pd := range gb.providers {
 		if touch { // touch first
 			pd.Touch()
 		}
-		providerVersions[i] = pd.Version()
 	}
 
 	// thread safe
 	gb.getProxiesMutex.Lock()
 	defer gb.getProxiesMutex.Unlock()
 
-	// return the cached proxies if version not changed
-	if slices.Equal(providerVersions, gb.providerVersions) {
-		return gb.providerProxies
+	// return the cached proxies if version not changed. The versions are read
+	// under the lock and compared without building a slice: the dial path asks
+	// for the list on every connection and must not allocate for a hit.
+	if len(gb.providerVersions) == len(gb.providers) {
+		changed := false
+		for i, pd := range gb.providers {
+			if gb.providerVersions[i] != pd.Version() {
+				changed = true
+				break
+			}
+		}
+		if !changed {
+			return gb.providerProxies, gb.listGen
+		}
+	}
+
+	providerVersions := make([]uint32, len(gb.providers))
+	for i, pd := range gb.providers {
+		providerVersions[i] = pd.Version()
 	}
 
 	parts := make([][]C.Proxy, len(gb.providers))
@@ -248,14 +273,15 @@ func (gb *GroupBase) GetProxies(touch bool) []C.Proxy {
 	}
 
 	if len(proxies) == 0 {
-		return []C.Proxy{gb.EmptyFallback()}
+		return []C.Proxy{gb.EmptyFallback()}, gb.listGen
 	}
 
 	// only cache when proxies not empty
 	gb.providerVersions = providerVersions
 	gb.providerProxies = proxies
+	gb.listGen++
 
-	return proxies
+	return proxies, gb.listGen
 }
 
 // ProxiesChanged reports whether a provider of the group published a new proxy
