@@ -444,3 +444,20 @@ func TestConvertsV2RayHTTPUpgradeEarlyData(t *testing.T) {
 	_, err = adapter.ParseProxy(proxies[0])
 	assert.NoError(t, err)
 }
+
+// A Shadowsocks link whose userinfo decodes to a method that the core does not
+// know must be dropped instead of becoming a node with a garbage cipher.
+func TestConvertsV2RayShadowsocksBrokenUserinfo(t *testing.T) {
+	broken := "ss://" + base64.RawURLEncoding.EncodeToString([]byte("bogus:pass")) + "@example.com:8388#broken"
+	proxies, err := ConvertsV2Ray([]byte(broken))
+	assert.Error(t, err, "a link with an unknown cipher must be rejected instead of becoming a node")
+	assert.Empty(t, proxies)
+
+	valid := "ss://" + base64.RawURLEncoding.EncodeToString([]byte("aes-256-gcm:secret")) + "@example.com:8388#ok"
+	proxies, err = ConvertsV2Ray([]byte(valid))
+	if !assert.NoError(t, err) || !assert.Len(t, proxies, 1) {
+		return
+	}
+	assert.Equal(t, "aes-256-gcm", proxies[0]["cipher"])
+	assert.Equal(t, "secret", proxies[0]["password"])
+}

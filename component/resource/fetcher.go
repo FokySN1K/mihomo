@@ -2,6 +2,8 @@ package resource
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -54,19 +56,28 @@ func (f *Fetcher[V]) UpdatedAt() time.Time {
 }
 
 func (f *Fetcher[V]) Initial() (V, error) {
+	// Keep every source error: when all sources fail, the caller should see the
+	// real reasons (broken local file, bad bundle) instead of just the last one.
+	var localErr, bundleErr error
+
 	if stat, fErr := os.Stat(f.vehicle.Path()); fErr == nil {
 		// local file exists, use it first
 		buf, err := os.ReadFile(f.vehicle.Path())
 		modTime := stat.ModTime()
-		contents, _, err := f.loadBuf(buf, utils.MakeHash(buf), false)
 		f.updatedAt = modTime // reset updatedAt to file's modTime
 
-		if err == nil {
-			err = f.startPullLoop(time.Since(modTime) > f.interval)
-			if err != nil {
-				return lo.Empty[V](), err
+		if err != nil {
+			localErr = fmt.Errorf("read local file: %w", err)
+		} else {
+			contents, _, loadErr := f.loadBuf(buf, utils.MakeHash(buf), false)
+			if loadErr == nil {
+				err = f.startPullLoop(time.Since(modTime) > f.interval)
+				if err != nil {
+					return lo.Empty[V](), err
+				}
+				return contents, nil
 			}
-			return contents, nil
+			localErr = fmt.Errorf("parse local file: %w", loadErr)
 		}
 	}
 
@@ -80,20 +91,26 @@ func (f *Fetcher[V]) Initial() (V, error) {
 			if stat, sErr := file.Stat(); sErr == nil {
 				modTime = stat.ModTime()
 			}
-			contents, _, err := f.loadBuf(buf, utils.MakeHash(buf), true)
 			f.updatedAt = modTime // reset updatedAt to file's modTime
 
-			if err == nil {
-				log.Infoln("[Provider] %s extract successful from bundle file", f.Name())
-				err = f.startPullLoop(time.Since(modTime) > f.interval)
-				if err != nil {
-					return lo.Empty[V](), err
+			if err != nil {
+				bundleErr = fmt.Errorf("read bundle file: %w", err)
+			} else {
+				contents, _, loadErr := f.loadBuf(buf, utils.MakeHash(buf), true)
+				if loadErr == nil {
+					log.Infoln("[Provider] %s extract successful from bundle file", f.Name())
+					err = f.startPullLoop(time.Since(modTime) > f.interval)
+					if err != nil {
+						return lo.Empty[V](), err
+					}
+					return contents, nil
 				}
-				return contents, nil
+				bundleErr = fmt.Errorf("parse bundle file: %w", loadErr)
 			}
-			log.Warnln("[Provider] %s read bundle file error: %s", f.Name(), err.Error())
+			log.Warnln("[Provider] %s read bundle file error: %s", f.Name(), bundleErr.Error())
 		} else {
-			log.Warnln("[Provider] %s read bundle file error: %s", f.Name(), fErr.Error())
+			bundleErr = fmt.Errorf("open bundle file: %w", fErr)
+			log.Warnln("[Provider] %s read bundle file error: %s", f.Name(), bundleErr.Error())
 		}
 	}
 
@@ -107,7 +124,14 @@ func (f *Fetcher[V]) Initial() (V, error) {
 	}
 
 	if updateErr != nil {
-		return lo.Empty[V](), updateErr
+		errs := []error{updateErr}
+		if localErr != nil {
+			errs = append(errs, localErr)
+		}
+		if bundleErr != nil {
+			errs = append(errs, bundleErr)
+		}
+		return lo.Empty[V](), errors.Join(errs...)
 	}
 
 	return contents, nil
