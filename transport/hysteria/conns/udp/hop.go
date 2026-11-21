@@ -54,9 +54,10 @@ func (a *udpHopAddr) String() string {
 }
 
 type udpPacket struct {
-	buf  []byte
-	n    int
-	addr net.Addr
+	buf    []byte
+	bufPtr *[]byte
+	n      int
+	addr   net.Addr
 }
 
 func NewObfsUDPHopClientPacketConn(server string, serverPorts string, hopInterval time.Duration, obfs obfs.Obfuscator, dialer utils.PacketDialer) (net.PacketConn, error) {
@@ -90,8 +91,9 @@ func NewObfsUDPHopClientPacketConn(server string, serverPorts string, hopInterva
 		recvQueue:   make(chan *udpPacket, packetQueueSize),
 		closeChan:   make(chan struct{}),
 		bufPool: sync.Pool{
-			New: func() interface{} {
-				return make([]byte, udpBufferSize)
+			New: func() any {
+				buf := make([]byte, udpBufferSize)
+				return &buf
 			},
 		},
 	}
@@ -114,16 +116,18 @@ func NewObfsUDPHopClientPacketConn(server string, serverPorts string, hopInterva
 
 func (c *ObfsUDPHopClientPacketConn) recvRoutine(conn net.PacketConn) {
 	for {
-		buf := c.bufPool.Get().([]byte)
+		bufPtr := c.bufPool.Get().(*[]byte)
+		buf := *bufPtr
 		n, addr, err := conn.ReadFrom(buf)
 		if err != nil {
+			c.bufPool.Put(bufPtr)
 			return
 		}
 		select {
-		case c.recvQueue <- &udpPacket{buf, n, addr}:
+		case c.recvQueue <- &udpPacket{buf: buf, bufPtr: bufPtr, n: n, addr: addr}:
 		default:
 			// Drop the packet if the queue is full
-			c.bufPool.Put(buf)
+			c.bufPool.Put(bufPtr)
 		}
 	}
 }
@@ -201,7 +205,7 @@ func (c *ObfsUDPHopClientPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
 			// so we skip the check for now. Should probably still check by using a map
 			// or something in the future.
 			n := copy(b, p.buf[:p.n])
-			c.bufPool.Put(p.buf)
+			c.bufPool.Put(p.bufPtr)
 			return n, c.serverAddr, nil
 		case <-c.closeChan:
 			return 0, nil, net.ErrClosed

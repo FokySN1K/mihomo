@@ -199,10 +199,8 @@ func New(config LC.TuicServer, lc C.InboundListenConfig, tunnel C.Tunnel, additi
 
 		go func() {
 			err := server.Serve()
-			if err != nil {
-				if sl.closed {
-					return
-				}
+			if err != nil && !sl.closed {
+				log.Warnln("TuicServer serve error: %s", err)
 			}
 		}()
 	}

@@ -5,6 +5,7 @@ package structure
 import (
 	"encoding"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
@@ -37,7 +38,7 @@ func NewDecoder(option Option) *Decoder {
 // Decode transform a map[string]any to a struct
 func (d *Decoder) Decode(src map[string]any, dst any) error {
 	if reflect.TypeOf(dst).Kind() != reflect.Ptr {
-		return fmt.Errorf("decode must recive a ptr struct")
+		return errors.New("decode must receive a ptr struct")
 	}
 	return d.decode("", src, reflect.ValueOf(dst).Elem())
 }
