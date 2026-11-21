@@ -25,6 +25,11 @@ var UnifiedDelay = atomic.NewBool(false)
 
 const (
 	defaultHistoriesNum = 10
+	// reusedDialMillis is the dial time below which the transport answered
+	// locally: a multiplexed session (Hysteria2 keeps a QUIC connection,
+	// VLESS opens a gRPC or xhttp stream) returns in well under a millisecond,
+	// while a real round trip to any server takes several.
+	reusedDialMillis = 2
 )
 
 type internalProxyState struct {
@@ -37,6 +42,10 @@ type Proxy struct {
 	alive   atomic.Bool
 	history *queue.Queue[C.DelayHistory]
 	extra   xsync.Map[string, *internalProxyState]
+	// roadRtt is the last dial that crossed the network, kept so a check that
+	// reused an open session still reports a road time instead of the local
+	// stream opening. Zero means no road time was ever measured.
+	roadRtt atomic.Uint32
 }
 
 // Adapter implements C.Proxy
@@ -175,7 +184,9 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 	var resp *http.Response
 	// rtt is the time the dial took, the part of the delay the node itself is
 	// responsible for. It is set only when the dial completed, so a check that
-	// never reached the proxy reports no road time.
+	// never reached the proxy reports no road time. A dial that reused an open
+	// session reports the road time remembered from the handshake, or zero when
+	// this process has not seen one yet.
 	var rtt uint16
 
 	defer func() {
@@ -236,7 +247,7 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 	if err != nil {
 		return
 	}
-	rtt = durationToMillis(time.Since(start))
+	rtt = p.roadTime(durationToMillis(time.Since(start)))
 	defer func() {
 		_ = instance.Close()
 	}()
@@ -315,6 +326,23 @@ func NewProxy(adapter C.ProxyAdapter) *Proxy {
 		history:      queue.New[C.DelayHistory](defaultHistoriesNum),
 		alive:        atomic.NewBool(true),
 	}
+}
+
+// roadTime turns a dial measurement into the road time a check reports. A dial
+// that crossed the network is the road time and becomes the new memory; a dial
+// that finished locally reused an already open session, so the remembered value
+// answers instead, and a proxy whose session was never established reports 0,
+// the "not measured" value.
+func (p *Proxy) roadTime(measured uint16) uint16 {
+	if measured > reusedDialMillis {
+		p.roadRtt.Store(uint32(measured))
+		return measured
+	}
+	cached := p.roadRtt.Load()
+	if cached == 0 {
+		return 0
+	}
+	return uint16(cached)
 }
 
 // durationToMillis turns a measured duration into the millisecond unit of

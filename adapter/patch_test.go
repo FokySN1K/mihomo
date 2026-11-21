@@ -46,7 +46,10 @@ func TestProxyURLTestReportsProbeStart(t *testing.T) {
 }
 
 // A host that shows the road to a node apart from the server time needs the
-// dial time on every result, not only on the ones that failed.
+// dial time on every result, not only on the ones that failed. A dial to the
+// host itself never crosses the network, so it is no road time: the hook gets
+// zero, the "not measured" value, instead of a near-zero figure that would
+// read as a very fast node.
 func TestProxyURLTestReportsRoadTime(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
@@ -68,6 +71,5 @@ func TestProxyURLTestReportsRoadTime(t *testing.T) {
 	got, err := proxy.URLTest(context.Background(), server.URL, expected)
 	require.NoError(t, err)
 	require.Equal(t, got, delay, "the hook must carry the measured delay")
-	require.NotZero(t, rtt, "a completed dial must report its road time")
-	require.LessOrEqual(t, rtt, delay, "the road is a part of the whole delay")
+	require.Zero(t, rtt, "a dial that never left the host measures no road")
 }

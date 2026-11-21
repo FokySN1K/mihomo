@@ -13,9 +13,10 @@ import (
 	C "github.com/metacubex/mihomo/constant"
 )
 
-// A check against a reachable endpoint must report both numbers: the full
-// delay the pool orders by and the road time the dial took before the server
-// answered.
+// A check against a reachable endpoint must report the full delay the pool
+// orders by. A dial to the host itself never crosses the network, so its road
+// time stays unmeasured: a near-zero figure would read as a very fast node,
+// and the cache of real handshakes answers it once one is seen.
 func TestURLTestRecordsRTT(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
@@ -36,11 +37,8 @@ func TestURLTestRecordsRTT(t *testing.T) {
 		t.Fatalf("history of the tested URL not recorded: %+v", state.History)
 	}
 	last := state.History[len(state.History)-1]
-	if last.RTT == 0 {
-		t.Fatal("a completed dial reported no RTT")
-	}
-	if last.RTT > last.Delay {
-		t.Fatalf("RTT %d exceeds the full delay %d", last.RTT, last.Delay)
+	if last.RTT != 0 {
+		t.Fatalf("a dial that never left the host reported RTT %d", last.RTT)
 	}
 }
 
